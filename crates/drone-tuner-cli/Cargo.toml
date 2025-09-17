@@ -1,0 +1,46 @@
+[package]
+name = "drone-tuner-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for FPV drone tuning analysis"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "drone-tuner"
+path = "src/main.rs"
+
+[dependencies]
+# Core library
+drone-tuner-core = { path = "../drone-tuner-core" }
+
+# CLI framework
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Terminal formatting
+console = "0.15"
+indicatif = "0.17"
+
+# File I/O
+walkdir = "2.4"
+
+# Time formatting
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+assert_cmd = "2.0"
+predicates = "3.0"
