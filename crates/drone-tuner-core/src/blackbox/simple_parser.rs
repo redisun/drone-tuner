@@ -60,14 +60,14 @@ impl FrameIntervals {
         // Effective rate is frames per second
         let effective_rate = frames_in_cycle as f32 / cycle_duration_s;
 
-        info!(
+        debug!(
             "Betaflight rate calculation: base={:.1}Hz, I-interval={}, P-interval={}/{}",
             base_rate,
             self.frame_interval_i,
             self.frame_interval_p_num,
             self.frame_interval_p_denom
         );
-        info!(
+        debug!(
             "Frame pattern: {} frames every {} cycles = {:.1}Hz effective rate",
             frames_in_cycle, self.frame_interval_i, effective_rate
         );
@@ -426,7 +426,7 @@ impl SimpleBlackboxParser {
             let headers = headers_result
                 .map_err(|e| BlackboxError::Parse(format!("Failed to parse headers: {:?}", e)))?;
 
-            info!(
+                debug!(
                 "Processing session {} with {} main fields",
                 selected_session_index + 1,
                 headers.main_frame_def().len()
@@ -453,7 +453,7 @@ impl SimpleBlackboxParser {
 
                         // Debug: Log every 1000th frame to understand the pattern
                         if main_frame_count % 1000 == 0 {
-                            info!(
+                            debug!(
                                 "Main frame #{}: gyro samples so far = {}",
                                 main_frame_count,
                                 telemetry_data.gyro.len()
@@ -548,7 +548,7 @@ impl SimpleBlackboxParser {
                 let pid_rate = base_rate / pid_denom;
                 let effective_rate = intervals.calculate_effective_rate(pid_rate);
                 telemetry_data.sample_rate = effective_rate;
-                info!("Updated sample rate with pid_process_denom: base={:.1}Hz, denom={:.0} ⇒ pid={:.1}Hz, effective={:.1}Hz",
+                debug!("Updated sample rate with pid_process_denom: base={:.1}Hz, denom={:.0} ⇒ pid={:.1}Hz, effective={:.1}Hz",
                       base_rate, pid_denom, pid_rate, effective_rate);
                 // Build concise summary
                 let p = format!(
@@ -564,13 +564,13 @@ impl SimpleBlackboxParser {
                 self.bb_summary = Some(p);
             }
         } else {
-            info!(
+            warn!(
                 "No frame intervals found, keeping extracted sample rate: {:.1}Hz",
                 telemetry_data.sample_rate
             );
         }
 
-        info!(
+        debug!(
             "Extracted {} gyro samples, {} accel samples from {} main frames in session {}",
             telemetry_data.gyro.len(),
             telemetry_data.accel.len(),
@@ -584,11 +584,11 @@ impl SimpleBlackboxParser {
         } else {
             0.0
         };
-        info!(
+        debug!(
             "Samples per frame ratio: {:.2} (expected: 1.0)",
             samples_per_frame
         );
-        info!("Final sample rate: {:.1}Hz", telemetry_data.sample_rate);
+        debug!("Final sample rate: {:.1}Hz", telemetry_data.sample_rate);
 
         // Initialize motor traces if we found motor data
         if !field_mappings.motor_indices.is_empty() {
@@ -615,7 +615,7 @@ impl SimpleBlackboxParser {
                 // Use the longest continuous period (filters out setup/historical data)
                 let delta_us = best_end.saturating_sub(best_start) as u64;
                 let ms = (delta_us + 500) / 1000; // round to nearest ms
-                info!(
+                debug!(
                     "Session {}: time_raw() duration = {:.1}s (best period: {} - {} = {} μs)",
                     selected_session_index + 1,
                     ms as f32 / 1000.0,
@@ -628,7 +628,7 @@ impl SimpleBlackboxParser {
                 // Fallback to overall range if no periods detected
                 let delta_us = max_t.saturating_sub(min_t) as u64;
                 let ms = (delta_us + 500) / 1000; // round to nearest ms
-                info!(
+                debug!(
                     "Session {}: time_raw() duration = {:.1}s (overall range: {} - {} = {} μs)",
                     selected_session_index + 1,
                     ms as f32 / 1000.0,
@@ -664,7 +664,7 @@ impl SimpleBlackboxParser {
                     let pid_rate = base_rate / pid_denom;
                     let seconds = iter_range / pid_rate;
                     let ms = (seconds * 1000.0).round() as u64;
-                    info!("Session {}: iteration fallback duration = {:.1}s (iter {}..{}, base={:.1}Hz, denom {:.0}, pid={:.1}Hz)",
+                    debug!("Session {}: iteration fallback duration = {:.1}s (iter {}..{}, base={:.1}Hz, denom {:.0}, pid={:.1}Hz)",
                           selected_session_index + 1, ms as f32 / 1000.0, min_it, max_it, base_rate, pid_denom, pid_rate);
                     Some(ms)
                 } else {
@@ -684,7 +684,7 @@ impl SimpleBlackboxParser {
                 // prefer the time-derived rate.
                 let guessed_default = (telemetry_data.sample_rate - self.get_intelligent_default()).abs() < 1.0;
                 if !found_intervals || guessed_default {
-                    info!(
+                    debug!(
                         "Updated sample rate from time_raw(): {:.1}Hz ({} frames / {:.3}s)",
                         time_based_rate,
                         total_main_frames,
@@ -713,7 +713,7 @@ impl SimpleBlackboxParser {
                 intervals.calculate_effective_rate(base_rate)
             } else {
                 // Only base rate found, no interval configuration
-                info!(
+                debug!(
                     "Using base loop rate {:.1}Hz (no interval configuration)",
                     base_rate
                 );
@@ -722,7 +722,7 @@ impl SimpleBlackboxParser {
         } else {
             // Look for direct pid_rate header as fallback
             if let Some(direct_rate) = self.extract_direct_pid_rate(data) {
-                info!("Using direct pid_rate: {:.1}Hz", direct_rate);
+                debug!("Using direct pid_rate: {:.1}Hz", direct_rate);
                 return direct_rate;
             }
 
@@ -790,7 +790,7 @@ impl SimpleBlackboxParser {
 
         let found_intervals = found_i_interval || found_p_interval;
         if !found_intervals {
-            info!("No frame interval configuration found, using defaults (I=32, P=1/1)");
+            warn!("No frame interval configuration found, using defaults (I=32, P=1/1)");
         }
 
         (intervals, found_intervals)
@@ -933,15 +933,15 @@ impl SimpleBlackboxParser {
     ) -> BlackboxResult<()> {
         let main_fields = headers.main_frame_def();
         // CRITICAL DEBUG: Log all available fields to understand structure
-        info!("Available main frame fields ({} total):", main_fields.len());
+        debug!("Available main frame fields ({} total):", main_fields.len());
         for (idx, field) in main_fields.iter().enumerate() {
-            info!("  [{}]: {} (checking for time field)", idx, field.name);
+            debug!("  [{}]: {} (checking for time field)", idx, field.name);
             // Add explicit time field detection debugging
             if field.name == "time" {
-                info!("  >>> FOUND EXACT TIME FIELD AT INDEX {}", idx);
+                debug!("  >>> FOUND EXACT TIME FIELD AT INDEX {}", idx);
             }
             if field.name.contains("time") {
-                info!(
+                debug!(
                     "  >>> FOUND TIME-CONTAINING FIELD '{}' AT INDEX {}",
                     field.name, idx
                 );
@@ -981,7 +981,7 @@ impl SimpleBlackboxParser {
             // Iteration field (fallback for duration calculation when time_raw() fails)
             if normalized == "loopiteration" || normalized == "iteration" {
                 iteration_idx = Some(idx);
-                info!("Found iteration field '{}' at index {}", field_name, idx);
+                debug!("Found iteration field '{}' at index {}", field_name, idx);
             }
             // Gyro fields
             else if field_name == "gyroADC[0]" {
@@ -1048,7 +1048,7 @@ impl SimpleBlackboxParser {
             (rc_roll_idx, rc_pitch_idx, rc_yaw_idx, rc_throttle_idx)
         {
             mappings.rc_command_indices = Some((roll, pitch, yaw, throttle));
-            info!(
+            debug!(
                 "Found all RC command fields at indices: {}, {}, {}, {}",
                 roll, pitch, yaw, throttle
             );
@@ -1059,14 +1059,14 @@ impl SimpleBlackboxParser {
         // Set iteration index for proper duration calculation
         mappings.iteration_idx = iteration_idx;
         if iteration_idx.is_some() {
-            info!("Found iteration field - duration calculation will use FC loop iterations");
+            debug!("Found iteration field - duration calculation will use FC loop iterations");
         } else {
             warn!("No iteration field found - duration calculation will use frame count (may be inaccurate)");
         }
 
         // Time tracking uses time_raw() method from blackbox-log crate (primary approach)
         // Iteration field is used as fallback only if time_raw() fails
-        info!("Duration calculation: time_raw() (primary), loopIteration (fallback)");
+        debug!("Duration calculation: time_raw() (primary), loopIteration (fallback)");
 
         Ok(())
     }
@@ -1080,7 +1080,7 @@ impl SimpleBlackboxParser {
         // Get unknown headers that contain configuration data
         let unknown_headers = headers.unknown();
 
-        info!(
+        debug!(
             "Extracting configuration from {} unknown headers",
             unknown_headers.len()
         );
@@ -1645,7 +1645,7 @@ impl SimpleBlackboxParser {
                     let duration_s = if let (Some(best_start), Some(best_end)) = bf_time.best_period() {
                         // Use the longest continuous period (filters out setup/historical data)
                         let duration = (best_end - best_start) as f32 / 1_000_000.0;
-                        info!(
+                        debug!(
                             "Session {}: time-based duration = {:.1}s (best period: {} - {} = {} μs)",
                             idx + 1,
                             duration,
@@ -1657,7 +1657,7 @@ impl SimpleBlackboxParser {
                     } else if let (Some(min_t), Some(max_t)) = (min_time, max_time) {
                         // Fallback to overall range if no periods detected
                         let duration = (max_t - min_t) as f32 / 1_000_000.0;
-                        info!(
+                        debug!(
                             "Session {}: time-based duration = {:.1}s (overall range: {} - {} = {} μs)",
                             idx + 1,
                             duration,
@@ -1674,7 +1674,7 @@ impl SimpleBlackboxParser {
                         let iteration_range = (max_iter - min_iter) as f32;
                         let iteration_rate_hz = base_rate / pid_denom;
                         let duration = iteration_range / iteration_rate_hz;
-                        info!(
+                        debug!(
                             "Session {}: iteration-based duration (PID denom) = {:.1}s (range: {} - {} = {} cycles at {:.1}Hz / denom {:.0} = {:.1}Hz)",
                             idx + 1,
                             duration,
