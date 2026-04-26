@@ -53,6 +53,19 @@ fn parse_unit_interval(s: &str) -> std::result::Result<f32, String> {
     }
 }
 
+/// Parse a `--pull-chunk-size` argument. Below 256 bytes there's no
+/// meaningful win over V1 legacy; above 32 KB risks overrunning the FC's
+/// USB CDC TX buffer.
+fn parse_chunk_size(s: &str) -> std::result::Result<u16, String> {
+    let v: u32 = s
+        .parse()
+        .map_err(|e| format!("not a positive integer: {e}"))?;
+    if !(256..=32_768).contains(&v) {
+        return Err(format!("must be between 256 and 32768, got {v}"));
+    }
+    Ok(v as u16)
+}
+
 /// Parse a 1-based session index. Zero is rejected so `--session 0` is a
 /// clean error rather than silently behaving like the default.
 fn parse_one_based_index(s: &str) -> std::result::Result<usize, String> {
@@ -225,6 +238,14 @@ struct TuneArgs {
     /// tune iterations. Has no effect without `--pull-bbl`.
     #[arg(long)]
     erase_after_pull: bool,
+
+    /// Chunk size (in bytes) for the V2 dataflash read request. Default
+    /// 1024 is conservative and works on every Betaflight 4.x FC tested.
+    /// Larger values (2048, 4096) cut roundtrip count proportionally
+    /// but some firmware/buffer combinations stall mid-pull at 4 KB.
+    /// Range: 256–32768.
+    #[arg(long, value_name = "BYTES", value_parser = parse_chunk_size)]
+    pull_chunk_size: Option<u16>,
 
     /// Only show recommendations without applying
     #[arg(long)]
@@ -838,9 +859,14 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
             let connection = resolved_connection
                 .as_deref()
                 .expect("resolve_connection guarantees Some when --pull-bbl is set");
-            pull_bbl_from_fc(connection, args.keep_bbl.as_deref(), args.erase_after_pull)
-                .await
-                .context("Failed to pull BBL from flight controller")?
+            pull_bbl_from_fc(
+                connection,
+                args.keep_bbl.as_deref(),
+                args.erase_after_pull,
+                args.pull_chunk_size,
+            )
+            .await
+            .context("Failed to pull BBL from flight controller")?
         }
         (None, false) => {
             return Err(anyhow::anyhow!(
@@ -1086,6 +1112,7 @@ async fn pull_bbl_from_fc(
     connection: &str,
     keep_path: Option<&Path>,
     erase: bool,
+    chunk_size: Option<u16>,
 ) -> Result<PathBuf> {
     print_stage("Pull", "📥");
 
@@ -1166,8 +1193,15 @@ async fn pull_bbl_from_fc(
     pull_pb.set_message("downloading dataflash");
     pull_pb.enable_steady_tick(std::time::Duration::from_millis(120));
     let pull_pb_for_cb = pull_pb.clone();
+    // 1024 by default — proven to work across our test fleet. User can
+    // experiment with --pull-chunk-size 2048/4096 to halve or quarter
+    // roundtrip count if their FC's USB CDC TX buffer can keep up.
+    let chunk_size = chunk_size.unwrap_or(1024);
     let blob = fc
-        .pull_dataflash(move |done, _total| pull_pb_for_cb.set_position(done))
+        .pull_dataflash_with(
+            move |done, _total| pull_pb_for_cb.set_position(done),
+            chunk_size,
+        )
         .await
         .context("Dataflash pull failed")?;
     finish_step(pull_pb, format!("downloaded {}", format_bytes(blob.len() as u64)));
@@ -3425,6 +3459,7 @@ mod tests {
             pull_bbl: false,
             keep_bbl: None,
             erase_after_pull: false,
+            pull_chunk_size: None,
             dry_run: false,
             backup: None,
             auto_apply_safe: auto,

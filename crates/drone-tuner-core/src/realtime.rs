@@ -1225,6 +1225,13 @@ impl FlightControllerConnection {
         mut progress: F,
         chunk_size: u16,
     ) -> Result<Vec<u8>> {
+        // How many V2 read requests to keep in flight at once. With
+        // depth=2 we send req[N+1] while still draining the response to
+        // req[N], halving USB roundtrip latency. Depth>2 risks overrunning
+        // the FC's MSP RX queue on tight buffers; 2 is the sweet spot
+        // empirically.
+        const PIPELINE_DEPTH: usize = 2;
+
         let summary = self.read_dataflash_summary().await?;
         if !summary.supported {
             return Err(DronetunerError::communication_error(
@@ -1243,14 +1250,16 @@ impl FlightControllerConnection {
 
         // Probe V2 with the first chunk. If V2 fails on probe (older
         // firmware that doesn't speak it for cmd 71), fall straight to
-        // V1's slower legacy chunks rather than aborting.
-        let mut use_v2 = true;
+        // V1's slower legacy chunks rather than aborting. Only V2 paths
+        // are pipelined; V1 stays single-request because chunks there
+        // are tiny and pipelining wouldn't pay off.
         let first = self.read_dataflash_chunk_v2(0, chunk_size).await;
         let (echoed, chunk) = match first {
             Ok(ok) => ok,
             Err(_) => {
-                use_v2 = false;
-                self.read_dataflash_chunk(0).await?
+                return self
+                    .pull_dataflash_v1(progress, total, buf)
+                    .await;
             }
         };
         if echoed != 0 {
@@ -1265,41 +1274,137 @@ impl FlightControllerConnection {
         buf.extend_from_slice(&chunk);
         progress(buf.len() as u64, total);
 
-        // Iteration cap: even at 128-byte chunks, a 32 MB chip is ~262k
-        // roundtrips. 400k gives generous margin against runaways.
+        // Pipelined V2 loop: keep PIPELINE_DEPTH requests in flight.
+        let mut in_flight: std::collections::VecDeque<u32> =
+            std::collections::VecDeque::with_capacity(PIPELINE_DEPTH);
+        let mut next_offset = offset;
+
+        // Prime the pipeline.
+        while in_flight.len() < PIPELINE_DEPTH && (next_offset as u64) < total {
+            if let Err(e) = self.send_v2_dataflash_request(next_offset, chunk_size).await {
+                tracing::warn!(
+                    "MSP V2 dataflash request failed during pipeline prime at \
+                     offset {next_offset}: {e}. Falling back to V1 single-request \
+                     mode for the remaining bytes."
+                );
+                return self.pull_dataflash_v1(progress, total, buf).await;
+            }
+            in_flight.push_back(next_offset);
+            next_offset = next_offset.saturating_add(chunk_size as u32);
+        }
+
+        // Iteration cap: 32 MB / 256-byte chunks (worst case after fallback)
+        // is ~131k iterations. 400k gives margin.
+        for _ in 0..400_000 {
+            let Some(expected) = in_flight.pop_front() else {
+                break;
+            };
+            let response = self
+                .read_msp2_response_for(MspCommand::DataflashRead as u16)
+                .await;
+            let payload = match response {
+                Ok(p) => p,
+                Err(e) => {
+                    // Mid-stream V2 failure. Drain any in-flight requests
+                    // by ignoring them and restart from the failing offset
+                    // using V1 single-request mode.
+                    tracing::warn!(
+                        "MSP V2 dataflash read failed at offset {expected}: {e}. \
+                         Falling back to V1 framing for the remaining bytes."
+                    );
+                    offset = expected;
+                    return self
+                        .pull_dataflash_v1_from(progress, total, buf, offset)
+                        .await;
+                }
+            };
+            let (echoed, chunk) = Self::decode_dataflash_chunk(&payload)?;
+            if echoed != expected {
+                return Err(DronetunerError::communication_error(format!(
+                    "FC echoed dataflash offset {echoed}, expected {expected} — \
+                     pipeline sync lost"
+                )));
+            }
+            if chunk.is_empty() {
+                break;
+            }
+            offset = offset.saturating_add(chunk.len() as u32);
+            buf.extend_from_slice(&chunk);
+            progress(buf.len() as u64, total);
+
+            // Refill the pipeline if there's more to read.
+            if (next_offset as u64) < total {
+                if let Err(e) =
+                    self.send_v2_dataflash_request(next_offset, chunk_size).await
+                {
+                    tracing::warn!(
+                        "MSP V2 dataflash request failed during refill at offset \
+                         {next_offset}: {e}. Falling back to V1 single-request mode."
+                    );
+                    return self
+                        .pull_dataflash_v1_from(progress, total, buf, offset)
+                        .await;
+                }
+                in_flight.push_back(next_offset);
+                next_offset = next_offset.saturating_add(chunk_size as u32);
+            }
+
+            if (offset as u64) >= total && in_flight.is_empty() {
+                break;
+            }
+        }
+        Ok(buf)
+    }
+
+    /// Send (without reading the response) a V2 dataflash read request.
+    /// Used by [`Self::pull_dataflash_with`]'s pipelined loop.
+    async fn send_v2_dataflash_request(
+        &mut self,
+        offset: u32,
+        chunk_size: u16,
+    ) -> Result<()> {
+        let mut payload = Vec::with_capacity(6);
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.extend_from_slice(&chunk_size.to_le_bytes());
+        let request = self
+            .msp
+            .build_v2_request(MspCommand::DataflashRead as u16, &payload);
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        Ok(())
+    }
+
+    /// V1 fallback for the entire pull, used when the V2 probe at offset 0
+    /// fails. Single-request, legacy 128-byte chunks.
+    async fn pull_dataflash_v1<F: FnMut(u64, u64)>(
+        &mut self,
+        progress: F,
+        total: u64,
+        buf: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.pull_dataflash_v1_from(progress, total, buf, 0).await
+    }
+
+    /// V1 fallback resuming from `offset`. Used by mid-stream V2 failures
+    /// where some bytes have already landed in `buf`.
+    async fn pull_dataflash_v1_from<F: FnMut(u64, u64)>(
+        &mut self,
+        mut progress: F,
+        total: u64,
+        mut buf: Vec<u8>,
+        mut offset: u32,
+    ) -> Result<Vec<u8>> {
         for _ in 0..400_000 {
             if (offset as u64) >= total {
                 break;
             }
-            let chunk_result = if use_v2 {
-                self.read_dataflash_chunk_v2(offset, chunk_size).await
-            } else {
-                self.read_dataflash_chunk(offset).await
-            };
-            let (echoed, chunk) = match chunk_result {
-                Ok(ok) => ok,
-                Err(e) if use_v2 => {
-                    // Mid-stream V2 failure. Some Betaflight builds
-                    // happily return the first 4 KB chunk over V2 then
-                    // stall on the second; rather than bail, drop to V1
-                    // for the rest of the pull starting from the failing
-                    // offset. The user gets their bytes, just slower.
-                    tracing::warn!(
-                        "MSP V2 dataflash read failed at offset {offset}: {e}. \
-                         Falling back to V1 framing for the remaining bytes."
-                    );
-                    use_v2 = false;
-                    self.read_dataflash_chunk(offset).await?
-                }
-                Err(e) => return Err(e),
-            };
+            let (echoed, chunk) = self.read_dataflash_chunk(offset).await?;
             if echoed != offset {
                 return Err(DronetunerError::communication_error(format!(
                     "FC echoed dataflash offset {echoed}, expected {offset} — sync lost"
                 )));
             }
             if chunk.is_empty() {
-                // FC tells us we've hit the end early. Honour it.
                 break;
             }
             offset = offset.saturating_add(chunk.len() as u32);
