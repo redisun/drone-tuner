@@ -208,13 +208,27 @@ struct TuneArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Backup current settings before applying changes
-    #[arg(long)]
-    backup: bool,
+    /// Save the pre-change PID snapshot to a JSON file before applying.
+    /// Path defaults to `tune-backup-<timestamp>.json` in the current
+    /// directory; pass a custom path to override.
+    #[arg(long, value_name = "PATH")]
+    backup: Option<Option<PathBuf>>,
 
-    /// Automatically apply low-risk recommendations
+    /// Apply only Low/Medium priority recommendations. Without this flag,
+    /// no recommendations are applied unless --apply-all is set.
     #[arg(long)]
     auto_apply_safe: bool,
+
+    /// Apply ALL recommendations (including Critical/High priority).
+    /// Mutually exclusive with --auto-apply-safe.
+    #[arg(long, conflicts_with = "auto_apply_safe")]
+    apply_all: bool,
+
+    /// After applying changes, persist them to the FC's non-volatile
+    /// memory (EEPROM_WRITE). Without this flag, changes are RAM-only
+    /// and lost on power cycle — which is itself a useful safety net.
+    #[arg(long)]
+    save_eeprom: bool,
 }
 
 /// Arguments for the export command
@@ -916,38 +930,23 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         }
     }
 
-    // Apply changes if connection is provided and not dry run
-    if let Some(_connection) = &args.connection {
-        if !args.dry_run {
-            #[cfg(feature = "realtime")]
-            {
-                println!(
-                    "\n{} Connecting to flight controller to apply changes...",
-                    style("🔗").blue()
-                );
+    // Decide whether/how to apply. --dry-run wins over everything else.
+    if args.dry_run {
+        println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
+    } else if let Some(connection) = &args.connection {
+        #[cfg(feature = "realtime")]
+        {
+            apply_pid_recommendations_via_fc(connection, &args, &analysis.report).await?;
+        }
 
-                use drone_tuner_core::realtime::*;
-                let mut _fc = FlightControllerConnection::connect(_connection)
-                    .await
-                    .context("Failed to connect to flight controller")?;
-
-                println!(
-                    "{} Connected! (Parameter application not yet implemented)",
-                    style("✓").green()
-                );
-                // TODO: Implement parameter application
-            }
-
-            #[cfg(not(feature = "realtime"))]
-            {
-                println!(
-                    "{} Real-time tuning is not available in this build",
-                    style("⚠").yellow()
-                );
-                println!("Rebuild with --features realtime to enable this feature");
-            }
-        } else {
-            println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
+        #[cfg(not(feature = "realtime"))]
+        {
+            let _ = connection;
+            println!(
+                "{} Real-time tuning is not available in this build",
+                style("⚠").yellow()
+            );
+            println!("Rebuild with --features realtime to enable this feature");
         }
     } else {
         println!(
@@ -957,6 +956,169 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
     }
 
     Ok(())
+}
+
+/// Connect to the FC, read current PID, mutate per analysis recommendations,
+/// and apply via [`FlightControllerConnection::apply_pid_with_rollback`]
+/// (which auto-restores the prior values if the write or its ack fails).
+///
+/// Behaviour:
+/// - Without `--auto-apply-safe` or `--apply-all`, no recommendations are
+///   applied — the user is prompted to opt in.
+/// - With `--auto-apply-safe`, only Low/Medium priority recs are applied.
+/// - With `--apply-all`, every rec is applied (including Critical/High).
+/// - With `--backup`, the pre-change snapshot is written to disk as JSON
+///   so the user can manually restore later if the rollback path fails.
+/// - With `--save-eeprom`, after a successful write, EEPROM_WRITE is sent
+///   so changes survive a power cycle. Without it, RAM-only changes
+///   revert on next reboot — itself a useful safety net.
+#[cfg(feature = "realtime")]
+async fn apply_pid_recommendations_via_fc(
+    connection: &str,
+    args: &TuneArgs,
+    report: &drone_tuner_core::domain::AnalysisReport,
+) -> Result<()> {
+    use drone_tuner_core::realtime::FlightControllerConnection;
+
+    if !args.auto_apply_safe && !args.apply_all {
+        println!(
+            "\n{} No --auto-apply-safe or --apply-all flag — skipping writeback. \
+             Re-run with one of those flags to actually apply changes.",
+            style("ℹ️").blue()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n{} Connecting to flight controller to apply changes...",
+        style("🔗").blue()
+    );
+
+    let mut fc = FlightControllerConnection::connect(connection)
+        .await
+        .context("Failed to connect to flight controller")?;
+    println!("{} Connected", style("✓").green());
+
+    // Read current PID and decide what to write.
+    let current = fc
+        .read_pid()
+        .await
+        .context("Failed to read current PID values from FC")?;
+    let mut new_snapshot = current.clone();
+    let applied = apply_pid_recs_to_snapshot(&mut new_snapshot, &report.pid_recommendations, args);
+
+    if applied == 0 {
+        println!(
+            "{} No PID recommendations matched the active filters; nothing to write.",
+            style("ℹ️").blue()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} Writing {} PID change(s) with rollback safety net...",
+        style("📝").blue(),
+        applied
+    );
+    let backup = fc
+        .apply_pid_with_rollback(&new_snapshot)
+        .await
+        .context("PID writeback failed (any partial write was rolled back)")?;
+    println!(
+        "{} Write succeeded; backup retained in memory.",
+        style("✓").green()
+    );
+
+    // Persist backup to disk if requested.
+    if let Some(maybe_path) = &args.backup {
+        let path = maybe_path.clone().unwrap_or_else(|| {
+            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            PathBuf::from(format!("tune-backup-{ts}.json"))
+        });
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "drone-tuner-pid-backup-v1",
+            "captured_at": chrono::Utc::now(),
+            "pid_payload": backup.as_payload(),
+            "roll": backup.roll(),
+            "pitch": backup.pitch(),
+            "yaw": backup.yaw(),
+        }))?;
+        std::fs::write(&path, json)
+            .with_context(|| format!("Failed to write backup snapshot to {}", path.display()))?;
+        println!(
+            "{} Backup snapshot saved to {}",
+            style("💾").blue(),
+            path.display()
+        );
+    }
+
+    if args.save_eeprom {
+        println!("{} Persisting changes to EEPROM...", style("💾").blue());
+        fc.save_to_eeprom().await.context(
+            "EEPROM write failed; RAM changes are still in effect but will revert on power cycle",
+        )?;
+        println!("{} Changes persisted.", style("✓").green());
+    } else {
+        println!(
+            "{} Changes are RAM-only and will revert on power cycle. \
+             Re-run with --save-eeprom to persist.",
+            style("ℹ️").blue()
+        );
+    }
+
+    Ok(())
+}
+
+/// Translate a list of [`PidRecommendation`]s onto a [`PidSnapshot`] in
+/// place. Returns the number of changes actually applied.
+///
+/// `recommended_value` is in Betaflight's internal scale (typically 0..=255),
+/// so we just clamp and round to u8.
+#[cfg(feature = "realtime")]
+fn apply_pid_recs_to_snapshot(
+    snapshot: &mut drone_tuner_core::realtime::PidSnapshot,
+    recommendations: &[drone_tuner_core::domain::PidRecommendation],
+    args: &TuneArgs,
+) -> usize {
+    use drone_tuner_core::domain::{Axis, PidTerm, Priority};
+
+    let allow_priority = |p: &Priority| {
+        if args.apply_all {
+            true
+        } else if args.auto_apply_safe {
+            matches!(p, Priority::Low | Priority::Medium)
+        } else {
+            false
+        }
+    };
+
+    let mut count = 0usize;
+    for rec in recommendations {
+        if !allow_priority(&rec.priority) {
+            continue;
+        }
+        let new_val = rec.recommended_value.round().clamp(0.0, 255.0) as u8;
+        let (mut p, mut i, mut d) = match rec.axis {
+            Axis::Roll => snapshot.roll(),
+            Axis::Pitch => snapshot.pitch(),
+            Axis::Yaw => snapshot.yaw(),
+        };
+        match rec.term {
+            PidTerm::P => p = new_val,
+            PidTerm::I => i = new_val,
+            PidTerm::D => d = new_val,
+            // F-term doesn't fit in MSP_PID's first 9 bytes; skip and let
+            // the user know.
+            PidTerm::F => continue,
+        }
+        match rec.axis {
+            Axis::Roll => snapshot.set_roll(p, i, d),
+            Axis::Pitch => snapshot.set_pitch(p, i, d),
+            Axis::Yaw => snapshot.set_yaw(p, i, d),
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Handle the export command
@@ -2053,4 +2215,114 @@ async fn export_to_python(
 
     std::fs::write(output_path, content)?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "realtime"))]
+mod tests {
+    use super::*;
+    use drone_tuner_core::domain::{Axis, PidRecommendation, PidTerm, Priority};
+    use drone_tuner_core::realtime::PidSnapshot;
+
+    fn rec(axis: Axis, term: PidTerm, value: f32, priority: Priority) -> PidRecommendation {
+        PidRecommendation {
+            axis,
+            term,
+            current_value: 0.0,
+            recommended_value: value,
+            reason: "test".to_string(),
+            priority,
+        }
+    }
+
+    fn fresh_snapshot() -> PidSnapshot {
+        // Build a 30-byte zeroed payload — PidSnapshot has no public ctor.
+        PidSnapshot::from_payload(vec![0u8; 30]).unwrap()
+    }
+
+    fn args(auto: bool, all: bool) -> TuneArgs {
+        TuneArgs {
+            input: PathBuf::from("dummy"),
+            connection: None,
+            dry_run: false,
+            backup: None,
+            auto_apply_safe: auto,
+            apply_all: all,
+            save_eeprom: false,
+        }
+    }
+
+    #[test]
+    fn no_flags_applies_nothing() {
+        let mut snap = fresh_snapshot();
+        let recs = vec![
+            rec(Axis::Roll, PidTerm::P, 50.0, Priority::Low),
+            rec(Axis::Pitch, PidTerm::I, 100.0, Priority::High),
+        ];
+        let count = apply_pid_recs_to_snapshot(&mut snap, &recs, &args(false, false));
+        assert_eq!(count, 0);
+        assert_eq!(snap.roll(), (0, 0, 0));
+        assert_eq!(snap.pitch(), (0, 0, 0));
+    }
+
+    #[test]
+    fn auto_apply_safe_filters_to_low_medium() {
+        let mut snap = fresh_snapshot();
+        let recs = vec![
+            rec(Axis::Roll, PidTerm::P, 40.0, Priority::Low),
+            rec(Axis::Pitch, PidTerm::I, 80.0, Priority::Medium),
+            rec(Axis::Yaw, PidTerm::D, 120.0, Priority::High),
+            rec(Axis::Roll, PidTerm::I, 200.0, Priority::Critical),
+        ];
+        let count = apply_pid_recs_to_snapshot(&mut snap, &recs, &args(true, false));
+        assert_eq!(count, 2);
+        assert_eq!(snap.roll().0, 40);
+        assert_eq!(snap.roll().1, 0); // Critical I rec was skipped
+        assert_eq!(snap.pitch().1, 80);
+        assert_eq!(snap.yaw(), (0, 0, 0)); // High skipped
+    }
+
+    #[test]
+    fn apply_all_takes_every_priority() {
+        let mut snap = fresh_snapshot();
+        let recs = vec![
+            rec(Axis::Roll, PidTerm::P, 40.0, Priority::Low),
+            rec(Axis::Pitch, PidTerm::I, 80.0, Priority::High),
+            rec(Axis::Yaw, PidTerm::D, 120.0, Priority::Critical),
+        ];
+        let count = apply_pid_recs_to_snapshot(&mut snap, &recs, &args(false, true));
+        assert_eq!(count, 3);
+        assert_eq!(snap.roll().0, 40);
+        assert_eq!(snap.pitch().1, 80);
+        assert_eq!(snap.yaw().2, 120);
+    }
+
+    #[test]
+    fn out_of_range_values_clamp() {
+        let mut snap = fresh_snapshot();
+        let recs = vec![
+            rec(Axis::Roll, PidTerm::P, -50.0, Priority::Low),
+            rec(Axis::Pitch, PidTerm::I, 999.5, Priority::Low),
+        ];
+        let count = apply_pid_recs_to_snapshot(&mut snap, &recs, &args(true, false));
+        assert_eq!(count, 2);
+        assert_eq!(snap.roll().0, 0); // clamped from -50
+        assert_eq!(snap.pitch().1, 255); // clamped from 999.5
+    }
+
+    #[test]
+    fn f_term_recommendations_are_skipped() {
+        let mut snap = fresh_snapshot();
+        let recs = vec![rec(Axis::Roll, PidTerm::F, 100.0, Priority::Low)];
+        let count = apply_pid_recs_to_snapshot(&mut snap, &recs, &args(false, true));
+        assert_eq!(count, 0, "F-term doesn't fit in MSP_PID's first 9 bytes");
+    }
+
+    #[test]
+    fn writes_preserve_other_axes() {
+        let mut snap = fresh_snapshot();
+        snap.set_yaw(11, 22, 33);
+        let recs = vec![rec(Axis::Roll, PidTerm::P, 50.0, Priority::Low)];
+        apply_pid_recs_to_snapshot(&mut snap, &recs, &args(true, false));
+        assert_eq!(snap.yaw(), (11, 22, 33));
+    }
 }
