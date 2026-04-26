@@ -320,6 +320,11 @@ impl FlightControllerConnection {
                     DronetunerError::communication_error(format!("Failed to open serial port: {e}"))
                 })?;
 
+            // Discard any bytes the kernel has already buffered for us. Without
+            // this, a stale MSP frame from an aborted prior session shows up as
+            // the "first" byte we see and desynchronises the handshake.
+            let _ = port.clear(serialport::ClearBuffer::All);
+
             Ok(Box::new(UsbSerialTransport {
                 port,
                 path: connection_string.to_string(),
@@ -648,14 +653,56 @@ impl FlightControllerConnection {
     }
 
     async fn read_msp_response(&mut self) -> Result<MspResponse> {
-        let mut buf = [0u8; 256];
-        let size = self.transport.read(&mut buf).await?;
+        // USB CDC delivers data in arbitrary chunks: a single transport read
+        // may return half a frame, two frames, or junk bytes before the frame
+        // (FC boot banner, stale bytes from an aborted prior session). We
+        // accumulate into a buffer, hunt for the `$` start marker, and only
+        // hand a complete V1 frame to parse_response.
+        let mut acc: Vec<u8> = Vec::with_capacity(256);
+        let mut tmp = [0u8; 256];
+        // Bound the loop so a chatty FC can't keep us forever.
+        for _ in 0..32 {
+            let n = self.transport.read(&mut tmp).await?;
+            if n == 0 {
+                if acc.is_empty() {
+                    return Err(DronetunerError::communication_error("No response received"));
+                }
+                continue;
+            }
+            acc.extend_from_slice(&tmp[..n]);
 
-        if size == 0 {
-            return Err(DronetunerError::communication_error("No response received"));
+            // Drop bytes before the first `$` — that's how we resync past
+            // banner junk or partial leftovers from a previous frame.
+            if let Some(start) = acc.iter().position(|&b| b == b'$') {
+                if start > 0 {
+                    acc.drain(..start);
+                }
+            } else {
+                // No header yet, keep reading.
+                continue;
+            }
+
+            // V1 frame layout: $ M dir size cmd [payload..] checksum
+            // Need at least 6 bytes to know the full length.
+            if acc.len() < 6 {
+                continue;
+            }
+            // V1 only for now (matches MspProtocol::new() default).
+            if acc[1] != b'M' {
+                // Drop the `$` and resync — wrong protocol family.
+                acc.drain(..1);
+                continue;
+            }
+            let payload_size = acc[3] as usize;
+            let frame_len = 6 + payload_size;
+            if acc.len() < frame_len {
+                continue;
+            }
+            return self.msp.parse_response(&acc[..frame_len]);
         }
-
-        self.msp.parse_response(&buf[..size])
+        Err(DronetunerError::communication_error(
+            "Timed out waiting for complete MSP frame",
+        ))
     }
 
     fn clone_transport(&self) -> Result<Box<dyn Transport + Send>> {
@@ -674,13 +721,17 @@ impl FlightControllerConnection {
         let request = self.msp.create_message(MspCommand::Pid, &[])?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
-        let response = self.read_msp_response().await?;
-        if !matches!(response.command, MspCommand::Pid) {
-            return Err(DronetunerError::communication_error(
-                "Unexpected response command for read_pid",
-            ));
+        // The FC may still be flushing late responses to earlier handshake
+        // commands. Skip frames that don't match what we asked for.
+        for _ in 0..8 {
+            let response = self.read_msp_response().await?;
+            if matches!(response.command, MspCommand::Pid) {
+                return PidSnapshot::from_payload(response.payload);
+            }
         }
-        PidSnapshot::from_payload(response.payload)
+        Err(DronetunerError::communication_error(
+            "Did not receive MSP_PID response after 8 frames",
+        ))
     }
 
     /// Write a PID snapshot back to the flight controller (MSP SetPid / 202).
@@ -756,24 +807,27 @@ impl FlightControllerConnection {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PidSnapshot {
-    raw: [u8; 30],
+    /// Raw payload as returned by MSP_PID. Length is FC-dependent: modern
+    /// Betaflight returns 15 bytes (5 axes × 3), legacy firmwares returned
+    /// 30 (10 × 3). We preserve whatever the FC sent so SetPid round-trips.
+    raw: Vec<u8>,
 }
 
 impl PidSnapshot {
     /// Parse a payload from an MSP Pid response.
     pub fn from_payload(payload: Vec<u8>) -> Result<Self> {
-        if payload.len() < 30 {
+        // Minimum is 9 bytes for ROLL/PITCH/YAW P-I-D — anything shorter
+        // can't carry the three flight axes we operate on.
+        if payload.len() < 9 {
             return Err(DronetunerError::parse_error(
                 format!("MSP Pid payload too short: {} bytes", payload.len()),
                 None,
             ));
         }
-        let mut raw = [0u8; 30];
-        raw.copy_from_slice(&payload[..30]);
-        Ok(Self { raw })
+        Ok(Self { raw: payload })
     }
 
-    /// Borrow the underlying 30-byte payload, suitable for SetPid.
+    /// Borrow the underlying payload, suitable for SetPid round-trip.
     pub fn as_payload(&self) -> &[u8] {
         &self.raw
     }
@@ -1552,8 +1606,8 @@ mod tests {
 
     #[test]
     fn test_pid_snapshot_from_short_payload_is_error() {
-        let err = PidSnapshot::from_payload(vec![0u8; 10])
-            .expect_err("payloads under 30 bytes should be rejected");
+        let err = PidSnapshot::from_payload(vec![0u8; 8])
+            .expect_err("payloads under 9 bytes should be rejected");
         assert!(matches!(err, DronetunerError::ParseError { .. }));
     }
 }

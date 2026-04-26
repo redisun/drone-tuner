@@ -229,6 +229,11 @@ struct TuneArgs {
     /// and lost on power cycle — which is itself a useful safety net.
     #[arg(long)]
     save_eeprom: bool,
+
+    /// Session selection strategy when multiple sessions are present.
+    /// Options: last (default), first, longest.
+    #[arg(long)]
+    session_strategy: Option<String>,
 }
 
 /// Arguments for the export command
@@ -794,7 +799,7 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         session: None,
         list_sessions: false,
         bb_summary: false,
-        session_strategy: None,
+        session_strategy: args.session_strategy.clone(),
     };
 
     // Get analysis results
@@ -1011,7 +1016,11 @@ async fn open_fc_connection(
             ))
         }
     } else {
-        FlightControllerConnection::connect(connection)
+        // Strip a leading `serial://` so callers can use a uniform scheme
+        // (`serial:///dev/ttyACM0`) alongside `simulator://`. The core
+        // transport parser still expects a bare device path.
+        let target = connection.strip_prefix("serial://").unwrap_or(connection);
+        FlightControllerConnection::connect(target)
             .await
             .context("Failed to connect to flight controller")
     }
@@ -2368,6 +2377,7 @@ mod tests {
             auto_apply_safe: auto,
             apply_all: all,
             save_eeprom: false,
+            session_strategy: None,
         }
     }
 
