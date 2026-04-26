@@ -1,0 +1,14 @@
+---
+source: crates/drone-tuner-core/tests/calibration.rs
+assertion_line: 188
+expression: "ReportSummary::from_report(&report)"
+---
+{
+  "issues_by_severity": {},
+  "issues_by_type": {},
+  "filter_recommendations_by_type": {},
+  "pid_recommendations_by_axis_term": {
+    "yaw_p": 1
+  },
+  "tune_quality_bucket": "excellent"
+}

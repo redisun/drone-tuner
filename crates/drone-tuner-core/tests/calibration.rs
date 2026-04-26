@@ -158,10 +158,51 @@ fn analyze_fixture(filename: &str) -> AnalysisReport {
         .unwrap_or_else(|e| panic!("failed to analyze {}: {}", filename, e))
 }
 
-/// Small (~4 MB) fixture committed to git so this test runs in CI.
+/// Small (~4 MB) pre-tune fixture committed to git so this test runs in CI.
 #[test]
 fn calibration_btfl_all_old() {
     let report = analyze_fixture("btfl_all_old.bbl");
+    insta::assert_json_snapshot!(ReportSummary::from_report(&report));
+}
+
+/// Post-tune log from the Jeno (STM32H743) after the second tune iteration.
+/// The quad flies stable in the air; this is our "good tune" ground truth.
+/// The snapshot captures the *current* recommendation count; the assertion
+/// below is the durable contract: a good tune should produce few PID
+/// recommendations.
+#[test]
+fn calibration_jeno_post_tune_is_quiet() {
+    let report = analyze_fixture("jeno_after.bbl");
+    let pid_count = report.pid_recommendations.len();
+
+    // Hard regression guard: a tune the pilot called "stable" must not
+    // produce a flood of PID recommendations. If this trips, the analyser
+    // has regressed toward the old "always bump I" behaviour.
+    assert!(
+        pid_count <= 3,
+        "post-tune log should produce ≤3 PID recommendations, got {}: {:#?}",
+        pid_count,
+        report.pid_recommendations
+    );
+
+    insta::assert_json_snapshot!(ReportSummary::from_report(&report));
+}
+
+/// Post-tune log from the TBS Source One (STM32F7x2) after the second tune
+/// iteration. Same idea as the Jeno test — quad flies stable, so few PID
+/// recommendations are expected.
+#[test]
+fn calibration_tbs_post_tune_is_quiet() {
+    let report = analyze_fixture("tbs_after.bbl");
+    let pid_count = report.pid_recommendations.len();
+
+    assert!(
+        pid_count <= 3,
+        "post-tune log should produce ≤3 PID recommendations, got {}: {:#?}",
+        pid_count,
+        report.pid_recommendations
+    );
+
     insta::assert_json_snapshot!(ReportSummary::from_report(&report));
 }
 

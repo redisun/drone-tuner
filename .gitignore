@@ -21,7 +21,9 @@ target
 .idea/
 
 test_data/*
-# Track only the small CI fixture; larger fixtures stay local.
+# Track only the small CI fixtures; larger fixtures stay local.
 !test_data/btfl_all_old.bbl
+!test_data/jeno_after.bbl
+!test_data/tbs_after.bbl
 docs
 .claude
