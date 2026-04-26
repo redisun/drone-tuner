@@ -1,12 +1,14 @@
 //! Command-line interface for the FPV drone tuning platform.
 
+mod history;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use console::{style, Term};
 use drone_tuner_core::domain::{FilterRecommendationType, Priority};
 use drone_tuner_core::{AnalysisEngine, BlackboxParser, FlightSession};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use tracing::{info, warn};
@@ -1119,11 +1121,13 @@ async fn apply_pid_recommendations_via_fc(
         );
     }
 
+    let mut persisted_to_eeprom = false;
     if args.save_eeprom {
         println!("{} Persisting changes to EEPROM...", style("💾").blue());
         fc.save_to_eeprom().await.context(
             "EEPROM write failed; RAM changes are still in effect but will revert on power cycle",
         )?;
+        persisted_to_eeprom = true;
         println!("{} Changes persisted.", style("✓").green());
     } else {
         println!(
@@ -1133,6 +1137,58 @@ async fn apply_pid_recommendations_via_fc(
         );
     }
 
+    // Append a row to the per-FC tune history. Best-effort: a failure here
+    // must never break the successful writeback that just completed.
+    if let Err(e) = record_history(
+        &fc,
+        &args.input,
+        &backup,
+        &new_snapshot,
+        applied,
+        persisted_to_eeprom,
+    ) {
+        warn!("Failed to append tune history entry: {e:#}");
+    }
+
+    Ok(())
+}
+
+/// Build and append a [`history::TuneHistoryEntry`] for a successful write.
+fn record_history(
+    fc: &drone_tuner_core::realtime::FlightControllerConnection,
+    bbl_path: &Path,
+    pre: &drone_tuner_core::realtime::PidSnapshot,
+    post: &drone_tuner_core::realtime::PidSnapshot,
+    recommendations_applied: usize,
+    persisted_to_eeprom: bool,
+) -> Result<()> {
+    use drone_tuner_core::realtime::FlightControllerInfo;
+    let info: &FlightControllerInfo = fc
+        .fc_info()
+        .context("FC connection has no handshake info; refusing to log history")?;
+    let entry = history::TuneHistoryEntry {
+        schema: "drone-tuner-history-v1",
+        timestamp: chrono::Utc::now(),
+        fc: history::FcIdentity {
+            board_id: &info.board_id,
+            target_name: &info.target_name,
+            firmware_id: &info.firmware_id,
+            firmware_version: &info.firmware_version,
+        },
+        bbl: history::BblIdentity::from_path(bbl_path)?,
+        pids_before: history::PidTriples::from_snapshot(pre),
+        pids_after: history::PidTriples::from_snapshot(post),
+        recommendations_applied,
+        persisted_to_eeprom,
+    };
+    let path = history::append(&entry)?;
+    println!(
+        "{} Tune logged to {} ({} {})",
+        style("📒").blue(),
+        path.display(),
+        info.board_id,
+        info.target_name,
+    );
     Ok(())
 }
 
