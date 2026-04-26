@@ -17,6 +17,7 @@ power cycles.
 | PID and filter recommendations | Working, calibrated against real flights |
 | Step-response analysis | Working |
 | MSP read/write (PID, filter config, EEPROM) | Working on hardware (Jeno H743, TBS Source One F7) |
+| Filter writeback via MSP2_COMMON_SET_SETTING | Implemented + simulator-tested; real-hardware verification pending |
 | Onboard dataflash pull (`--pull-bbl`) | Implemented + simulator-tested; real-hardware verification pending |
 | Desktop GUI (Tauri) | Not started |
 | ML pattern recognition | Not started |
@@ -140,15 +141,37 @@ to a file:
   ✅ Tune complete.
 ```
 
-### 6. Filter writeback (read-only for now)
+### 6. Filter writeback (parameter-by-name)
 
-Filter recommendations are computed and printed, and `MSP_FILTER_CONFIG`
-(cmd 92) is read on dry-run so you can see the FC's current
-gyro/D-term/yaw lowpass cutoffs. **Writeback isn't auto-applied** —
-the `MSP_FILTER_CONFIG` payload layout shifts between Betaflight 4.x
-versions and a typed setter that's wrong by one byte can brick a tune.
-Apply filter changes from Configurator until we have per-firmware-version
-offset detection.
+After PIDs are written, filter recommendations are also applied — but
+not via the binary `MSP_SET_FILTER_CONFIG` (cmd 93) blob, whose payload
+layout shifts between Betaflight 4.x versions. Instead, the CLI
+translates each `FilterRecommendation` into one or more
+`(setting_name, value_bytes)` writes and dispatches them via
+**`MSP2_COMMON_SET_SETTING`** (cmd `0x1004`) — the same name-based
+parameter interface Configurator's CLI uses. The FC resolves the name
+through its own settings table, so we don't have to track binary
+offsets per firmware version.
+
+Coverage:
+
+- `gyro_lpf{1,2}_static_hz` + `gyro_lpf{1,2}_type`
+- `dterm_lpf{1,2}_static_hz`, `dterm_lpf1_dyn_min_hz`,
+  `dterm_lpf1_dyn_max_hz`, `dterm_lpf{1,2}_type`
+- `yaw_lowpass_hz`
+- `dyn_notch_count`, `dyn_notch_min_hz`, `dyn_notch_max_hz`
+- `rpm_filter_harmonics`, `rpm_filter_min_hz`
+
+Skipped (encoding shifts too much across firmware versions):
+
+- Notch Q-factor (`dyn_notch_q`, `rpm_filter_q`) — scale changes 4.x → 4.x
+- Static gyro notches (`gyro_notch{1,2}_hz`/`_cutoff`) — Hz/cutoff
+  derivation changes
+
+Per-setting failures (e.g. an older firmware that doesn't recognise a
+name) are logged and the batch continues — one stale name doesn't take
+out the rest. Pass `--skip-filters` to opt out entirely and write only
+PIDs.
 
 ## Connection schemes
 
