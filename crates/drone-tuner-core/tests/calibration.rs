@@ -182,3 +182,243 @@ fn calibration_btfl_all_pre() {
     let report = analyze_fixture("btfl_all_pre.bbl");
     insta::assert_json_snapshot!(ReportSummary::from_report(&report));
 }
+
+// ===========================================================================
+// Labelled synthetic cases
+//
+// The .bbl-based snapshot tests above guard against drift but can't tell us
+// whether the analyser is fundamentally right — they just freeze its current
+// behaviour. The cases below construct synthetic FlightSessions with a
+// single, *known* property (clean signal, P-term oscillation, mechanical
+// resonance, etc.) and assert a specific shape of recommendation comes out.
+//
+// These are the regression tests for the algorithm's actual correctness.
+// ===========================================================================
+
+mod labelled {
+    use super::*;
+    use chrono::Utc;
+    use drone_tuner_core::domain::{
+        EnvironmentalConditions, FlightMetadata, FlightSession, HardwareConfiguration,
+        PidErrorTrace, PilotProfile, RcCommandTrace, TelemetryData, TimeSeriesVector3,
+    };
+    use nalgebra::Vector3;
+    use uuid::Uuid;
+
+    const SAMPLE_RATE: f32 = 1000.0;
+    const SAMPLE_COUNT: usize = 16384;
+
+    /// Build a `FlightSession` with a single sine-wave oscillation injected
+    /// onto one gyro axis, on top of mild base motion and noise.
+    ///
+    /// `axis_index`: 0 = roll, 1 = pitch, 2 = yaw.
+    fn synthetic_session(frequency: f32, amplitude: f32, axis_index: usize) -> FlightSession {
+        assert!(axis_index < 3, "axis_index must be 0, 1, or 2");
+
+        let mut gyro = TimeSeriesVector3::with_capacity(SAMPLE_COUNT);
+        let accel = {
+            let mut a = TimeSeriesVector3::with_capacity(SAMPLE_COUNT);
+            for _ in 0..SAMPLE_COUNT {
+                a.push(Vector3::new(0.0, 0.0, 9.81));
+            }
+            a
+        };
+
+        // Deterministic LCG so tests are reproducible across runs without
+        // pulling in a rand crate dependency.
+        let mut rng_state: u64 = 0xDEADBEEF;
+        let mut next_noise = || -> f32 {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng_state >> 33) as f32) / (u32::MAX as f32) - 0.5
+        };
+
+        for i in 0..SAMPLE_COUNT {
+            let t = i as f32 / SAMPLE_RATE;
+            let mut g = [0.0f32; 3];
+            // Slow base motion on every axis so the analyser has signal.
+            for (j, slot) in g.iter_mut().enumerate() {
+                *slot += 2.0 * (2.0 * std::f32::consts::PI * 1.5 * t + j as f32).sin();
+                *slot += 0.5 * next_noise();
+            }
+            // Inject the oscillation on the requested axis.
+            g[axis_index] += amplitude * (2.0 * std::f32::consts::PI * frequency * t).sin();
+            gyro.push(Vector3::new(g[0], g[1], g[2]));
+        }
+
+        FlightSession {
+            metadata: FlightMetadata {
+                session_id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                duration_ms: (SAMPLE_COUNT as f32 / SAMPLE_RATE * 1000.0) as u64,
+                hardware: HardwareConfiguration::test_default(),
+                environment: EnvironmentalConditions::default(),
+                pilot: PilotProfile::default(),
+            },
+            telemetry: TelemetryData {
+                sample_rate: SAMPLE_RATE,
+                gyro,
+                accel,
+                motor: Vec::new(),
+                pid_error: PidErrorTrace {
+                    roll: vec![0.0; SAMPLE_COUNT],
+                    pitch: vec![0.0; SAMPLE_COUNT],
+                    yaw: vec![0.0; SAMPLE_COUNT],
+                },
+                rc_commands: RcCommandTrace {
+                    roll: vec![0.0; SAMPLE_COUNT],
+                    pitch: vec![0.0; SAMPLE_COUNT],
+                    yaw: vec![0.0; SAMPLE_COUNT],
+                    throttle: vec![0.5; SAMPLE_COUNT],
+                },
+                loop_time_variance: 0.0,
+                cpu_load: Vec::new(),
+            },
+            events: Vec::new(),
+            analysis_results: None,
+        }
+    }
+
+    fn analyze(session: &FlightSession) -> AnalysisReport {
+        AnalysisEngine::new()
+            .analyze(session)
+            .expect("analysis on synthetic session must succeed")
+    }
+
+    /// 400 Hz mechanical resonance on roll → analyser must emit a notch
+    /// recommendation (gyro notch or dynamic notch).
+    #[test]
+    fn labelled_mechanical_resonance_400hz_emits_notch_filter() {
+        let session = synthetic_session(400.0, 15.0, 0);
+        let report = analyze(&session);
+
+        let notch_count = report
+            .filter_recommendations
+            .iter()
+            .filter(|rec| {
+                matches!(
+                    rec.recommendation_type,
+                    FilterRecommendationType::ConfigureGyroNotch { .. }
+                        | FilterRecommendationType::AdjustDynamicNotch { .. }
+                )
+            })
+            .count();
+
+        assert!(
+            notch_count >= 1,
+            "expected at least one notch filter recommendation for a 400 Hz \
+             resonance, got {} filter recommendations: {:#?}",
+            report.filter_recommendations.len(),
+            report
+                .filter_recommendations
+                .iter()
+                .map(|r| &r.recommendation_type)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 25 Hz oscillation on roll → analyser must classify it as a P-term
+    /// oscillation (or a low-frequency mechanical resonance). Either way
+    /// it should NOT be classified as motor noise — that would mean the
+    /// frequency-band classifier is broken.
+    #[test]
+    fn labelled_p_term_25hz_not_classified_as_motor_noise() {
+        let session = synthetic_session(25.0, 12.0, 0);
+        let report = analyze(&session);
+
+        let motor_noise_issues = report
+            .detected_issues
+            .iter()
+            .filter(|i| matches!(i.issue_type, IssueType::Imbalance { .. }))
+            .count();
+        let acceptable_issues = report
+            .detected_issues
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.issue_type,
+                    IssueType::PTermOscillation { .. } | IssueType::MechanicalResonance { .. }
+                )
+            })
+            .count();
+
+        assert_eq!(
+            motor_noise_issues,
+            0,
+            "25 Hz oscillation must not be classified as motor noise; \
+             issues: {:#?}",
+            report
+                .detected_issues
+                .iter()
+                .map(|i| &i.issue_type)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            acceptable_issues >= 1,
+            "expected the analyser to detect a P-term oscillation or a \
+             low-frequency resonance for a strong 25 Hz signal; \
+             got: {:#?}",
+            report
+                .detected_issues
+                .iter()
+                .map(|i| &i.issue_type)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 120 Hz oscillation on pitch → must be classified as D-term territory
+    /// (or mechanical resonance, which the analyser sometimes prefers when
+    /// Q is high). Crucially: never as P-term.
+    #[test]
+    fn labelled_d_term_120hz_not_classified_as_p_term() {
+        let session = synthetic_session(120.0, 8.0, 1);
+        let report = analyze(&session);
+
+        let p_term_issues = report
+            .detected_issues
+            .iter()
+            .filter(|i| matches!(i.issue_type, IssueType::PTermOscillation { .. }))
+            .count();
+
+        assert_eq!(
+            p_term_issues,
+            0,
+            "120 Hz oscillation should not be classified as a P-term \
+             oscillation (P-term band is 5..50 Hz); issues: {:#?}",
+            report
+                .detected_issues
+                .iter()
+                .map(|i| &i.issue_type)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A synthetic session with no oscillation and only mild base motion
+    /// should not generate critical-severity issues. Nothing's broken,
+    /// nothing should panic the pilot.
+    #[test]
+    fn labelled_clean_flight_has_no_critical_issues() {
+        // Amplitude 0 → zero injected oscillation, just baseline motion + noise.
+        let session = synthetic_session(50.0, 0.0, 0);
+        let report = analyze(&session);
+
+        let critical_issues = report
+            .detected_issues
+            .iter()
+            .filter(|i| matches!(i.severity, Severity::Critical))
+            .count();
+
+        assert_eq!(
+            critical_issues,
+            0,
+            "clean flight should not produce critical issues; \
+             issues: {:#?}",
+            report
+                .detected_issues
+                .iter()
+                .map(|i| (&i.issue_type, &i.severity))
+                .collect::<Vec<_>>()
+        );
+    }
+}

@@ -824,69 +824,6 @@ mod oscillation_detection_tests {
     }
 }
 
-// Test helper implementations for domain types
-impl Default for EnvironmentalConditions {
-    fn default() -> Self {
-        Self {
-            temperature_c: Some(25.0),
-            wind_speed_ms: None,
-            wind_direction_deg: None,
-            pressure_hpa: None,
-            humidity_percent: None,
-        }
-    }
-}
-
-impl Default for PilotProfile {
-    fn default() -> Self {
-        Self {
-            pilot_id: None,
-            skill_level: SkillLevel::Intermediate,
-            flying_style: FlyingStyle::Freestyle,
-        }
-    }
-}
-
-impl HardwareConfiguration {
-    /// Create test default hardware configuration
-    pub fn test_default() -> Self {
-        Self {
-            flight_controller: FlightController {
-                firmware: "Betaflight".to_string(),
-                version: "4.4.0".to_string(),
-                target: "STM32F405".to_string(),
-                loop_rate: 1000,
-            },
-            frame: Frame {
-                wheelbase_mm: 220,
-                weight_g: 650,
-                material: "Carbon Fiber".to_string(),
-                moment_of_inertia: None,
-            },
-            propulsion: PropulsionSystem {
-                motors: MotorSpec {
-                    model: "Test Motor".to_string(),
-                    kv: 2300,
-                    stator_size: "2207".to_string(),
-                },
-                props: PropellerSpec {
-                    diameter_inches: 5.0,
-                    pitch_inches: 4.3,
-                    blade_count: 3,
-                    material: "Polycarbonate".to_string(),
-                },
-                esc: EscSpec {
-                    model: "Test ESC".to_string(),
-                    current_rating: 35,
-                    protocol: "DShot600".to_string(),
-                },
-            },
-            pid_config: PidConfiguration::default(),
-            filter_config: FilterConfiguration::default(),
-        }
-    }
-}
-
 // Add rand crate functionality for testing
 mod rand {
     use std::cell::Cell;
