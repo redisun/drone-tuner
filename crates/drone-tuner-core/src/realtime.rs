@@ -61,6 +61,10 @@ pub struct FlightControllerInfo {
     pub board_id: String,
     /// Target name
     pub target_name: String,
+    /// Pilot / craft name as set in Configurator (`set name = "..."`).
+    /// Empty string when unset or when the FC's firmware doesn't support
+    /// `MSP_NAME` (cmd 10). Useful for naming backup/log files per quad.
+    pub craft_name: String,
     /// Available features/capabilities
     pub capabilities: Vec<String>,
 }
@@ -262,6 +266,8 @@ pub enum MspCommand {
     FcVersion = 3,
     /// Board information
     BoardInfo = 4,
+    /// Craft / pilot name string (Configurator's `set name = "..."` field)
+    Name = 10,
     /// Raw IMU data
     RawImu = 102,
     /// Motor outputs
@@ -379,12 +385,18 @@ impl FlightControllerConnection {
         let response = self.read_msp_response().await?;
         let (board_id, target_name) = self.parse_board_info(&response.payload)?;
 
+        // Pilot/craft name. Best-effort: older firmware may not support
+        // MSP_NAME and we don't want a missing name to abort the whole
+        // handshake — just record an empty string in that case.
+        let craft_name = self.try_read_craft_name().await;
+
         let fc_info = FlightControllerInfo {
             api_version,
             firmware_id,
             firmware_version,
             board_id,
             target_name,
+            craft_name,
             capabilities: Vec::new(), // Would be populated from actual capability detection
         };
 
@@ -932,6 +944,32 @@ impl FlightControllerConnection {
         Err(DronetunerError::communication_error(
             "Did not receive MSP_DATAFLASH_READ response after 8 frames",
         ))
+    }
+
+    /// Best-effort read of the FC's craft / pilot name (`MSP_NAME` / 10).
+    ///
+    /// Returns the empty string on any failure (older firmware, missing
+    /// command, garbled response). Used during the handshake — a missing
+    /// name should never abort the connection.
+    async fn try_read_craft_name(&mut self) -> String {
+        let request = match self.msp.create_message(MspCommand::Name, &[]) {
+            Ok(r) => r,
+            Err(_) => return String::new(),
+        };
+        if self.transport.write(&request).await.is_err() {
+            return String::new();
+        }
+        let _ = self.transport.flush().await;
+        for _ in 0..4 {
+            match self.read_msp_response().await {
+                Ok(resp) if matches!(resp.command, MspCommand::Name) => {
+                    return String::from_utf8_lossy(&resp.payload).into_owned();
+                }
+                Ok(_) => continue, // late frame from earlier handshake step
+                Err(_) => return String::new(),
+            }
+        }
+        String::new()
     }
 
     /// Send an MSPv2 request and return the response payload.
@@ -1748,6 +1786,7 @@ impl MspCommand {
             2 => Ok(MspCommand::FcVariant),
             3 => Ok(MspCommand::FcVersion),
             4 => Ok(MspCommand::BoardInfo),
+            10 => Ok(MspCommand::Name),
             102 => Ok(MspCommand::RawImu),
             104 => Ok(MspCommand::Motor),
             105 => Ok(MspCommand::Rc),
@@ -2006,6 +2045,10 @@ pub struct MspSimulator {
     pub firmware_id: String,
     /// 3-byte firmware version (major, minor, patch).
     pub firmware_version: [u8; 3],
+    /// Pilot / craft name as it would be returned by `MSP_NAME` (cmd 10).
+    /// Empty by default; tests / the CLI's `simulator://` scheme set this
+    /// to verify name-aware behaviour like default-filename suffixing.
+    pub craft_name: String,
     /// Mutable state shared with consumers for assertions / fault injection.
     pub state: std::sync::Arc<std::sync::Mutex<SimulatorState>>,
 }
@@ -2021,6 +2064,7 @@ impl MspSimulator {
             api_version: [1, 46, 0],
             firmware_id: "BTFL".to_string(),
             firmware_version: [4, 5, 1],
+            craft_name: String::new(),
             state: std::sync::Arc::new(std::sync::Mutex::new(SimulatorState::default())),
         }
     }
@@ -2117,6 +2161,7 @@ impl MspSimulator {
             MspCommand::FcVariant => Ok(self.firmware_id.as_bytes().to_vec()),
             MspCommand::FcVersion => Ok(self.firmware_version.to_vec()),
             MspCommand::BoardInfo => Ok(b"OMNF7\x04\x00\x00".to_vec()),
+            MspCommand::Name => Ok(self.craft_name.as_bytes().to_vec()),
             MspCommand::RawImu => Ok(vec![0u8; 18]),
             MspCommand::Motor => Ok(vec![0u8; 32]),
             MspCommand::Rc => Ok(vec![0u8; 16]),
@@ -2611,6 +2656,39 @@ mod tests {
             .await
             .expect_err("should error on unsupported chip");
         assert!(matches!(err, DronetunerError::CommunicationError { .. }));
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_handshake_picks_up_craft_name_from_simulator() {
+        let (client, server) = MockTransport::pair();
+        let mut sim = MspSimulator::new(Box::new(server));
+        sim.craft_name = "TBS Source One".to_string();
+        let handle = tokio::spawn(sim.run());
+
+        let conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .expect("handshake");
+        let info = conn.fc_info().expect("must be connected");
+        assert_eq!(info.craft_name, "TBS Source One");
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_handshake_tolerates_empty_craft_name() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server)); // craft_name defaults to ""
+        let handle = tokio::spawn(sim.run());
+
+        let conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .expect("handshake should succeed even with empty name");
+        let info = conn.fc_info().expect("must be connected");
+        assert_eq!(info.craft_name, "");
+
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
