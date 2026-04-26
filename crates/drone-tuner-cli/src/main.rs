@@ -1627,6 +1627,13 @@ fn output_pretty(
                         );
                     }
                 }
+
+                // Step-response viz, only in --show-details mode. Surface
+                // *what the analyser saw* per axis so the recommendations
+                // above stop being a black box.
+                if detailed_info && !analysis.report.step_responses.is_empty() {
+                    render_step_responses(&analysis.report.step_responses);
+                }
             }
             Err(e) => {
                 println!();
@@ -1640,6 +1647,79 @@ fn output_pretty(
         }
     }
     Ok(())
+}
+
+/// Render the most informative step responses per axis as a compact ASCII
+/// chart of (rc command, gyro response, target). "Most informative" means
+/// the largest stick deflection — that's where rise time and overshoot
+/// are observable, and where the SS-error metric (if any) was computed.
+fn render_step_responses(responses: &[drone_tuner_core::analysis::StepResponse]) {
+    use drone_tuner_core::domain::Axis;
+
+    println!();
+    println!("  {} Step responses (top per axis):", style("📐").blue());
+    for axis in [Axis::Roll, Axis::Pitch, Axis::Yaw] {
+        let mut by_axis: Vec<&drone_tuner_core::analysis::StepResponse> =
+            responses.iter().filter(|r| r.axis == axis).collect();
+        if by_axis.is_empty() {
+            continue;
+        }
+        // Largest command magnitude first — the cleanest signal.
+        by_axis.sort_by(|a, b| {
+            b.command_magnitude
+                .partial_cmp(&a.command_magnitude)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let pick = by_axis[0];
+        println!(
+            "    {:?} @ t={:.2}s  Δstick={:.2}  rise={:.0}ms  overshoot={:.1}%  SS={}",
+            axis,
+            pick.start_time,
+            pick.command_magnitude,
+            pick.rise_time * 1000.0,
+            pick.overshoot_percent,
+            match pick.steady_state_error_dps {
+                Some(e) => format!("{:.1} dps", e),
+                None => "—".to_string(),
+            }
+        );
+        print_sparkline("rc ", &pick.command_trace);
+        print_sparkline("gyr", &pick.gyro_trace);
+    }
+}
+
+/// Render a single trace as a unicode-block sparkline. Auto-scales to the
+/// data range so flat traces stay flat instead of getting amplified noise.
+fn print_sparkline(label: &str, samples: &[f32]) {
+    if samples.is_empty() {
+        return;
+    }
+    const COLS: usize = 60;
+    const BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    // Down-sample to COLS columns by averaging consecutive chunks.
+    let chunk = samples.len().div_ceil(COLS);
+    let downsampled: Vec<f32> = samples
+        .chunks(chunk.max(1))
+        .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+        .collect();
+
+    let (min, max) = downsampled
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    let span = (max - min).max(1e-6);
+
+    let line: String = downsampled
+        .iter()
+        .map(|&v| {
+            let norm = ((v - min) / span).clamp(0.0, 1.0);
+            let idx = (norm * (BLOCKS.len() - 1) as f32).round() as usize;
+            BLOCKS[idx]
+        })
+        .collect();
+    println!("      {} [{:>+6.2} → {:>+6.2}] {}", label, min, max, line);
 }
 
 /// Output results as JSON

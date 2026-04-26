@@ -5,10 +5,25 @@
 
 use crate::domain::{Axis, PidConfiguration, PidRecommendation, PidTerm, Priority, TelemetryData};
 use crate::error::{DronetunerError, Result};
+use serde::{Deserialize, Serialize};
 
 /// Analyses telemetry to derive PID gain recommendations.
 pub(super) struct PidAnalyzer {
     config: PidAnalyzerConfig,
+}
+
+/// What [`PidAnalyzer::analyze`] hands back: both the actionable
+/// recommendations and the underlying step-response observations they
+/// were derived from. Surfacing the steps lets callers (CLI, future GUI)
+/// show the analyser's reasoning instead of just its conclusions.
+#[derive(Debug, Clone)]
+pub struct PidAnalysisOutcome {
+    /// Actionable PID gain changes.
+    pub recommendations: Vec<PidRecommendation>,
+    /// Step responses detected on each axis. Empty when the log has no
+    /// RC command data (gyro-only path) or the pilot didn't move the
+    /// stick enough to trigger detection.
+    pub step_responses: Vec<StepResponse>,
 }
 
 /// Configuration for PID analysis
@@ -23,7 +38,7 @@ pub struct PidAnalyzerConfig {
 }
 
 /// Represents a detected step response in the control system
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepResponse {
     /// Which axis this response occurred on
     pub axis: Axis,
@@ -46,6 +61,15 @@ pub struct StepResponse {
     /// metric meaningful. `None` for transient stick movements where
     /// "steady state" was never reached.
     pub steady_state_error_dps: Option<f32>,
+    /// Sample rate of the underlying log (Hz). Carried alongside the
+    /// trace so renderers can reconstruct the time axis.
+    pub sample_rate: f32,
+    /// Gyro response over the analysis window, starting at the step.
+    /// Units: deg/s. Length matches `command_trace`.
+    pub gyro_trace: Vec<f32>,
+    /// RC command over the analysis window, normalised to ~[-1.0, 1.0].
+    /// The pre-step plateau is implicit in the value at index 0.
+    pub command_trace: Vec<f32>,
 }
 
 /// Step response performance metrics
@@ -156,8 +180,9 @@ impl PidAnalyzer {
         &self,
         telemetry: &TelemetryData,
         pid_config: &PidConfiguration,
-    ) -> Result<Vec<PidRecommendation>> {
+    ) -> Result<PidAnalysisOutcome> {
         let mut recommendations = Vec::new();
+        let mut step_responses: Vec<StepResponse> = Vec::new();
 
         // Check if we have RC command data
         if telemetry.rc_commands.roll.is_empty() {
@@ -227,6 +252,10 @@ impl PidAnalyzer {
                 pitch_responses.len(),
                 yaw_responses.len()
             );
+
+            step_responses.extend(roll_responses);
+            step_responses.extend(pitch_responses);
+            step_responses.extend(yaw_responses);
         }
 
         // Check if we have PID error data for additional analysis
@@ -235,7 +264,10 @@ impl PidAnalyzer {
             recommendations.extend(self.analyze_pid_errors(telemetry, pid_config)?);
         }
 
-        Ok(recommendations)
+        Ok(PidAnalysisOutcome {
+            recommendations,
+            step_responses,
+        })
     }
 
     /// Detect step responses in RC command and gyro data
@@ -389,6 +421,9 @@ impl PidAnalyzer {
             oscillation_frequency: metrics.oscillation_frequency,
             damping_ratio: metrics.damping_ratio,
             steady_state_error_dps: metrics.steady_state_error_dps,
+            sample_rate,
+            gyro_trace: response_window.to_vec(),
+            command_trace: cmd_window.to_vec(),
         }))
     }
 

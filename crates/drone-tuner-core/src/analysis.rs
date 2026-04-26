@@ -191,12 +191,13 @@ impl AnalysisEngine {
         );
 
         // Stage 4: PID analysis
-        let pid_recommendations = self
+        let pid_outcome = self
             .pid_analyzer
             .analyze(&session.telemetry, &session.metadata.hardware.pid_config)?;
         tracing::debug!(
-            "Generated {} PID recommendations",
-            pid_recommendations.len()
+            "Generated {} PID recommendations from {} step responses",
+            pid_outcome.recommendations.len(),
+            pid_outcome.step_responses.len()
         );
 
         // Stage 5: Calculate confidence scores
@@ -216,7 +217,8 @@ impl AnalysisEngine {
             frequency_analysis: self.convert_frequency_analysis(freq_analysis),
             detected_issues: self.convert_oscillations_to_issues(oscillations),
             filter_recommendations,
-            pid_recommendations,
+            pid_recommendations: pid_outcome.recommendations,
+            step_responses: pid_outcome.step_responses,
             confidence_scores,
             tune_quality_score,
         })
@@ -1072,7 +1074,10 @@ mod basic_tests {
 
         // Test the PID analyzer directly
         let analyzer = PidAnalyzer::new();
-        let recommendations = analyzer.analyze(&telemetry, &test_pid_config).unwrap();
+        let recommendations = analyzer
+            .analyze(&telemetry, &test_pid_config)
+            .unwrap()
+            .recommendations;
 
         // Verify that recommendations exist and use actual PID values
         assert!(

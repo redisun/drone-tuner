@@ -488,6 +488,11 @@ pub struct AnalysisReport {
     pub filter_recommendations: Vec<FilterRecommendation>,
     /// Recommended PID changes
     pub pid_recommendations: Vec<PidRecommendation>,
+    /// Step responses detected on each axis. Each entry carries the
+    /// gyro/command traces and timing metrics, so a viewer can render
+    /// what the analyser saw.
+    #[serde(default)]
+    pub step_responses: Vec<crate::analysis::StepResponse>,
     /// Confidence scores for various analyses
     pub confidence_scores: ConfidenceScores,
     /// Overall tune quality score (0-100)
