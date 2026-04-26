@@ -1,9 +1,7 @@
 //! Data conversion utilities for blackbox parsing.
 
 use super::*;
-use crate::domain::{
-    FilterType, TelemetryData, TimeSeriesVector3,
-};
+use crate::domain::{FilterType, TelemetryData, TimeSeriesVector3};
 use tracing::debug;
 
 /// Data converter for transforming blackbox data to domain model

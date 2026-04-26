@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::{TestFiles, CommandTestExt, create_test_command, verify_output_file, run_with_timeout};
+use common::{
+    create_test_command, run_with_timeout, verify_output_file, CommandTestExt, TestFiles,
+};
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
@@ -95,19 +97,35 @@ mod analyze_scenarios {
 
         let header = &csv_rows[0];
         let expected_columns = [
-            "file", "status", "tune_quality", "duration_ms", "sample_rate",
-            "samples", "analysis_time_ms", "issues", "filter_recommendations", "pid_recommendations"
+            "file",
+            "status",
+            "tune_quality",
+            "duration_ms",
+            "sample_rate",
+            "samples",
+            "analysis_time_ms",
+            "issues",
+            "filter_recommendations",
+            "pid_recommendations",
         ];
 
         for expected_col in &expected_columns {
-            assert!(header.contains(&expected_col.to_string()),
-                "CSV header should contain '{}', got: {:?}", expected_col, header);
+            assert!(
+                header.contains(&expected_col.to_string()),
+                "CSV header should contain '{}', got: {:?}",
+                expected_col,
+                header
+            );
         }
 
         // Validate data row
         if csv_rows.len() > 1 {
             let data_row = &csv_rows[1];
-            assert_eq!(data_row.len(), header.len(), "Data row should have same column count as header");
+            assert_eq!(
+                data_row.len(),
+                header.len(),
+                "Data row should have same column count as header"
+            );
             assert_eq!(data_row[1], "success"); // Status should be success
         }
     }
@@ -188,8 +206,7 @@ mod analyze_scenarios {
         // Test with timeout to ensure it doesn't hang
         {
             let mut cmd = create_test_command();
-            cmd.arg("analyze")
-                .arg(&large_file);
+            cmd.arg("analyze").arg(&large_file);
             run_with_timeout(cmd, 30)
         }
         .success()
@@ -212,7 +229,10 @@ mod export_scenarios {
         ];
 
         for (format, expected_content) in &formats {
-            let output_file = test_files.temp_dir.path().join(format!("export.{}", format));
+            let output_file = test_files
+                .temp_dir
+                .path()
+                .join(format!("export.{}", format));
 
             create_test_command()
                 .arg("export")
@@ -228,9 +248,13 @@ mod export_scenarios {
             verify_output_file(&output_file, Some(100)); // At least 100 bytes
 
             let content = fs::read_to_string(&output_file).unwrap();
-            assert!(content.contains(expected_content),
+            assert!(
+                content.contains(expected_content),
                 "Export format {} should contain '{}', got first 200 chars: {}",
-                format, expected_content, &content[..content.len().min(200)]);
+                format,
+                expected_content,
+                &content[..content.len().min(200)]
+            );
         }
     }
 
@@ -363,7 +387,9 @@ mod export_scenarios {
             .arg("csv")
             .assert()
             .failure()
-            .stderr(predicate::str::contains("CSV export requires blackbox analysis"));
+            .stderr(predicate::str::contains(
+                "CSV export requires blackbox analysis",
+            ));
     }
 }
 
@@ -456,15 +482,20 @@ mod compare_scenarios {
         assert!(csv_rows.len() >= 3); // Header + 2 data rows
 
         let header = &csv_rows[0];
-        let expected_columns = ["name", "tune_quality", "issues_count", "recommendations_count", "duration_ms"];
+        let expected_columns = [
+            "name",
+            "tune_quality",
+            "issues_count",
+            "recommendations_count",
+            "duration_ms",
+        ];
 
         for expected_col in &expected_columns {
             assert!(header.contains(&expected_col.to_string()));
         }
 
         // Check data rows
-        for i in 1..csv_rows.len() {
-            let row = &csv_rows[i];
+        for row in csv_rows.iter().skip(1) {
             assert_eq!(row.len(), header.len());
             assert!(row[0].ends_with(".bbl")); // Name should be filename
         }
@@ -573,8 +604,7 @@ mod validate_scenarios {
         // Should complete validation of 20 files within reasonable time
         {
             let mut cmd = create_test_command();
-            cmd.arg("validate")
-                .arg(&batch_dir);
+            cmd.arg("validate").arg(&batch_dir);
             run_with_timeout(cmd, 30)
         }
         .success()
@@ -643,7 +673,9 @@ mod tune_scenarios {
             .arg("/dev/ttyUSB0")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time tuning is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time tuning is not available",
+            ));
     }
 }
 
@@ -706,16 +738,18 @@ mod error_scenarios {
         let test_files = TestFiles::new();
 
         // Run multiple commands on same file simultaneously
-        let handles: Vec<_> = (0..3).map(|_| {
-            let file = test_files.valid_file.clone();
-            std::thread::spawn(move || {
-                create_test_command()
-                    .arg("validate")
-                    .arg(&file)
-                    .assert()
-                    .success();
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let file = test_files.valid_file.clone();
+                std::thread::spawn(move || {
+                    create_test_command()
+                        .arg("validate")
+                        .arg(&file)
+                        .assert()
+                        .success();
+                })
             })
-        }).collect();
+            .collect();
 
         for handle in handles {
             handle.join().unwrap();

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{TestFiles, create_test_command, run_with_timeout, create_large_blackbox_data};
+use common::{create_large_blackbox_data, create_test_command, run_with_timeout, TestFiles};
 use predicates::prelude::*;
 use std::fs;
 use std::time::Instant;
@@ -25,7 +25,11 @@ mod performance_benchmarks {
         let duration = start.elapsed();
 
         // Small file should analyze very quickly
-        assert!(duration.as_secs() < 5, "Small file analysis took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 5,
+            "Small file analysis took too long: {:?}",
+            duration
+        );
         println!("Small file analysis time: {:?}", duration);
     }
 
@@ -47,7 +51,11 @@ mod performance_benchmarks {
         let duration = start.elapsed();
 
         // Medium file should complete within reasonable time
-        assert!(duration.as_secs() < 15, "Medium file analysis took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 15,
+            "Medium file analysis took too long: {:?}",
+            duration
+        );
         println!("Medium file analysis time: {:?}", duration);
     }
 
@@ -63,15 +71,18 @@ mod performance_benchmarks {
         let start = Instant::now();
         {
             let mut cmd = create_test_command();
-            cmd.arg("analyze")
-                .arg(&large_file);
+            cmd.arg("analyze").arg(&large_file);
             run_with_timeout(cmd, 60)
         }
         .success();
         let duration = start.elapsed();
 
         // Large file should complete within timeout
-        assert!(duration.as_secs() < 60, "Large file analysis took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 60,
+            "Large file analysis took too long: {:?}",
+            duration
+        );
         println!("Large file analysis time: {:?}", duration);
     }
 
@@ -97,7 +108,11 @@ mod performance_benchmarks {
         let duration = start.elapsed();
 
         // Batch processing should scale reasonably
-        assert!(duration.as_secs() < 30, "Batch processing took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 30,
+            "Batch processing took too long: {:?}",
+            duration
+        );
         println!("Batch processing time for 10 files: {:?}", duration);
     }
 
@@ -120,7 +135,11 @@ mod performance_benchmarks {
         let duration = start.elapsed();
 
         // Export should be fast
-        assert!(duration.as_secs() < 10, "Export took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 10,
+            "Export took too long: {:?}",
+            duration
+        );
         println!("Export time: {:?}", duration);
     }
 
@@ -146,7 +165,11 @@ mod performance_benchmarks {
         let duration = start.elapsed();
 
         // Validation should be efficient
-        assert!(duration.as_secs() < 20, "Validation took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 20,
+            "Validation took too long: {:?}",
+            duration
+        );
         println!("Validation time for 20 files: {:?}", duration);
     }
 
@@ -165,7 +188,11 @@ mod performance_benchmarks {
         let duration = start.elapsed();
 
         // Comparison should be reasonably fast
-        assert!(duration.as_secs() < 20, "Comparison took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 20,
+            "Comparison took too long: {:?}",
+            duration
+        );
         println!("Comparison time for 3 files: {:?}", duration);
     }
 }
@@ -190,8 +217,7 @@ mod memory_tests {
         // This should not run out of memory or crash
         {
             let mut cmd = create_test_command();
-            cmd.arg("analyze")
-                .arg(&batch_dir);
+            cmd.arg("analyze").arg(&batch_dir);
             run_with_timeout(cmd, 120)
         }
         .success()
@@ -210,8 +236,7 @@ mod memory_tests {
         // Should handle large file without excessive memory usage
         {
             let mut cmd = create_test_command();
-            cmd.arg("analyze")
-                .arg(&very_large_file);
+            cmd.arg("analyze").arg(&very_large_file);
             run_with_timeout(cmd, 180)
         }
         .success();
@@ -222,21 +247,23 @@ mod memory_tests {
         let test_files = TestFiles::new();
 
         // Run multiple analysis operations concurrently
-        let handles: Vec<_> = (0..5).map(|i| {
-            let file = if i % 2 == 0 {
-                test_files.valid_file.clone()
-            } else {
-                test_files.oscillating_file.clone()
-            };
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let file = if i % 2 == 0 {
+                    test_files.valid_file.clone()
+                } else {
+                    test_files.oscillating_file.clone()
+                };
 
-            std::thread::spawn(move || {
-                create_test_command()
-                    .arg("analyze")
-                    .arg(&file)
-                    .assert()
-                    .success();
+                std::thread::spawn(move || {
+                    create_test_command()
+                        .arg("analyze")
+                        .arg(&file)
+                        .assert()
+                        .success();
+                })
             })
-        }).collect();
+            .collect();
 
         // All should complete without memory issues
         for handle in handles {
@@ -297,10 +324,13 @@ mod stress_tests {
                 .arg("analyze")
                 .arg(&stress_dir)
                 .arg("--max-files")
-                .arg(&max_files.to_string())
+                .arg(max_files.to_string())
                 .assert()
                 .success()
-                .stdout(predicate::str::contains(format!("Found {} blackbox file(s)", max_files.min(100))));
+                .stdout(predicate::str::contains(format!(
+                    "Found {} blackbox file(s)",
+                    max_files.min(100)
+                )));
         }
     }
 
@@ -345,8 +375,7 @@ mod stress_tests {
         // Should handle many small files efficiently
         {
             let mut cmd = create_test_command();
-            cmd.arg("analyze")
-                .arg(&small_files_dir);
+            cmd.arg("analyze").arg(&small_files_dir);
             run_with_timeout(cmd, 120)
         }
         .success()
@@ -370,8 +399,7 @@ mod stress_tests {
         // Should handle mixed file sizes efficiently
         {
             let mut cmd = create_test_command();
-            cmd.arg("analyze")
-                .arg(&mixed_dir);
+            cmd.arg("analyze").arg(&mixed_dir);
             run_with_timeout(cmd, 120)
         }
         .success()
@@ -423,7 +451,10 @@ mod stress_tests {
                 })
             },
             {
-                let files = (test_files.valid_file.clone(), test_files.oscillating_file.clone());
+                let files = (
+                    test_files.valid_file.clone(),
+                    test_files.oscillating_file.clone(),
+                );
                 std::thread::spawn(move || {
                     create_test_command()
                         .arg("compare")
@@ -449,40 +480,43 @@ mod regression_tests {
     fn test_startup_time_regression() {
         // Test that basic commands start quickly
         let start = Instant::now();
-        create_test_command()
-            .arg("--help")
-            .assert()
-            .success();
+        create_test_command().arg("--help").assert().success();
         let duration = start.elapsed();
 
         // Help should display very quickly
-        assert!(duration.as_millis() < 1000, "Help command too slow: {:?}", duration);
+        assert!(
+            duration.as_millis() < 1000,
+            "Help command too slow: {:?}",
+            duration
+        );
     }
 
     #[test]
     fn test_version_performance() {
         let start = Instant::now();
-        create_test_command()
-            .arg("--version")
-            .assert()
-            .success();
+        create_test_command().arg("--version").assert().success();
         let duration = start.elapsed();
 
         // Version should be instant
-        assert!(duration.as_millis() < 500, "Version command too slow: {:?}", duration);
+        assert!(
+            duration.as_millis() < 500,
+            "Version command too slow: {:?}",
+            duration
+        );
     }
 
     #[test]
     fn test_info_command_performance() {
         let start = Instant::now();
-        create_test_command()
-            .arg("info")
-            .assert()
-            .success();
+        create_test_command().arg("info").assert().success();
         let duration = start.elapsed();
 
         // Info should be very fast
-        assert!(duration.as_millis() < 2000, "Info command too slow: {:?}", duration);
+        assert!(
+            duration.as_millis() < 2000,
+            "Info command too slow: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -513,6 +547,10 @@ mod regression_tests {
         // Verify roughly linear scaling (allowing for measurement variance)
         // 4x size should not take more than 8x time
         let ratio = times[2].as_millis() as f64 / times[0].as_millis() as f64;
-        assert!(ratio < 8.0, "Analysis time scaling is worse than expected: {}x", ratio);
+        assert!(
+            ratio < 8.0,
+            "Analysis time scaling is worse than expected: {}x",
+            ratio
+        );
     }
 }

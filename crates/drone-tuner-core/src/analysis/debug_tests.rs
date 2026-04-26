@@ -78,17 +78,28 @@ mod debug_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         println!("Debug: 25 Hz test");
-        println!("  Frequency peaks found: {}", result.frequency_analysis.peaks.len());
+        println!(
+            "  Frequency peaks found: {}",
+            result.frequency_analysis.peaks.len()
+        );
         for peak in &result.frequency_analysis.peaks {
-            println!("    Peak: {:.1} Hz, amplitude: {:.3}, Q: {:.1}",
-                    peak.frequency, peak.amplitude, peak.q_factor);
+            println!(
+                "    Peak: {:.1} Hz, amplitude: {:.3}, Q: {:.1}",
+                peak.frequency, peak.amplitude, peak.q_factor
+            );
         }
         println!("  Issues detected: {}", result.detected_issues.len());
         for issue in &result.detected_issues {
             println!("    Issue: {:?}", issue.issue_type);
         }
-        println!("  Filter recommendations: {}", result.filter_recommendations.len());
-        println!("  PID recommendations: {}", result.pid_recommendations.len());
+        println!(
+            "  Filter recommendations: {}",
+            result.filter_recommendations.len()
+        );
+        println!(
+            "  PID recommendations: {}",
+            result.pid_recommendations.len()
+        );
     }
 
     #[test]
@@ -96,18 +107,26 @@ mod debug_tests {
         let detector = OscillationDetector::new();
 
         println!("Debug: Frequency bands configuration");
-        println!("  P-term band: {:.1}-{:.1} Hz",
-                detector.config.frequency_bands.p_term_band.0,
-                detector.config.frequency_bands.p_term_band.1);
-        println!("  D-term band: {:.1}-{:.1} Hz",
-                detector.config.frequency_bands.d_term_band.0,
-                detector.config.frequency_bands.d_term_band.1);
-        println!("  Mechanical band: {:.1}-{:.1} Hz",
-                detector.config.frequency_bands.mechanical_band.0,
-                detector.config.frequency_bands.mechanical_band.1);
-        println!("  Motor noise band: {:.1}-{:.1} Hz",
-                detector.config.frequency_bands.motor_noise_band.0,
-                detector.config.frequency_bands.motor_noise_band.1);
+        println!(
+            "  P-term band: {:.1}-{:.1} Hz",
+            detector.config.frequency_bands.p_term_band.0,
+            detector.config.frequency_bands.p_term_band.1
+        );
+        println!(
+            "  D-term band: {:.1}-{:.1} Hz",
+            detector.config.frequency_bands.d_term_band.0,
+            detector.config.frequency_bands.d_term_band.1
+        );
+        println!(
+            "  Mechanical band: {:.1}-{:.1} Hz",
+            detector.config.frequency_bands.mechanical_band.0,
+            detector.config.frequency_bands.mechanical_band.1
+        );
+        println!(
+            "  Motor noise band: {:.1}-{:.1} Hz",
+            detector.config.frequency_bands.motor_noise_band.0,
+            detector.config.frequency_bands.motor_noise_band.1
+        );
 
         // Test classification
         let test_cases = [
@@ -130,30 +149,41 @@ mod debug_tests {
         let session = create_test_session_from_telemetry(telemetry);
 
         let mut engine = AnalysisEngine::new();
-        let freq_analysis = engine.perform_frequency_analysis(&session.telemetry)
+        let freq_analysis = engine
+            .perform_frequency_analysis(&session.telemetry)
             .expect("FFT analysis should succeed");
 
         println!("Debug: FFT Analysis");
         println!("  Frequency bins: {}", freq_analysis.frequencies.len());
-        println!("  Frequency range: {:.1} - {:.1} Hz",
-                freq_analysis.frequencies.first().unwrap_or(&0.0),
-                freq_analysis.frequencies.last().unwrap_or(&0.0));
+        println!(
+            "  Frequency range: {:.1} - {:.1} Hz",
+            freq_analysis.frequencies.first().unwrap_or(&0.0),
+            freq_analysis.frequencies.last().unwrap_or(&0.0)
+        );
 
         if let Some(psd) = freq_analysis.psd.get(&Axis::Roll) {
             println!("  Roll PSD values: {}", psd.len());
             let max_power = psd.iter().fold(0.0f32, |max, &val| val.max(max));
-            let max_idx = psd.iter().enumerate()
+            let max_idx = psd
+                .iter()
+                .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx)
                 .unwrap_or(0);
 
-            println!("  Max power: {:.6} at {:.1} Hz", max_power, freq_analysis.frequencies.get(max_idx).unwrap_or(&0.0));
+            println!(
+                "  Max power: {:.6} at {:.1} Hz",
+                max_power,
+                freq_analysis.frequencies.get(max_idx).unwrap_or(&0.0)
+            );
         }
 
         println!("  Spectral peaks found: {}", freq_analysis.peaks.len());
         for peak in &freq_analysis.peaks {
-            println!("    Peak: {:.1} Hz, magnitude: {:.6}, Q: {:.1}",
-                    peak.frequency, peak.magnitude, peak.q_factor);
+            println!(
+                "    Peak: {:.1} Hz, magnitude: {:.6}, Q: {:.1}",
+                peak.frequency, peak.magnitude, peak.q_factor
+            );
         }
     }
 

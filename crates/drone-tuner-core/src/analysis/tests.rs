@@ -110,12 +110,11 @@ fn create_test_telemetry_with_mechanical_resonance(
 }
 
 /// Create a test flight session with specified oscillations
-fn create_test_session_with_oscillations(
-    oscillations: &[(f32, f32, f32)],
-) -> FlightSession {
+fn create_test_session_with_oscillations(oscillations: &[(f32, f32, f32)]) -> FlightSession {
     let sample_count = 8192; // 8 seconds at 1kHz
     let sample_rate = 1000.0;
-    let telemetry = create_test_telemetry_with_oscillations(sample_count, sample_rate, oscillations);
+    let telemetry =
+        create_test_telemetry_with_oscillations(sample_count, sample_rate, oscillations);
 
     FlightSession {
         metadata: FlightMetadata {
@@ -146,7 +145,8 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect the P-term oscillation
-        let p_term_issues: Vec<_> = result.detected_issues
+        let p_term_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::PTermOscillation { .. }))
             .collect();
@@ -154,7 +154,8 @@ mod oscillation_detection_tests {
         // With enhanced detection, 25 Hz oscillations might be classified as mechanical due to high Q
         if p_term_issues.is_empty() {
             // Check if it was classified as mechanical resonance instead
-            let mechanical_issues: Vec<_> = result.detected_issues
+            let mechanical_issues: Vec<_> = result
+                .detected_issues
                 .iter()
                 .filter(|issue| matches!(issue.issue_type, IssueType::MechanicalResonance { .. }))
                 .collect();
@@ -163,22 +164,44 @@ mod oscillation_detection_tests {
                 // This is acceptable with the enhanced system - high Q sine waves get classified as mechanical
                 // which is more accurate than the previous system
             } else {
-                assert!(!p_term_issues.is_empty(), "Should detect P-term oscillation or mechanical resonance");
+                assert!(
+                    !p_term_issues.is_empty(),
+                    "Should detect P-term oscillation or mechanical resonance"
+                );
             }
         } else {
-            assert!(!p_term_issues.is_empty(), "Should detect P-term oscillation");
+            assert!(
+                !p_term_issues.is_empty(),
+                "Should detect P-term oscillation"
+            );
         }
 
         if !p_term_issues.is_empty() {
-            if let IssueType::PTermOscillation { frequency, amplitude } = &p_term_issues[0].issue_type {
-                assert!((frequency - 25.0).abs() < 5.0, "Frequency should be near 25 Hz, got {}", frequency);
-                assert!(*amplitude > 1.0, "Amplitude should be significant, got {}", amplitude);
+            if let IssueType::PTermOscillation {
+                frequency,
+                amplitude,
+            } = &p_term_issues[0].issue_type
+            {
+                assert!(
+                    (frequency - 25.0).abs() < 5.0,
+                    "Frequency should be near 25 Hz, got {}",
+                    frequency
+                );
+                assert!(
+                    *amplitude > 1.0,
+                    "Amplitude should be significant, got {}",
+                    amplitude
+                );
             }
         }
 
         // Check confidence is reasonable with enhanced system
         if !result.detected_issues.is_empty() {
-            assert!(result.detected_issues[0].confidence > 0.4, "Enhanced confidence should be reasonable, got {}", result.detected_issues[0].confidence);
+            assert!(
+                result.detected_issues[0].confidence > 0.4,
+                "Enhanced confidence should be reasonable, got {}",
+                result.detected_issues[0].confidence
+            );
         }
     }
 
@@ -193,28 +216,51 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect oscillation in the D-term frequency range (50-300 Hz extended)
-        let d_term_issues: Vec<_> = result.detected_issues
+        let d_term_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::DTermOscillation { .. }))
             .collect();
 
-        let mechanical_issues: Vec<_> = result.detected_issues
+        let mechanical_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::MechanicalResonance { .. }))
             .collect();
 
         // Should detect either D-term oscillation or mechanical resonance in D-term frequency range
-        assert!(!d_term_issues.is_empty() || !mechanical_issues.is_empty(), "Should detect oscillation in D-term frequency range");
+        assert!(
+            !d_term_issues.is_empty() || !mechanical_issues.is_empty(),
+            "Should detect oscillation in D-term frequency range"
+        );
 
         // Check the detected issue frequency
         if !d_term_issues.is_empty() {
-            if let IssueType::DTermOscillation { frequency, amplitude } = &d_term_issues[0].issue_type {
-                assert!((frequency - 120.0).abs() < 10.0, "Frequency should be near 120 Hz, got {}", frequency);
-                assert!(*amplitude > 0.5, "Amplitude should be significant, got {}", amplitude);
+            if let IssueType::DTermOscillation {
+                frequency,
+                amplitude,
+            } = &d_term_issues[0].issue_type
+            {
+                assert!(
+                    (frequency - 120.0).abs() < 10.0,
+                    "Frequency should be near 120 Hz, got {}",
+                    frequency
+                );
+                assert!(
+                    *amplitude > 0.5,
+                    "Amplitude should be significant, got {}",
+                    amplitude
+                );
             }
         } else if !mechanical_issues.is_empty() {
-            if let IssueType::MechanicalResonance { frequency, .. } = &mechanical_issues[0].issue_type {
-                assert!((frequency - 120.0).abs() < 10.0, "Frequency should be near 120 Hz, got {}", frequency);
+            if let IssueType::MechanicalResonance { frequency, .. } =
+                &mechanical_issues[0].issue_type
+            {
+                assert!(
+                    (frequency - 120.0).abs() < 10.0,
+                    "Frequency should be near 120 Hz, got {}",
+                    frequency
+                );
             }
         }
     }
@@ -224,7 +270,13 @@ mod oscillation_detection_tests {
         // Test data with a sharp mechanical resonance at 300 Hz (in new mechanical band 200-800 Hz)
         let sample_count = 8192;
         let sample_rate = 1000.0;
-        let telemetry = create_test_telemetry_with_mechanical_resonance(sample_count, sample_rate, 300.0, 8.0, 0);
+        let telemetry = create_test_telemetry_with_mechanical_resonance(
+            sample_count,
+            sample_rate,
+            300.0,
+            8.0,
+            0,
+        );
 
         let session = FlightSession {
             metadata: FlightMetadata {
@@ -244,22 +296,39 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect the mechanical resonance in the updated frequency band
-        let mechanical_issues: Vec<_> = result.detected_issues
+        let mechanical_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::MechanicalResonance { .. }))
             .collect();
 
         // With the updated ranges, a 300 Hz signal should be in mechanical band
         if mechanical_issues.is_empty() {
-            let motor_noise_issues: Vec<_> = result.detected_issues
+            let motor_noise_issues: Vec<_> = result
+                .detected_issues
                 .iter()
                 .filter(|issue| matches!(issue.issue_type, IssueType::Imbalance { .. }))
                 .collect();
-            assert!(!motor_noise_issues.is_empty(), "Should detect some form of issue at 300 Hz");
+            assert!(
+                !motor_noise_issues.is_empty(),
+                "Should detect some form of issue at 300 Hz"
+            );
         } else {
-            if let IssueType::MechanicalResonance { frequency, q_factor } = &mechanical_issues[0].issue_type {
-                assert!((frequency - 300.0).abs() < 30.0, "Frequency should be near 300 Hz, got {}", frequency);
-                assert!(*q_factor > 5.0, "Q-factor should meet mechanical resonance threshold, got {}", q_factor);
+            if let IssueType::MechanicalResonance {
+                frequency,
+                q_factor,
+            } = &mechanical_issues[0].issue_type
+            {
+                assert!(
+                    (frequency - 300.0).abs() < 30.0,
+                    "Frequency should be near 300 Hz, got {}",
+                    frequency
+                );
+                assert!(
+                    *q_factor > 5.0,
+                    "Q-factor should meet mechanical resonance threshold, got {}",
+                    q_factor
+                );
             }
         }
     }
@@ -274,17 +343,22 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect motor noise or imbalance in the extended frequency range
-        let motor_issues: Vec<_> = result.detected_issues
+        let motor_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::Imbalance { .. }))
             .collect();
 
-        let mechanical_issues: Vec<_> = result.detected_issues
+        let mechanical_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::MechanicalResonance { .. }))
             .collect();
 
-        assert!(!motor_issues.is_empty() || !mechanical_issues.is_empty(), "Should detect motor noise or mechanical resonance at 900 Hz");
+        assert!(
+            !motor_issues.is_empty() || !mechanical_issues.is_empty(),
+            "Should detect motor noise or mechanical resonance at 900 Hz"
+        );
     }
 
     #[test]
@@ -292,8 +366,8 @@ mod oscillation_detection_tests {
         // Test data with multiple oscillations across updated frequency bands
         // Use broader, noisier signals to reduce Q-factors for P/D-term classification
         let oscillations = vec![
-            (25.0, 3.0, 0.0),   // P-term on roll (3-50 Hz band) - should have low Q
-            (180.0, 2.0, 1.0),  // D-term on pitch (50-300 Hz band) - should have low Q
+            (25.0, 3.0, 0.0),  // P-term on roll (3-50 Hz band) - should have low Q
+            (180.0, 2.0, 1.0), // D-term on pitch (50-300 Hz band) - should have low Q
         ];
         let session = create_test_session_with_oscillations(&oscillations);
 
@@ -301,7 +375,11 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect multiple issues with the updated ranges
-        assert!(result.detected_issues.len() >= 1, "Should detect oscillations, got {}", result.detected_issues.len());
+        assert!(
+            result.detected_issues.len() >= 1,
+            "Should detect oscillations, got {}",
+            result.detected_issues.len()
+        );
 
         // With added noise, we should get more realistic Q-factors and better classification
         // Note: Due to the nature of test signals, this might still classify as mechanical
@@ -309,7 +387,11 @@ mod oscillation_detection_tests {
 
         // Verify enhanced confidence scores are reasonable
         for issue in &result.detected_issues {
-            assert!(issue.confidence > 0.3, "Enhanced confidence should be reasonable, got {}", issue.confidence);
+            assert!(
+                issue.confidence > 0.3,
+                "Enhanced confidence should be reasonable, got {}",
+                issue.confidence
+            );
         }
     }
 
@@ -375,18 +457,40 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Check enhanced confidence scores are reasonable
-        assert!(result.confidence_scores.overall > 0.4, "Enhanced overall confidence should be reasonable, got {}", result.confidence_scores.overall);
-        assert!(result.confidence_scores.oscillation_detection > 0.4, "Enhanced oscillation detection confidence should be reasonable, got {}", result.confidence_scores.oscillation_detection);
+        assert!(
+            result.confidence_scores.overall > 0.4,
+            "Enhanced overall confidence should be reasonable, got {}",
+            result.confidence_scores.overall
+        );
+        assert!(
+            result.confidence_scores.oscillation_detection > 0.4,
+            "Enhanced oscillation detection confidence should be reasonable, got {}",
+            result.confidence_scores.oscillation_detection
+        );
 
         // Check individual issue confidence with enhanced system
         for issue in &result.detected_issues {
-            assert!(issue.confidence > 0.3, "Enhanced individual issue confidence should be reasonable, got {}", issue.confidence);
-            assert!(issue.confidence <= 1.0, "Confidence should not exceed 1.0, got {}", issue.confidence);
+            assert!(
+                issue.confidence > 0.3,
+                "Enhanced individual issue confidence should be reasonable, got {}",
+                issue.confidence
+            );
+            assert!(
+                issue.confidence <= 1.0,
+                "Confidence should not exceed 1.0, got {}",
+                issue.confidence
+            );
         }
 
         // Test that cross-axis validation affects confidence
-        assert!(result.confidence_scores.filter_recommendations > 0.3, "Filter recommendation confidence should benefit from cross-axis validation");
-        assert!(result.confidence_scores.mechanical_issues > 0.2, "Mechanical issue confidence should be reasonable");
+        assert!(
+            result.confidence_scores.filter_recommendations > 0.3,
+            "Filter recommendation confidence should benefit from cross-axis validation"
+        );
+        assert!(
+            result.confidence_scores.mechanical_issues > 0.2,
+            "Mechanical issue confidence should be reasonable"
+        );
     }
 
     #[test]
@@ -399,10 +503,18 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect few or no issues
-        assert!(result.detected_issues.len() <= 1, "Clean flight should have minimal issues, got {}", result.detected_issues.len());
+        assert!(
+            result.detected_issues.len() <= 1,
+            "Clean flight should have minimal issues, got {}",
+            result.detected_issues.len()
+        );
 
         // Tune quality should be high
-        assert!(result.tune_quality_score > 70.0, "Clean flight should have high tune quality, got {}", result.tune_quality_score);
+        assert!(
+            result.tune_quality_score > 70.0,
+            "Clean flight should have high tune quality, got {}",
+            result.tune_quality_score
+        );
     }
 
     #[test]
@@ -415,23 +527,38 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should have filter recommendations
-        assert!(!result.filter_recommendations.is_empty(), "Should recommend filters for resonance in updated frequency band");
+        assert!(
+            !result.filter_recommendations.is_empty(),
+            "Should recommend filters for resonance in updated frequency band"
+        );
 
         // Check for notch filter recommendation
-        let notch_recommendations: Vec<_> = result.filter_recommendations
+        let notch_recommendations: Vec<_> = result
+            .filter_recommendations
             .iter()
-            .filter(|rec| matches!(
-                rec.recommendation_type,
-                FilterRecommendationType::ConfigureGyroNotch { .. }
-                    | FilterRecommendationType::AdjustDynamicNotch { .. }
-            ))
+            .filter(|rec| {
+                matches!(
+                    rec.recommendation_type,
+                    FilterRecommendationType::ConfigureGyroNotch { .. }
+                        | FilterRecommendationType::AdjustDynamicNotch { .. }
+                )
+            })
             .collect();
 
-        assert!(!notch_recommendations.is_empty(), "Should recommend notch filter for resonance");
+        assert!(
+            !notch_recommendations.is_empty(),
+            "Should recommend notch filter for resonance"
+        );
 
         if let Some(notch_rec) = notch_recommendations.first() {
-            assert!((notch_rec.frequency - 400.0).abs() < 50.0, "Notch frequency should be near resonance frequency");
-            assert!(notch_rec.q_factor.is_some(), "Notch filter should have Q-factor");
+            assert!(
+                (notch_rec.frequency - 400.0).abs() < 50.0,
+                "Notch frequency should be near resonance frequency"
+            );
+            assert!(
+                notch_rec.q_factor.is_some(),
+                "Notch filter should have Q-factor"
+            );
         }
     }
 
@@ -448,19 +575,26 @@ mod oscillation_detection_tests {
         // In gyro-only mode, PID recommendations are generated based on std dev and noise levels
         println!("PID recommendations: {}", result.pid_recommendations.len());
         for rec in &result.pid_recommendations {
-            println!("  {:?} {:?}: {:.1} -> {:.1}", rec.axis, rec.term, rec.current_value, rec.recommended_value);
+            println!(
+                "  {:?} {:?}: {:.1} -> {:.1}",
+                rec.axis, rec.term, rec.current_value, rec.recommended_value
+            );
         }
         // Note: PID recommendations in gyro-only mode may not trigger for this test case
 
         // Check for P-term reduction recommendation
-        let p_term_recommendations: Vec<_> = result.pid_recommendations
+        let p_term_recommendations: Vec<_> = result
+            .pid_recommendations
             .iter()
             .filter(|rec| matches!(rec.term, PidTerm::P))
             .collect();
 
         if !p_term_recommendations.is_empty() {
             let p_rec = p_term_recommendations[0];
-            assert!(p_rec.recommended_value < p_rec.current_value, "Should recommend reducing P-term");
+            assert!(
+                p_rec.recommended_value < p_rec.current_value,
+                "Should recommend reducing P-term"
+            );
         }
     }
 
@@ -474,7 +608,10 @@ mod oscillation_detection_tests {
 
         let q_factor = engine.estimate_q_factor(&frequencies, &psd, 2);
 
-        assert!(q_factor > 1.0, "Q-factor should be greater than 1 for a peak");
+        assert!(
+            q_factor > 1.0,
+            "Q-factor should be greater than 1 for a peak"
+        );
         assert!(q_factor < 100.0, "Q-factor should be reasonable");
     }
 
@@ -487,7 +624,11 @@ mod oscillation_detection_tests {
 
         let noise_floor = engine.estimate_noise_floor(&psd);
 
-        assert!((noise_floor - 1.0).abs() < 0.5, "Noise floor should be around 1.0, got {}", noise_floor);
+        assert!(
+            (noise_floor - 1.0).abs() < 0.5,
+            "Noise floor should be around 1.0, got {}",
+            noise_floor
+        );
     }
 
     #[test]
@@ -506,7 +647,10 @@ mod oscillation_detection_tests {
         // Test Hamming window
         engine.apply_window_function(&mut data, &WindowFunction::Hamming);
         assert!(data[0].re < 1.0, "Hamming window should attenuate edges");
-        assert!(data[4].re > data[0].re, "Hamming window should peak in middle");
+        assert!(
+            data[4].re > data[0].re,
+            "Hamming window should peak in middle"
+        );
     }
 
     #[test]
@@ -522,7 +666,8 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect P-term oscillations
-        let p_term_issues: Vec<_> = result.detected_issues
+        let p_term_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::PTermOscillation { .. }))
             .collect();
@@ -531,13 +676,22 @@ mod oscillation_detection_tests {
         // due to high Q-factors from pure sine waves. This is actually correct behavior.
         if p_term_issues.is_empty() {
             // Accept any detected issues as the enhancement is working
-            assert!(!result.detected_issues.is_empty(), "Should detect some oscillations with cross-axis correlation");
+            assert!(
+                !result.detected_issues.is_empty(),
+                "Should detect some oscillations with cross-axis correlation"
+            );
         } else {
-            assert!(!p_term_issues.is_empty(), "Should detect P-term oscillations with cross-axis correlation");
+            assert!(
+                !p_term_issues.is_empty(),
+                "Should detect P-term oscillations with cross-axis correlation"
+            );
         }
 
         // Enhanced confidence should be reasonable due to correlation validation
-        assert!(result.confidence_scores.overall > 0.5, "Cross-axis validation should boost confidence");
+        assert!(
+            result.confidence_scores.overall > 0.5,
+            "Cross-axis validation should boost confidence"
+        );
     }
 
     #[test]
@@ -556,22 +710,29 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // Should detect multiple issues with different severities
-        assert!(result.detected_issues.len() >= 3, "Should detect multiple issues with different severities");
+        assert!(
+            result.detected_issues.len() >= 3,
+            "Should detect multiple issues with different severities"
+        );
 
         // Check for critical severity issues
-        let critical_issues: Vec<_> = result.detected_issues
+        let critical_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.severity, Severity::Critical))
             .collect();
 
-        let high_issues: Vec<_> = result.detected_issues
+        let high_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.severity, Severity::High))
             .collect();
 
         // Should have both critical and high severity issues
-        assert!(!critical_issues.is_empty() || !high_issues.is_empty(),
-                "Should detect issues with appropriate severity levels");
+        assert!(
+            !critical_issues.is_empty() || !high_issues.is_empty(),
+            "Should detect issues with appropriate severity levels"
+        );
     }
 
     #[test]
@@ -584,15 +745,23 @@ mod oscillation_detection_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         // With lowered Q-factor threshold, should detect mechanical resonances more readily
-        let mechanical_issues: Vec<_> = result.detected_issues
+        let mechanical_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::MechanicalResonance { .. }))
             .collect();
 
         // Should detect mechanical resonance with the lowered threshold
         if !mechanical_issues.is_empty() {
-            if let IssueType::MechanicalResonance { frequency, q_factor } = &mechanical_issues[0].issue_type {
-                assert!((frequency - 400.0).abs() < 50.0, "Should detect resonance near 400 Hz");
+            if let IssueType::MechanicalResonance {
+                frequency,
+                q_factor,
+            } = &mechanical_issues[0].issue_type
+            {
+                assert!(
+                    (frequency - 400.0).abs() < 50.0,
+                    "Should detect resonance near 400 Hz"
+                );
                 assert!(*q_factor >= 5.0, "Q-factor should meet lowered threshold");
             }
         }

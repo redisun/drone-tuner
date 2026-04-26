@@ -160,7 +160,9 @@ impl TimeSemantics {
     fn finalize_current_period_into_best(&mut self) {
         if let (Some(start), Some(end)) = (self.current_period_start, self.current_period_end) {
             let duration = end.saturating_sub(start);
-            let best_duration = if let (Some(bstart), Some(bend)) = (self.best_period_start, self.best_period_end) {
+            let best_duration = if let (Some(bstart), Some(bend)) =
+                (self.best_period_start, self.best_period_end)
+            {
                 bend.saturating_sub(bstart)
             } else {
                 0
@@ -414,7 +416,7 @@ impl SimpleBlackboxParser {
         // We'll compute exact duration for the selected session from the time field if present
         let mut selected_min_time_us: Option<u64> = None;
         let mut selected_max_time_us: Option<u64> = None;
-        
+
         // Betaflight-style time semantics (period management, acceptance rules)
         let mut bf_time = TimeSemantics::default();
 
@@ -426,7 +428,7 @@ impl SimpleBlackboxParser {
             let headers = headers_result
                 .map_err(|e| BlackboxError::Parse(format!("Failed to parse headers: {:?}", e)))?;
 
-                debug!(
+            debug!(
                 "Processing session {} with {} main fields",
                 selected_session_index + 1,
                 headers.main_frame_def().len()
@@ -463,7 +465,7 @@ impl SimpleBlackboxParser {
                         // Track min/max time for exact Betaflight-style duration using crate API
                         // Prefer direct time_raw() from MainFrame to avoid reliance on field names/filters
                         let t = main_frame.time_raw(); // raw is microseconds in u64
-                        
+
                         match bf_time.on_time(t) {
                             FrameAction::Skip => {
                                 // Drop this frame entirely (backward time)
@@ -474,7 +476,7 @@ impl SimpleBlackboxParser {
                                 event_backfill.on_main_frame_time(t);
                             }
                         }
-                        
+
                         // Keep overall min/max for backward compatibility
                         selected_min_time_us = Some(selected_min_time_us.map_or(t, |m| m.min(t)));
                         selected_max_time_us = Some(selected_max_time_us.map_or(t, |m| m.max(t)));
@@ -610,69 +612,69 @@ impl SimpleBlackboxParser {
         bf_time.finalize_at_end();
 
         // Compute exact duration (ms) using time_raw() method (primary approach)
-        let duration_ms_override =
-            if let (Some(best_start), Some(best_end)) = bf_time.best_period() {
-                // Use the longest continuous period (filters out setup/historical data)
-                let delta_us = best_end.saturating_sub(best_start) as u64;
-                let ms = (delta_us + 500) / 1000; // round to nearest ms
-                debug!(
-                    "Session {}: time_raw() duration = {:.1}s (best period: {} - {} = {} μs)",
-                    selected_session_index + 1,
-                    ms as f32 / 1000.0,
-                    best_start,
-                    best_end,
-                    delta_us
-                );
-                Some(ms)
-            } else if let (Some(min_t), Some(max_t)) = (selected_min_time_us, selected_max_time_us) {
-                // Fallback to overall range if no periods detected
-                let delta_us = max_t.saturating_sub(min_t) as u64;
-                let ms = (delta_us + 500) / 1000; // round to nearest ms
-                debug!(
-                    "Session {}: time_raw() duration = {:.1}s (overall range: {} - {} = {} μs)",
-                    selected_session_index + 1,
-                    ms as f32 / 1000.0,
-                    min_t,
-                    max_t,
-                    delta_us
-                );
-                Some(ms)
-            } else if let Some(iter_idx) = field_mappings.iteration_idx {
-                // Fallback: compute duration using loopIteration (when time_raw() fails)
-                let (intervals, _) = self.extract_frame_intervals_from_raw_data(data);
-                let base_rate = intervals.base_rate.unwrap_or(8000.0);
-                let pid_denom = self.extract_pid_process_denom(data).unwrap_or(1) as f32;
-                let mut min_iter: Option<u64> = None;
-                let mut max_iter: Option<u64> = None;
-                // Re-iterate quickly to find min/max iteration for the selected session
-                if let Some(headers_result) = file.iter().nth(selected_session_index) {
-                    if let Ok(headers) = headers_result {
-                        let mut parser = headers.data_parser();
-                        while let Some(event) = parser.next() {
-                            if let ParserEvent::Main(main_frame) = event {
-                                if let Some(v) = main_frame.get(iter_idx) {
-                                    let it = self.main_value_to_u64(&v);
-                                    min_iter = Some(min_iter.map_or(it, |m| m.min(it)));
-                                    max_iter = Some(max_iter.map_or(it, |m| m.max(it)));
-                                }
+        let duration_ms_override = if let (Some(best_start), Some(best_end)) = bf_time.best_period()
+        {
+            // Use the longest continuous period (filters out setup/historical data)
+            let delta_us = best_end.saturating_sub(best_start) as u64;
+            let ms = (delta_us + 500) / 1000; // round to nearest ms
+            debug!(
+                "Session {}: time_raw() duration = {:.1}s (best period: {} - {} = {} μs)",
+                selected_session_index + 1,
+                ms as f32 / 1000.0,
+                best_start,
+                best_end,
+                delta_us
+            );
+            Some(ms)
+        } else if let (Some(min_t), Some(max_t)) = (selected_min_time_us, selected_max_time_us) {
+            // Fallback to overall range if no periods detected
+            let delta_us = max_t.saturating_sub(min_t) as u64;
+            let ms = (delta_us + 500) / 1000; // round to nearest ms
+            debug!(
+                "Session {}: time_raw() duration = {:.1}s (overall range: {} - {} = {} μs)",
+                selected_session_index + 1,
+                ms as f32 / 1000.0,
+                min_t,
+                max_t,
+                delta_us
+            );
+            Some(ms)
+        } else if let Some(iter_idx) = field_mappings.iteration_idx {
+            // Fallback: compute duration using loopIteration (when time_raw() fails)
+            let (intervals, _) = self.extract_frame_intervals_from_raw_data(data);
+            let base_rate = intervals.base_rate.unwrap_or(8000.0);
+            let pid_denom = self.extract_pid_process_denom(data).unwrap_or(1) as f32;
+            let mut min_iter: Option<u64> = None;
+            let mut max_iter: Option<u64> = None;
+            // Re-iterate quickly to find min/max iteration for the selected session
+            if let Some(headers_result) = file.iter().nth(selected_session_index) {
+                if let Ok(headers) = headers_result {
+                    let mut parser = headers.data_parser();
+                    while let Some(event) = parser.next() {
+                        if let ParserEvent::Main(main_frame) = event {
+                            if let Some(v) = main_frame.get(iter_idx) {
+                                let it = self.main_value_to_u64(&v);
+                                min_iter = Some(min_iter.map_or(it, |m| m.min(it)));
+                                max_iter = Some(max_iter.map_or(it, |m| m.max(it)));
                             }
                         }
                     }
                 }
-                if let (Some(min_it), Some(max_it)) = (min_iter, max_iter) {
-                    let iter_range = max_it.saturating_sub(min_it) as f32;
-                    let pid_rate = base_rate / pid_denom;
-                    let seconds = iter_range / pid_rate;
-                    let ms = (seconds * 1000.0).round() as u64;
-                    debug!("Session {}: iteration fallback duration = {:.1}s (iter {}..{}, base={:.1}Hz, denom {:.0}, pid={:.1}Hz)",
+            }
+            if let (Some(min_it), Some(max_it)) = (min_iter, max_iter) {
+                let iter_range = max_it.saturating_sub(min_it) as f32;
+                let pid_rate = base_rate / pid_denom;
+                let seconds = iter_range / pid_rate;
+                let ms = (seconds * 1000.0).round() as u64;
+                debug!("Session {}: iteration fallback duration = {:.1}s (iter {}..{}, base={:.1}Hz, denom {:.0}, pid={:.1}Hz)",
                           selected_session_index + 1, ms as f32 / 1000.0, min_it, max_it, base_rate, pid_denom, pid_rate);
-                    Some(ms)
-                } else {
-                    None
-                }
+                Some(ms)
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // Derive a sample rate from time_raw() if available as a robust fallback.
         // This reflects the actual logged main-frame rate (frames per second).
@@ -682,13 +684,12 @@ impl SimpleBlackboxParser {
                 let time_based_rate = total_main_frames as f32 / seconds;
                 // If interval headers were missing or we previously used the heuristic default,
                 // prefer the time-derived rate.
-                let guessed_default = (telemetry_data.sample_rate - self.get_intelligent_default()).abs() < 1.0;
+                let guessed_default =
+                    (telemetry_data.sample_rate - self.get_intelligent_default()).abs() < 1.0;
                 if !found_intervals || guessed_default {
                     debug!(
                         "Updated sample rate from time_raw(): {:.1}Hz ({} frames / {:.3}s)",
-                        time_based_rate,
-                        total_main_frames,
-                        seconds
+                        time_based_rate, total_main_frames, seconds
                     );
                     telemetry_data.sample_rate = time_based_rate;
                     // Summary when intervals missing
@@ -870,8 +871,6 @@ impl SimpleBlackboxParser {
         }
         None
     }
-
-    
 
     /// Parse pid_rate header to extract sample rate
     /// Format: "pid_rate:4000" (already in Hz)
@@ -1478,14 +1477,10 @@ impl SimpleBlackboxParser {
         }
     }
 
-    
-
     /// Convert blackbox MainValue to u64 for iteration tracking
     fn main_value_to_u64(&self, value: &MainValue) -> u64 {
         self.main_value_to_f32(value) as u64
     }
-
-    
 
     /// Create default hardware configuration when extraction fails
     fn create_default_hardware_configuration(&self, sample_rate: f32) -> HardwareConfiguration {
@@ -1600,7 +1595,7 @@ impl SimpleBlackboxParser {
                     let mut max_time: Option<u64> = None;
                     let mut min_iteration: Option<u64> = None;
                     let mut max_iteration: Option<u64> = None;
-                    
+
                     // Betaflight-style time semantics for this session
                     let mut bf_time = TimeSemantics::default();
 
@@ -1618,7 +1613,7 @@ impl SimpleBlackboxParser {
                                 }
                                 FrameAction::AcceptSamePeriod | FrameAction::AcceptNewPeriod => {}
                             }
-                            
+
                             // Keep overall min/max for backward compatibility
                             min_time = Some(min_time.map_or(time, |min| min.min(time)));
                             max_time = Some(max_time.map_or(time, |max| max.max(time)));
@@ -1640,9 +1635,11 @@ impl SimpleBlackboxParser {
 
                     // Finalize the best period (handle last period)
                     bf_time.finalize_at_end();
-                    
+
                     // Calculate duration using the best continuous time period (Betaflight method)
-                    let duration_s = if let (Some(best_start), Some(best_end)) = bf_time.best_period() {
+                    let duration_s = if let (Some(best_start), Some(best_end)) =
+                        bf_time.best_period()
+                    {
                         // Use the longest continuous period (filters out setup/historical data)
                         let duration = (best_end - best_start) as f32 / 1_000_000.0;
                         debug!(
@@ -1666,7 +1663,8 @@ impl SimpleBlackboxParser {
                             max_t - min_t
                         );
                         duration
-                    } else if let (Some(min_iter), Some(max_iter)) = (min_iteration, max_iteration) {
+                    } else if let (Some(min_iter), Some(max_iter)) = (min_iteration, max_iteration)
+                    {
                         // Use PID rate: loopIteration increments at base_rate / pid_process_denom
                         let (intervals, _) = self.extract_frame_intervals_from_raw_data(data);
                         let base_rate = intervals.base_rate.unwrap_or(8000.0);

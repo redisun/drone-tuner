@@ -196,12 +196,12 @@ pub enum PatternMatcher {
         /// Template pattern for correlation matching
         template: Vec<f32>,
         /// Correlation threshold for pattern detection
-        threshold: f32
+        threshold: f32,
     },
     /// Machine learning based classification
     ML {
         /// Identifier for the ML model to use
-        model_id: String
+        model_id: String,
     },
 }
 
@@ -365,7 +365,9 @@ impl AnalysisEngine {
         );
 
         // Stage 4: PID analysis
-        let pid_recommendations = self.pid_analyzer.analyze(&session.telemetry, &session.metadata.hardware.pid_config)?;
+        let pid_recommendations = self
+            .pid_analyzer
+            .analyze(&session.telemetry, &session.metadata.hardware.pid_config)?;
         tracing::debug!(
             "Generated {} PID recommendations",
             pid_recommendations.len()
@@ -442,7 +444,11 @@ impl AnalysisEngine {
             // Estimate noise floor and SNR
             let noise_level = self.estimate_noise_floor(&psd_values);
             let max_signal = psd_values.iter().fold(0.0f32, |acc, &x| acc.max(x));
-            let snr = if noise_level > 0.0 { max_signal / noise_level } else { 100.0 };
+            let snr = if noise_level > 0.0 {
+                max_signal / noise_level
+            } else {
+                100.0
+            };
 
             noise_floor.insert(axis.clone(), noise_level);
             snr_values.insert(axis.clone(), snr);
@@ -450,7 +456,8 @@ impl AnalysisEngine {
         }
 
         // Compute cross-axis correlations
-        let cross_correlation = self.compute_cross_axis_correlations(&all_axis_data, sample_rate)?;
+        let cross_correlation =
+            self.compute_cross_axis_correlations(&all_axis_data, sample_rate)?;
 
         // Assess signal quality
         let signal_quality = self.assess_signal_quality(&snr_values, telemetry)?;
@@ -716,7 +723,8 @@ impl AnalysisEngine {
                 let axis2 = &axes[j];
 
                 if let (Some(&data1), Some(&data2)) = (axis_data.get(axis1), axis_data.get(axis2)) {
-                    let correlation = self.compute_correlation_coefficient(data1, data2, sample_rate)?;
+                    let correlation =
+                        self.compute_correlation_coefficient(data1, data2, sample_rate)?;
                     cross_correlations.insert((axis1.clone(), axis2.clone()), correlation);
                 }
             }
@@ -898,7 +906,9 @@ impl AnalysisEngine {
                             motors: vec![1, 2, 3, 4],
                         },
                         match osc.severity {
-                            OscillationSeverity::Critical | OscillationSeverity::High => Severity::Medium,
+                            OscillationSeverity::Critical | OscillationSeverity::High => {
+                                Severity::Medium
+                            }
                             OscillationSeverity::Medium => Severity::Medium,
                             OscillationSeverity::Low => Severity::Low,
                         },
@@ -924,7 +934,8 @@ impl AnalysisEngine {
     ) -> Result<ConfidenceScores> {
         // Calculate confidence based on data quality and consistency
         let data_quality = freq_analysis.signal_quality.overall_quality;
-        let detection_consistency = self.assess_detection_consistency_enhanced(oscillations, freq_analysis);
+        let detection_consistency =
+            self.assess_detection_consistency_enhanced(oscillations, freq_analysis);
         let cross_axis_validation = self.assess_cross_axis_validation(oscillations, freq_analysis);
 
         let overall = (data_quality + detection_consistency + cross_axis_validation) / 3.0;
@@ -955,7 +966,11 @@ impl AnalysisEngine {
             let mut detection_confidence = oscillation.confidence;
 
             // Boost confidence for high-quality signals
-            if let Some(&snr) = freq_analysis.signal_quality.snr.get(&oscillation.affected_axes[0]) {
+            if let Some(&snr) = freq_analysis
+                .signal_quality
+                .snr
+                .get(&oscillation.affected_axes[0])
+            {
                 if snr > 20.0 {
                     detection_confidence *= 1.1;
                 } else if snr < 5.0 {
@@ -999,15 +1014,27 @@ impl AnalysisEngine {
             let correlation_score = match oscillation.oscillation_type {
                 OscillationType::PTermOscillation => {
                     // P-term should have high cross-axis correlation
-                    if oscillation.cross_axis_correlation > 0.7 { 1.0 } else { 0.5 }
+                    if oscillation.cross_axis_correlation > 0.7 {
+                        1.0
+                    } else {
+                        0.5
+                    }
                 }
                 OscillationType::DTermOscillation => {
                     // D-term should have low cross-axis correlation
-                    if oscillation.cross_axis_correlation < 0.5 { 1.0 } else { 0.6 }
+                    if oscillation.cross_axis_correlation < 0.5 {
+                        1.0
+                    } else {
+                        0.6
+                    }
                 }
                 OscillationType::MechanicalResonance => {
                     // Mechanical resonance can vary but should be consistent
-                    if oscillation.q_factor > 5.0 { 0.9 } else { 0.7 }
+                    if oscillation.q_factor > 5.0 {
+                        0.9
+                    } else {
+                        0.7
+                    }
                 }
                 OscillationType::MotorNoise => {
                     // Motor noise detection is less reliable
@@ -1172,16 +1199,14 @@ impl OscillationDetector {
 
         for peak in &freq_analysis.peaks {
             // Enhanced classification with cross-axis correlation
-            let cross_axis_correlation = self.get_cross_axis_correlation_for_peak(
-                peak,
-                freq_analysis
-            );
+            let cross_axis_correlation =
+                self.get_cross_axis_correlation_for_peak(peak, freq_analysis);
 
             let oscillation_type = self.classify_oscillation_type_enhanced(
                 peak.frequency,
                 peak.q_factor,
                 cross_axis_correlation,
-                hardware
+                hardware,
             );
 
             // Enhanced severity assessment
@@ -1189,7 +1214,7 @@ impl OscillationDetector {
                 peak.magnitude,
                 peak.q_factor,
                 &oscillation_type,
-                hardware
+                hardware,
             );
 
             // Enhanced confidence calculation
@@ -1197,7 +1222,7 @@ impl OscillationDetector {
                 peak,
                 &oscillation_type,
                 cross_axis_correlation,
-                freq_analysis
+                freq_analysis,
             );
 
             oscillations.push(DetectedOscillation {
@@ -1207,7 +1232,11 @@ impl OscillationDetector {
                 oscillation_type: oscillation_type.clone(),
                 affected_axes: vec![peak.axis.clone()],
                 confidence,
-                description: self.generate_description_enhanced(&oscillation_type, peak.frequency, &severity),
+                description: self.generate_description_enhanced(
+                    &oscillation_type,
+                    peak.frequency,
+                    &severity,
+                ),
                 cross_axis_correlation,
                 severity,
             });
@@ -1316,30 +1345,39 @@ impl OscillationDetector {
         // Simplified: return the first available cross-correlation value
         // In a full implementation, we would compute correlation at the specific frequency
         match peak.axis {
-            Axis::Roll => {
-                freq_analysis.cross_correlation
-                    .get(&(Axis::Roll, Axis::Pitch))
-                    .or_else(|| freq_analysis.cross_correlation.get(&(Axis::Pitch, Axis::Roll)))
-                    .and_then(|v| v.first())
-                    .copied()
-                    .unwrap_or(0.0)
-            }
-            Axis::Pitch => {
-                freq_analysis.cross_correlation
-                    .get(&(Axis::Roll, Axis::Pitch))
-                    .or_else(|| freq_analysis.cross_correlation.get(&(Axis::Pitch, Axis::Roll)))
-                    .and_then(|v| v.first())
-                    .copied()
-                    .unwrap_or(0.0)
-            }
-            Axis::Yaw => {
-                freq_analysis.cross_correlation
-                    .get(&(Axis::Roll, Axis::Yaw))
-                    .or_else(|| freq_analysis.cross_correlation.get(&(Axis::Yaw, Axis::Roll)))
-                    .and_then(|v| v.first())
-                    .copied()
-                    .unwrap_or(0.0)
-            }
+            Axis::Roll => freq_analysis
+                .cross_correlation
+                .get(&(Axis::Roll, Axis::Pitch))
+                .or_else(|| {
+                    freq_analysis
+                        .cross_correlation
+                        .get(&(Axis::Pitch, Axis::Roll))
+                })
+                .and_then(|v| v.first())
+                .copied()
+                .unwrap_or(0.0),
+            Axis::Pitch => freq_analysis
+                .cross_correlation
+                .get(&(Axis::Roll, Axis::Pitch))
+                .or_else(|| {
+                    freq_analysis
+                        .cross_correlation
+                        .get(&(Axis::Pitch, Axis::Roll))
+                })
+                .and_then(|v| v.first())
+                .copied()
+                .unwrap_or(0.0),
+            Axis::Yaw => freq_analysis
+                .cross_correlation
+                .get(&(Axis::Roll, Axis::Yaw))
+                .or_else(|| {
+                    freq_analysis
+                        .cross_correlation
+                        .get(&(Axis::Yaw, Axis::Roll))
+                })
+                .and_then(|v| v.first())
+                .copied()
+                .unwrap_or(0.0),
         }
     }
 
@@ -1492,44 +1530,44 @@ impl OscillationDetector {
         };
 
         let base_description = match osc_type {
-            OscillationType::PTermOscillation => {
-                match severity {
-                    OscillationSeverity::Critical => {
-                        format!("Severe P-term oscillation at {:.1} Hz causing flight instability. Immediately reduce P gain by 20-30%.", frequency)
-                    }
-                    OscillationSeverity::High => {
-                        format!("Strong P-term oscillation at {:.1} Hz affecting performance. Reduce P gain by 10-20%.", frequency)
-                    }
-                    _ => {
-                        format!("P-term oscillation at {:.1} Hz. Consider reducing P gain by 5-10%.", frequency)
-                    }
+            OscillationType::PTermOscillation => match severity {
+                OscillationSeverity::Critical => {
+                    format!("Severe P-term oscillation at {:.1} Hz causing flight instability. Immediately reduce P gain by 20-30%.", frequency)
                 }
-            }
-            OscillationType::DTermOscillation => {
-                match severity {
-                    OscillationSeverity::High | OscillationSeverity::Critical => {
-                        format!("High-frequency D-term oscillation at {:.1} Hz. Reduce D gain or lower D-term filter cutoff significantly.", frequency)
-                    }
-                    _ => {
-                        format!("D-term oscillation at {:.1} Hz. Consider reducing D gain or lowering D-term filter cutoff.", frequency)
-                    }
+                OscillationSeverity::High => {
+                    format!("Strong P-term oscillation at {:.1} Hz affecting performance. Reduce P gain by 10-20%.", frequency)
                 }
-            }
-            OscillationType::MechanicalResonance => {
-                match severity {
-                    OscillationSeverity::Critical => {
-                        format!("DANGEROUS mechanical resonance at {:.1} Hz. Check frame integrity and add notch filter immediately.", frequency)
-                    }
-                    OscillationSeverity::High => {
-                        format!("Sharp mechanical resonance at {:.1} Hz affecting flight quality. Add notch filter or check hardware.", frequency)
-                    }
-                    _ => {
-                        format!("Mechanical resonance at {:.1} Hz. Consider adding notch filter or checking for loose hardware.", frequency)
-                    }
+                _ => {
+                    format!(
+                        "P-term oscillation at {:.1} Hz. Consider reducing P gain by 5-10%.",
+                        frequency
+                    )
                 }
-            }
+            },
+            OscillationType::DTermOscillation => match severity {
+                OscillationSeverity::High | OscillationSeverity::Critical => {
+                    format!("High-frequency D-term oscillation at {:.1} Hz. Reduce D gain or lower D-term filter cutoff significantly.", frequency)
+                }
+                _ => {
+                    format!("D-term oscillation at {:.1} Hz. Consider reducing D gain or lowering D-term filter cutoff.", frequency)
+                }
+            },
+            OscillationType::MechanicalResonance => match severity {
+                OscillationSeverity::Critical => {
+                    format!("DANGEROUS mechanical resonance at {:.1} Hz. Check frame integrity and add notch filter immediately.", frequency)
+                }
+                OscillationSeverity::High => {
+                    format!("Sharp mechanical resonance at {:.1} Hz affecting flight quality. Add notch filter or check hardware.", frequency)
+                }
+                _ => {
+                    format!("Mechanical resonance at {:.1} Hz. Consider adding notch filter or checking for loose hardware.", frequency)
+                }
+            },
             OscillationType::MotorNoise => {
-                format!("Motor/propeller noise at {:.1} Hz. Check motor/prop balance and mounting.", frequency)
+                format!(
+                    "Motor/propeller noise at {:.1} Hz. Check motor/prop balance and mounting.",
+                    frequency
+                )
             }
         };
 
@@ -1544,7 +1582,7 @@ impl Default for OscillationDetectorConfig {
             resonance_q_threshold: 5.0, // Lowered from 10.0 based on FPV physics feedback
             frequency_bands: FrequencyBands {
                 // Updated frequency ranges based on FPV physics analysis
-                p_term_band: (3.0, 50.0),   // Extended lower for large builds
+                p_term_band: (3.0, 50.0), // Extended lower for large builds
                 d_term_band: (50.0, 300.0), // Extended upper range
                 mechanical_band: (200.0, 800.0), // Reduced overlap, extended range
                 motor_noise_band: (200.0, 1200.0), // Extended for larger motors
@@ -1555,11 +1593,11 @@ impl Default for OscillationDetectorConfig {
                 mechanical_correlation: 0.6, // Medium correlation for mechanical
             },
             severity_params: SeverityParameters {
-                critical_amplitude: 20.0,  // Flight unsafe amplitude
-                high_amplitude: 10.0,      // Performance significantly degraded
-                medium_amplitude: 5.0,     // Noticeable but manageable
-                critical_q_factor: 15.0,   // Very sharp resonances are dangerous
-                high_q_factor: 8.0,        // Sharp resonances need attention
+                critical_amplitude: 20.0, // Flight unsafe amplitude
+                high_amplitude: 10.0,     // Performance significantly degraded
+                medium_amplitude: 5.0,    // Noticeable but manageable
+                critical_q_factor: 15.0,  // Very sharp resonances are dangerous
+                high_q_factor: 8.0,       // Sharp resonances need attention
             },
         }
     }
@@ -1593,7 +1631,11 @@ impl FilterOptimizer {
             .collect();
 
         // Sort by amplitude (strongest first)
-        mechanical_resonances.sort_by(|a, b| b.amplitude.partial_cmp(&a.amplitude).unwrap_or(std::cmp::Ordering::Equal));
+        mechanical_resonances.sort_by(|a, b| {
+            b.amplitude
+                .partial_cmp(&a.amplitude)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Handle mechanical resonances with appropriate Betaflight filters
         for oscillation in mechanical_resonances {
@@ -1614,7 +1656,8 @@ impl FilterOptimizer {
                     q_factor: Some(q_factor),
                     expected_improvement: format!(
                         "Expected {:.1}% reduction in mechanical resonance at {:.0} Hz",
-                        improvement_threshold * 100.0, freq
+                        improvement_threshold * 100.0,
+                        freq
                     ),
                     priority: Priority::High,
                 });
@@ -1641,7 +1684,12 @@ impl FilterOptimizer {
                     ),
                     priority: Priority::Medium,
                 });
-            } else if hardware.flight_controller.firmware.to_lowercase().contains("betaflight") {
+            } else if hardware
+                .flight_controller
+                .firmware
+                .to_lowercase()
+                .contains("betaflight")
+            {
                 // Consider RPM filter for motor-related frequencies
                 if freq > 50.0 && freq < 200.0 && oscillation.affected_axes.len() > 1 {
                     recommendations.push(FilterRecommendation {
@@ -1671,7 +1719,9 @@ impl FilterOptimizer {
             // Determine which D-term filter stage to adjust
             let current_dterm_filters = &hardware.filter_config.dterm_filters;
 
-            if current_dterm_filters.is_empty() || current_dterm_filters[0].cutoff > recommended_cutoff {
+            if current_dterm_filters.is_empty()
+                || current_dterm_filters[0].cutoff > recommended_cutoff
+            {
                 // Adjust first stage D-term filter
                 recommendations.push(FilterRecommendation {
                     recommendation_type: FilterRecommendationType::AdjustDtermLowpass {
@@ -1697,10 +1747,17 @@ impl FilterOptimizer {
         }
 
         // Always suggest enabling RPM filter if not mentioned and we have motor-related oscillations
-        if !recommendations.iter().any(|r| matches!(r.recommendation_type, FilterRecommendationType::ConfigureRpmFilter { .. })) {
+        if !recommendations.iter().any(|r| {
+            matches!(
+                r.recommendation_type,
+                FilterRecommendationType::ConfigureRpmFilter { .. }
+            )
+        }) {
             let motor_oscillations: Vec<_> = oscillations
                 .iter()
-                .filter(|osc| osc.frequency > 50.0 && osc.frequency < 200.0 && osc.affected_axes.len() >= 2)
+                .filter(|osc| {
+                    osc.frequency > 50.0 && osc.frequency < 200.0 && osc.affected_axes.len() >= 2
+                })
                 .collect();
 
             if !motor_oscillations.is_empty() {
@@ -1713,7 +1770,9 @@ impl FilterOptimizer {
                     },
                     frequency: motor_oscillations[0].frequency,
                     q_factor: Some(500.0),
-                    expected_improvement: "Enable bidirectional DShot and RPM filtering for motor noise reduction".to_string(),
+                    expected_improvement:
+                        "Enable bidirectional DShot and RPM filtering for motor noise reduction"
+                            .to_string(),
                     priority: Priority::High,
                 });
             }
@@ -1746,7 +1805,11 @@ impl PidAnalyzer {
         }
     }
 
-    fn analyze(&self, telemetry: &TelemetryData, pid_config: &PidConfiguration) -> Result<Vec<PidRecommendation>> {
+    fn analyze(
+        &self,
+        telemetry: &TelemetryData,
+        pid_config: &PidConfiguration,
+    ) -> Result<Vec<PidRecommendation>> {
         let mut recommendations = Vec::new();
 
         // Check if we have RC command data
@@ -1780,9 +1843,21 @@ impl PidAnalyzer {
             )?;
 
             // Analyze each axis and generate recommendations
-            recommendations.extend(self.analyze_axis_responses(&roll_responses, Axis::Roll, pid_config)?);
-            recommendations.extend(self.analyze_axis_responses(&pitch_responses, Axis::Pitch, pid_config)?);
-            recommendations.extend(self.analyze_axis_responses(&yaw_responses, Axis::Yaw, pid_config)?);
+            recommendations.extend(self.analyze_axis_responses(
+                &roll_responses,
+                Axis::Roll,
+                pid_config,
+            )?);
+            recommendations.extend(self.analyze_axis_responses(
+                &pitch_responses,
+                Axis::Pitch,
+                pid_config,
+            )?);
+            recommendations.extend(self.analyze_axis_responses(
+                &yaw_responses,
+                Axis::Yaw,
+                pid_config,
+            )?);
 
             tracing::info!(
                 "PID analysis found {} step responses: {} roll, {} pitch, {} yaw",
@@ -2187,7 +2262,11 @@ impl PidAnalyzer {
     }
 
     /// Analyze PID error signals when available
-    fn analyze_pid_errors(&self, telemetry: &TelemetryData, pid_config: &PidConfiguration) -> Result<Vec<PidRecommendation>> {
+    fn analyze_pid_errors(
+        &self,
+        telemetry: &TelemetryData,
+        pid_config: &PidConfiguration,
+    ) -> Result<Vec<PidRecommendation>> {
         let mut recommendations = Vec::new();
 
         // Analyze each axis PID error
@@ -2445,9 +2524,9 @@ mod basic_tests {
         // Create a test flight session with specific PID values
         let test_pid_config = PidConfiguration {
             roll: PidValues {
-                p: 76.0,   // Actual FC value from the problem description
-                i: 122.0,  // Actual FC value
-                d: 57.0,   // Actual FC value
+                p: 76.0,  // Actual FC value from the problem description
+                i: 122.0, // Actual FC value
+                d: 57.0,  // Actual FC value
                 f: None,
             },
             pitch: PidValues {
@@ -2487,14 +2566,22 @@ mod basic_tests {
         let telemetry = TelemetryData {
             sample_rate: 4000.0,
             gyro: TimeSeriesVector3 {
-                x: vec![0.0; 1000].into_iter().enumerate().map(|(i, _)| {
-                    // Create noisy data that should trigger D-term reduction
-                    (i as f32 * 0.1).sin() * 20.0 + (i as f32 * 2.0).sin() * 5.0
-                }).collect(),
-                y: vec![0.0; 1000].into_iter().enumerate().map(|(i, _)| {
-                    // Create oscillatory data that should trigger P-term reduction
-                    (i as f32 * 0.05).sin() * 30.0
-                }).collect(),
+                x: vec![0.0; 1000]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        // Create noisy data that should trigger D-term reduction
+                        (i as f32 * 0.1).sin() * 20.0 + (i as f32 * 2.0).sin() * 5.0
+                    })
+                    .collect(),
+                y: vec![0.0; 1000]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        // Create oscillatory data that should trigger P-term reduction
+                        (i as f32 * 0.05).sin() * 30.0
+                    })
+                    .collect(),
                 z: vec![0.0; 1000],
             },
             accel: TimeSeriesVector3 {
@@ -2510,10 +2597,14 @@ mod basic_tests {
                 throttle: vec![],
             },
             pid_error: PidErrorTrace {
-                roll: vec![0.0; 1000].into_iter().enumerate().map(|(i, _)| {
-                    // Create persistent error bias to trigger I-term increase
-                    3.0 + (i as f32 * 0.01).sin() * 0.5
-                }).collect(),
+                roll: vec![0.0; 1000]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        // Create persistent error bias to trigger I-term increase
+                        3.0 + (i as f32 * 0.01).sin() * 0.5
+                    })
+                    .collect(),
                 pitch: vec![],
                 yaw: vec![],
             },
@@ -2526,11 +2617,17 @@ mod basic_tests {
         let recommendations = analyzer.analyze(&telemetry, &test_pid_config).unwrap();
 
         // Verify that recommendations exist and use actual PID values
-        assert!(!recommendations.is_empty(), "Should generate recommendations for noisy data");
+        assert!(
+            !recommendations.is_empty(),
+            "Should generate recommendations for noisy data"
+        );
 
         // Find a recommendation and verify it uses actual PID values
         let roll_recommendation = recommendations.iter().find(|r| r.axis == Axis::Roll);
-        assert!(roll_recommendation.is_some(), "Should have roll axis recommendation");
+        assert!(
+            roll_recommendation.is_some(),
+            "Should have roll axis recommendation"
+        );
 
         let rec = roll_recommendation.unwrap();
         // Should use actual PID values as current_value, not hardcoded 50.0
@@ -2551,24 +2648,33 @@ mod basic_tests {
 
         // The recommended value should be close to expected (within 10%)
         let diff_ratio = (rec.recommended_value - expected_reduction).abs() / expected_reduction;
-        assert!(diff_ratio < 0.1,
+        assert!(
+            diff_ratio < 0.1,
             "Recommended value {:.1} should be close to expected {:.1} (diff ratio: {:.3})",
-            rec.recommended_value, expected_reduction, diff_ratio
+            rec.recommended_value,
+            expected_reduction,
+            diff_ratio
         );
 
         // Most importantly: verify we're NOT using hardcoded 50.0
-        assert_ne!(rec.current_value, 50.0, "Should not use hardcoded 50.0 value");
+        assert_ne!(
+            rec.current_value, 50.0,
+            "Should not use hardcoded 50.0 value"
+        );
 
         println!("✅ PID recommendations now use actual values:");
         for rec in &recommendations {
-            println!("  {:?} {}: {:.1} → {:.1}", rec.axis,
+            println!(
+                "  {:?} {}: {:.1} → {:.1}",
+                rec.axis,
                 match rec.term {
                     PidTerm::P => "P",
                     PidTerm::I => "I",
                     PidTerm::D => "D",
                     PidTerm::F => "F",
                 },
-                rec.current_value, rec.recommended_value
+                rec.current_value,
+                rec.recommended_value
             );
         }
     }

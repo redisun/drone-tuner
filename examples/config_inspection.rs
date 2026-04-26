@@ -61,8 +61,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🎮 RC Configuration:");
     println!(
         "   RC Rates: [{:.1}, {:.1}, {:.1}]",
-        session.metadata.hardware.pid_config.settings.rates.roll_rate,
-        session.metadata.hardware.pid_config.settings.rates.pitch_rate,
+        session
+            .metadata
+            .hardware
+            .pid_config
+            .settings
+            .rates
+            .roll_rate,
+        session
+            .metadata
+            .hardware
+            .pid_config
+            .settings
+            .rates
+            .pitch_rate,
         session.metadata.hardware.pid_config.settings.rates.yaw_rate
     );
 

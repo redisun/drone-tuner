@@ -58,14 +58,16 @@ fn create_realistic_oscillation_telemetry(
     }
 }
 
-fn create_realistic_session(
-    frequency: f32,
-    amplitude: f32,
-    axis_index: usize,
-) -> FlightSession {
+fn create_realistic_session(frequency: f32, amplitude: f32, axis_index: usize) -> FlightSession {
     let sample_count = 16384; // 16 seconds at 1kHz
     let sample_rate = 1000.0;
-    let telemetry = create_realistic_oscillation_telemetry(frequency, amplitude, axis_index, sample_count, sample_rate);
+    let telemetry = create_realistic_oscillation_telemetry(
+        frequency,
+        amplitude,
+        axis_index,
+        sample_count,
+        sample_rate,
+    );
 
     FlightSession {
         metadata: FlightMetadata {
@@ -99,35 +101,49 @@ mod realistic_tests {
         for issue in &result.detected_issues {
             println!("    {:?}", issue.issue_type);
         }
-        println!("  PID recommendations: {}", result.pid_recommendations.len());
+        println!(
+            "  PID recommendations: {}",
+            result.pid_recommendations.len()
+        );
         for rec in &result.pid_recommendations {
-            println!("    {:?} {:?}: {:.1} -> {:.1} ({})", rec.axis, rec.term, rec.current_value, rec.recommended_value, rec.reason);
+            println!(
+                "    {:?} {:?}: {:.1} -> {:.1} ({})",
+                rec.axis, rec.term, rec.current_value, rec.recommended_value, rec.reason
+            );
         }
 
         // Should detect P-term oscillation (or mechanical resonance with enhanced detection)
-        let p_term_issues: Vec<_> = result.detected_issues
+        let p_term_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::PTermOscillation { .. }))
             .collect();
 
-        let mechanical_issues: Vec<_> = result.detected_issues
+        let mechanical_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::MechanicalResonance { .. }))
             .collect();
 
         // With enhanced detection, high-Q sine waves get classified as mechanical resonance
-        assert!(!p_term_issues.is_empty() || !mechanical_issues.is_empty(), "Should detect P-term oscillation or mechanical resonance with enhanced detection");
+        assert!(
+            !p_term_issues.is_empty() || !mechanical_issues.is_empty(),
+            "Should detect P-term oscillation or mechanical resonance with enhanced detection"
+        );
 
         // Should recommend reducing P-gain (in gyro-only mode this comes from high std dev)
-        let p_recommendations: Vec<_> = result.pid_recommendations
+        let p_recommendations: Vec<_> = result
+            .pid_recommendations
             .iter()
             .filter(|rec| matches!(rec.term, PidTerm::P))
             .collect();
 
         // Note: might not trigger in gyro-only mode depending on thresholds
         if !p_recommendations.is_empty() {
-            assert!(p_recommendations[0].recommended_value < p_recommendations[0].current_value,
-                "Should recommend reducing P-gain");
+            assert!(
+                p_recommendations[0].recommended_value < p_recommendations[0].current_value,
+                "Should recommend reducing P-gain"
+            );
         }
     }
 
@@ -141,34 +157,48 @@ mod realistic_tests {
 
         println!("Strong mechanical resonance test:");
         println!("  Issues detected: {}", result.detected_issues.len());
-        println!("  Filter recommendations: {}", result.filter_recommendations.len());
+        println!(
+            "  Filter recommendations: {}",
+            result.filter_recommendations.len()
+        );
 
         // Should detect mechanical resonance
-        let mechanical_issues: Vec<_> = result.detected_issues
+        let mechanical_issues: Vec<_> = result
+            .detected_issues
             .iter()
             .filter(|issue| matches!(issue.issue_type, IssueType::MechanicalResonance { .. }))
             .collect();
 
         if mechanical_issues.is_empty() {
             // Might be classified as motor noise, check for that
-            let motor_issues: Vec<_> = result.detected_issues
+            let motor_issues: Vec<_> = result
+                .detected_issues
                 .iter()
                 .filter(|issue| matches!(issue.issue_type, IssueType::Imbalance { .. }))
                 .collect();
-            assert!(!motor_issues.is_empty(), "Should detect some form of high-frequency issue");
+            assert!(
+                !motor_issues.is_empty(),
+                "Should detect some form of high-frequency issue"
+            );
         }
 
         // Should recommend notch filter
-        let notch_recommendations: Vec<_> = result.filter_recommendations
+        let notch_recommendations: Vec<_> = result
+            .filter_recommendations
             .iter()
-            .filter(|rec| matches!(
-                rec.recommendation_type,
-                FilterRecommendationType::ConfigureGyroNotch { .. }
-                    | FilterRecommendationType::AdjustDynamicNotch { .. }
-            ))
+            .filter(|rec| {
+                matches!(
+                    rec.recommendation_type,
+                    FilterRecommendationType::ConfigureGyroNotch { .. }
+                        | FilterRecommendationType::AdjustDynamicNotch { .. }
+                )
+            })
             .collect();
 
-        assert!(!notch_recommendations.is_empty(), "Should recommend notch filter for resonance");
+        assert!(
+            !notch_recommendations.is_empty(),
+            "Should recommend notch filter for resonance"
+        );
     }
 
     #[test]
@@ -243,16 +273,31 @@ mod realistic_tests {
         for issue in &result.detected_issues {
             println!("    {:?}", issue.issue_type);
         }
-        println!("  Filter recommendations: {}", result.filter_recommendations.len());
-        println!("  PID recommendations: {}", result.pid_recommendations.len());
+        println!(
+            "  Filter recommendations: {}",
+            result.filter_recommendations.len()
+        );
+        println!(
+            "  PID recommendations: {}",
+            result.pid_recommendations.len()
+        );
         println!("  Tune quality score: {:.1}", result.tune_quality_score);
 
         // Should detect multiple issues
-        assert!(result.detected_issues.len() >= 2, "Should detect multiple oscillations");
+        assert!(
+            result.detected_issues.len() >= 2,
+            "Should detect multiple oscillations"
+        );
 
         // Should have reasonable tune quality score (low due to multiple issues)
-        assert!(result.tune_quality_score < 90.0, "Tune quality should reflect detected issues");
-        assert!(result.tune_quality_score >= 0.0, "Tune quality should not be negative");
+        assert!(
+            result.tune_quality_score < 90.0,
+            "Tune quality should reflect detected issues"
+        );
+        assert!(
+            result.tune_quality_score >= 0.0,
+            "Tune quality should not be negative"
+        );
     }
 
     #[test]
@@ -264,25 +309,37 @@ mod realistic_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         println!("Filter recommendation test:");
-        println!("  Filter recommendations: {}", result.filter_recommendations.len());
+        println!(
+            "  Filter recommendations: {}",
+            result.filter_recommendations.len()
+        );
         for rec in &result.filter_recommendations {
-            println!("    {:?} at {:.1} Hz, Q: {:?}", rec.recommendation_type, rec.frequency, rec.q_factor);
+            println!(
+                "    {:?} at {:.1} Hz, Q: {:?}",
+                rec.recommendation_type, rec.frequency, rec.q_factor
+            );
         }
 
         // Should have filter recommendations for high amplitude oscillations
         if !result.filter_recommendations.is_empty() {
-            let notch_recs: Vec<_> = result.filter_recommendations
+            let notch_recs: Vec<_> = result
+                .filter_recommendations
                 .iter()
-                .filter(|rec| matches!(
-                    rec.recommendation_type,
-                    FilterRecommendationType::ConfigureGyroNotch { .. }
-                        | FilterRecommendationType::AdjustDynamicNotch { .. }
-                ))
+                .filter(|rec| {
+                    matches!(
+                        rec.recommendation_type,
+                        FilterRecommendationType::ConfigureGyroNotch { .. }
+                            | FilterRecommendationType::AdjustDynamicNotch { .. }
+                    )
+                })
                 .collect();
 
             if !notch_recs.is_empty() {
                 let rec = notch_recs[0];
-                assert!((rec.frequency - 200.0).abs() < 30.0, "Notch frequency should be near oscillation");
+                assert!(
+                    (rec.frequency - 200.0).abs() < 30.0,
+                    "Notch frequency should be near oscillation"
+                );
                 assert!(rec.q_factor.is_some(), "Notch filter should have Q-factor");
             }
         }

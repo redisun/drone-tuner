@@ -135,7 +135,7 @@ pub enum BlackboxError {
     /// Required fields are missing from the blackbox data
     MissingFields {
         /// List of missing field names
-        missing_fields: Vec<String>
+        missing_fields: Vec<String>,
     },
 
     #[error("Data corruption detected at frame {frame_index}: {details}")]
@@ -144,7 +144,7 @@ pub enum BlackboxError {
         /// Frame index where corruption was detected
         frame_index: u64,
         /// Details about the corruption
-        details: String
+        details: String,
     },
 
     #[error("IO error: {0}")]

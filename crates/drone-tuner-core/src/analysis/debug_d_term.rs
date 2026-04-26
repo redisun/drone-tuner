@@ -73,10 +73,15 @@ mod debug_d_term_tests {
         let result = engine.analyze(&session).expect("Analysis should succeed");
 
         println!("Debug D-term 120 Hz test:");
-        println!("  Frequency peaks found: {}", result.frequency_analysis.peaks.len());
+        println!(
+            "  Frequency peaks found: {}",
+            result.frequency_analysis.peaks.len()
+        );
         for peak in &result.frequency_analysis.peaks {
-            println!("    Peak: {:.1} Hz, amplitude: {:.3}, Q: {:.1} on {:?}",
-                    peak.frequency, peak.amplitude, peak.q_factor, peak.axes);
+            println!(
+                "    Peak: {:.1} Hz, amplitude: {:.3}, Q: {:.1} on {:?}",
+                peak.frequency, peak.amplitude, peak.q_factor, peak.axes
+            );
         }
         println!("  Issues detected: {}", result.detected_issues.len());
         for issue in &result.detected_issues {
@@ -142,8 +147,12 @@ mod debug_d_term_tests {
             let mut engine = AnalysisEngine::new();
             let result = engine.analyze(&session).expect("Analysis should succeed");
 
-            println!("Amplitude {:.1}: {} peaks, {} issues",
-                    amp, result.frequency_analysis.peaks.len(), result.detected_issues.len());
+            println!(
+                "Amplitude {:.1}: {} peaks, {} issues",
+                amp,
+                result.frequency_analysis.peaks.len(),
+                result.detected_issues.len()
+            );
         }
     }
 }

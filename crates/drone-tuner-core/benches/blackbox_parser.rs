@@ -75,7 +75,7 @@ fn generate_synthetic_blackbox_data(frame_count: usize, fields_per_frame: usize)
 
 /// Encode signed integer using variable-byte encoding (simplified)
 fn encode_signed_vb(value: i32) -> Vec<u8> {
-    if value >= -64 && value <= 63 {
+    if (-64..=63).contains(&value) {
         // Single byte encoding
         if value >= 0 {
             vec![value as u8]
@@ -236,8 +236,8 @@ fn bench_error_handling(c: &mut Criterion) {
             // Corrupt middle section
             let start = corrupted.len() / 2;
             let end = (start + 100).min(corrupted.len());
-            for i in start..end {
-                corrupted[i] = 0xFF;
+            for byte in &mut corrupted[start..end] {
+                *byte = 0xFF;
             }
             corrupted
         }),

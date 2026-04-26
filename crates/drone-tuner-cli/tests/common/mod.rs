@@ -31,9 +31,17 @@ pub fn create_minimal_blackbox_data() -> Vec<u8> {
 
     // Add some minimal frame data
     for i in 0..100 {
-        let frame_data = format!("I{},{},{},{},{},{},{},{}\n",
-            i, i * 1000, i % 100, (i * 2) % 100, (i * 3) % 100,
-            i % 50, (i * 2) % 50, (i * 3) % 50);
+        let frame_data = format!(
+            "I{},{},{},{},{},{},{},{}\n",
+            i,
+            i * 1000,
+            i % 100,
+            (i * 2) % 100,
+            (i * 3) % 100,
+            i % 50,
+            (i * 2) % 50,
+            (i * 3) % 50
+        );
         data.extend_from_slice(frame_data.as_bytes());
     }
 
@@ -64,7 +72,7 @@ pub fn create_oscillating_blackbox_data() -> Vec<u8> {
     for i in 0..1000 {
         let time = i as f32 * 0.001; // 1ms intervals
         let gyro_x = (50.0 * (2.0 * PI * 100.0 * time).sin()) as i32; // 100Hz oscillation
-        let gyro_y = (30.0 * (2.0 * PI * 80.0 * time).sin()) as i32;  // 80Hz oscillation
+        let gyro_y = (30.0 * (2.0 * PI * 80.0 * time).sin()) as i32; // 80Hz oscillation
         let gyro_z = (20.0 * (2.0 * PI * 120.0 * time).sin()) as i32; // 120Hz oscillation
 
         let motor_base = 1500;
@@ -73,8 +81,18 @@ pub fn create_oscillating_blackbox_data() -> Vec<u8> {
         let motor_3 = motor_base - (gyro_x / 10);
         let motor_4 = motor_base - (gyro_y / 10);
 
-        let frame_data = format!("I{},{},{},{},{},{},{},{},{}\n",
-            i, i * 1000, gyro_x, gyro_y, gyro_z, motor_1, motor_2, motor_3, motor_4);
+        let frame_data = format!(
+            "I{},{},{},{},{},{},{},{},{}\n",
+            i,
+            i * 1000,
+            gyro_x,
+            gyro_y,
+            gyro_z,
+            motor_1,
+            motor_2,
+            motor_3,
+            motor_4
+        );
         data.extend_from_slice(frame_data.as_bytes());
     }
 
@@ -139,12 +157,18 @@ pub fn validate_json_output(output_str: &str) -> serde_json::Value {
     let json_end = output_str.rfind('}').expect("Should contain JSON") + 1;
     let json_str = &output_str[json_start..json_end];
 
-    let json: serde_json::Value = serde_json::from_str(json_str)
-        .expect("Output should be valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(json_str).expect("Output should be valid JSON");
 
     // Validate common structure
-    assert!(json.get("version").is_some(), "JSON should have version field");
-    assert!(json.get("timestamp").is_some(), "JSON should have timestamp field");
+    assert!(
+        json.get("version").is_some(),
+        "JSON should have version field"
+    );
+    assert!(
+        json.get("timestamp").is_some(),
+        "JSON should have timestamp field"
+    );
 
     json
 }
@@ -184,8 +208,14 @@ pub fn create_large_blackbox_data(frame_count: usize) -> Vec<u8> {
 
     // Add many frames for performance testing
     for i in 0..frame_count {
-        let frame_data = format!("I{},{},{},{},{}\n",
-            i, i * 1000, i % 1000 - 500, (i * 2) % 1000 - 500, (i * 3) % 1000 - 500);
+        let frame_data = format!(
+            "I{},{},{},{},{}\n",
+            i,
+            i * 1000,
+            i % 1000 - 500,
+            (i * 2) % 1000 - 500,
+            (i * 3) % 1000 - 500
+        );
         data.extend_from_slice(frame_data.as_bytes());
     }
 
@@ -193,7 +223,10 @@ pub fn create_large_blackbox_data(frame_count: usize) -> Vec<u8> {
 }
 
 /// Helper to run command with timeout
-pub fn run_with_timeout(mut cmd: assert_cmd::Command, timeout_secs: u64) -> assert_cmd::assert::Assert {
+pub fn run_with_timeout(
+    mut cmd: assert_cmd::Command,
+    timeout_secs: u64,
+) -> assert_cmd::assert::Assert {
     use std::time::Duration;
 
     cmd.timeout(Duration::from_secs(timeout_secs));
@@ -202,12 +235,20 @@ pub fn run_with_timeout(mut cmd: assert_cmd::Command, timeout_secs: u64) -> asse
 
 /// Helper to check file existence and basic properties
 pub fn verify_output_file(path: &Path, min_size: Option<usize>) {
-    assert!(path.exists(), "Output file should exist: {}", path.display());
+    assert!(
+        path.exists(),
+        "Output file should exist: {}",
+        path.display()
+    );
 
     if let Some(min_size) = min_size {
         let metadata = fs::metadata(path).unwrap();
-        assert!(metadata.len() as usize >= min_size,
-            "Output file should be at least {} bytes, got {}", min_size, metadata.len());
+        assert!(
+            metadata.len() as usize >= min_size,
+            "Output file should be at least {} bytes, got {}",
+            min_size,
+            metadata.len()
+        );
     }
 }
 

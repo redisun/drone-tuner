@@ -426,10 +426,7 @@ mod compare_command_tests {
 
     #[test]
     fn test_compare_no_files() {
-        cli_cmd()
-            .arg("compare")
-            .assert()
-            .failure();
+        cli_cmd().arg("compare").assert().failure();
     }
 
     #[test]
@@ -573,7 +570,9 @@ mod monitor_command_tests {
             .arg("/dev/ttyUSB0")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 
     #[test]
@@ -583,7 +582,9 @@ mod monitor_command_tests {
             .arg("/nonexistent/port")
             .assert()
             .success() // Command succeeds but shows feature unavailable message
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 
     #[test]
@@ -595,7 +596,9 @@ mod monitor_command_tests {
             .arg("200")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 
     #[test]
@@ -607,7 +610,9 @@ mod monitor_command_tests {
             .arg("10")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 
     #[test]
@@ -619,7 +624,9 @@ mod monitor_command_tests {
             .arg("gyro,pid_error,motors")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 
     #[test]
@@ -634,7 +641,9 @@ mod monitor_command_tests {
             .arg(&log_file)
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 
     #[test]
@@ -646,7 +655,9 @@ mod monitor_command_tests {
             .arg("/dev/ttyUSB0")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 
     #[test]
@@ -658,7 +669,9 @@ mod monitor_command_tests {
             .arg("/dev/ttyUSB0")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
     }
 }
 
@@ -713,7 +726,9 @@ mod tune_command_tests {
             .arg("/dev/ttyUSB0")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time tuning is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time tuning is not available",
+            ));
     }
 
     #[test]
@@ -775,7 +790,9 @@ mod tune_command_tests {
             .arg("invalid_port")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time tuning is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time tuning is not available",
+            ));
     }
 }
 
@@ -1001,7 +1018,9 @@ mod export_command_tests {
             .arg("csv")
             .assert()
             .failure()
-            .stderr(predicate::str::contains("CSV export requires blackbox analysis"));
+            .stderr(predicate::str::contains(
+                "CSV export requires blackbox analysis",
+            ));
     }
 }
 
@@ -1106,18 +1125,12 @@ mod global_options_tests {
 
     #[test]
     fn test_invalid_command() {
-        cli_cmd()
-            .arg("invalid-command")
-            .assert()
-            .failure();
+        cli_cmd().arg("invalid-command").assert().failure();
     }
 
     #[test]
     fn test_missing_required_argument() {
-        cli_cmd()
-            .arg("analyze")
-            .assert()
-            .failure();
+        cli_cmd().arg("analyze").assert().failure();
     }
 
     #[test]
@@ -1155,7 +1168,11 @@ mod performance_regression_tests {
         let duration = start.elapsed();
 
         // Performance regression check - analysis should complete within 30 seconds
-        assert!(duration.as_secs() < 30, "Analysis took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 30,
+            "Analysis took too long: {:?}",
+            duration
+        );
     }
 
     #[test]
@@ -1178,7 +1195,11 @@ mod performance_regression_tests {
         let duration = start.elapsed();
 
         // Batch processing should scale reasonably
-        assert!(duration.as_secs() < 60, "Batch processing took too long: {:?}", duration);
+        assert!(
+            duration.as_secs() < 60,
+            "Batch processing took too long: {:?}",
+            duration
+        );
     }
 }
 
@@ -1194,16 +1215,14 @@ mod concurrent_execution_tests {
             return;
         }
 
-        let handles: Vec<_> = (0..3).map(|_| {
-            let file = blackbox_file.clone();
-            thread::spawn(move || {
-                cli_cmd()
-                    .arg("analyze")
-                    .arg(&file)
-                    .assert()
-                    .success();
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let file = blackbox_file.clone();
+                thread::spawn(move || {
+                    cli_cmd().arg("analyze").arg(&file).assert().success();
+                })
             })
-        }).collect();
+            .collect();
 
         for handle in handles {
             handle.join().unwrap();
@@ -1216,13 +1235,10 @@ mod concurrent_execution_tests {
 
         // Create and process multiple files to test resource cleanup
         for i in 1..=5 {
-            let file = create_test_blackbox_file(&temp_dir, &format!("test{}.bbl", i), b"test data");
+            let file =
+                create_test_blackbox_file(&temp_dir, &format!("test{}.bbl", i), b"test data");
 
-            cli_cmd()
-                .arg("analyze")
-                .arg(&file)
-                .assert()
-                .success();
+            cli_cmd().arg("analyze").arg(&file).assert().success();
         }
 
         // If we reach here without panicking, resources were cleaned up properly
@@ -1240,7 +1256,9 @@ mod feature_flag_tests {
             .arg("/dev/ttyUSB0")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Real-time monitoring is not available"));
+            .stdout(predicate::str::contains(
+                "Real-time monitoring is not available",
+            ));
 
         let blackbox_file = test_blackbox_file();
         if blackbox_file.exists() {
@@ -1251,7 +1269,9 @@ mod feature_flag_tests {
                 .arg("/dev/ttyUSB0")
                 .assert()
                 .success()
-                .stdout(predicate::str::contains("Real-time tuning is not available"));
+                .stdout(predicate::str::contains(
+                    "Real-time tuning is not available",
+                ));
         }
     }
 
@@ -1276,10 +1296,7 @@ mod feature_flag_tests {
             .assert()
             .success();
 
-        cli_cmd()
-            .arg("info")
-            .assert()
-            .success();
+        cli_cmd().arg("info").assert().success();
     }
 }
 
