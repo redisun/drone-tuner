@@ -934,6 +934,176 @@ impl FlightControllerConnection {
         ))
     }
 
+    /// Send an MSPv2 request and return the response payload.
+    ///
+    /// Used for V2-only commands (whose code exceeds u8::MAX) such as
+    /// `MSP2_COMMON_SET_SETTING` / `0x1004`. Reads frames until one with
+    /// the matching command code is seen, dropping any unrelated V1 or V2
+    /// frames in the meantime (legacy late responses, etc.).
+    ///
+    /// Returns the response payload on a `>` (success) frame. An `!`
+    /// (error) frame is converted to a [`DronetunerError::CommunicationError`]
+    /// so the caller doesn't have to inspect direction bytes.
+    pub async fn msp2_request(&mut self, command: u16, payload: &[u8]) -> Result<Vec<u8>> {
+        let request = self.msp.build_v2_request(command, payload);
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        self.read_msp2_response_for(command).await
+    }
+
+    /// Read frames from the transport until one matches `expected_cmd` (V2)
+    /// or the per-read timeout fires.
+    async fn read_msp2_response_for(&mut self, expected_cmd: u16) -> Result<Vec<u8>> {
+        let mut acc: Vec<u8> = Vec::with_capacity(256);
+        let mut tmp = [0u8; 256];
+        for _ in 0..32 {
+            let n = match tokio::time::timeout(
+                Duration::from_secs(2),
+                self.transport.read(&mut tmp),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(DronetunerError::communication_error(
+                        "Timed out waiting for MSPv2 response bytes",
+                    ));
+                }
+            };
+            if n == 0 && acc.is_empty() {
+                return Err(DronetunerError::communication_error(
+                    "No MSPv2 response received",
+                ));
+            }
+            acc.extend_from_slice(&tmp[..n]);
+
+            // Drain any number of complete frames sitting in `acc`. The FC
+            // can be in the middle of late-replying to a different command;
+            // skip past those rather than returning them as our answer.
+            loop {
+                // Resync to the next `$`.
+                let Some(start) = acc.iter().position(|&b| b == b'$') else {
+                    acc.clear();
+                    break;
+                };
+                if start > 0 {
+                    acc.drain(..start);
+                }
+                if acc.len() < 2 {
+                    break;
+                }
+                match acc[1] {
+                    b'M' => {
+                        // V1 frame in the way — skip past it.
+                        if acc.len() < 6 {
+                            break; // need full V1 header
+                        }
+                        let payload_size = acc[3] as usize;
+                        let frame_len = 6 + payload_size;
+                        if acc.len() < frame_len {
+                            break;
+                        }
+                        acc.drain(..frame_len);
+                    }
+                    b'X' => {
+                        if acc.len() < 8 {
+                            break; // need full V2 header (8 bytes)
+                        }
+                        let payload_size =
+                            u16::from_le_bytes([acc[6], acc[7]]) as usize;
+                        // Header(8) + payload + CRC(1) = 9 + payload_size.
+                        let frame_len = 9 + payload_size;
+                        if acc.len() < frame_len {
+                            break;
+                        }
+                        let frame_bytes = acc[..frame_len].to_vec();
+                        acc.drain(..frame_len);
+                        let response = self.msp.parse_v2_frame(&frame_bytes)?;
+                        if response.command != expected_cmd {
+                            // Wrong command — skip and look for the next.
+                            continue;
+                        }
+                        if response.direction == MspMessageType::Error as u8 {
+                            return Err(DronetunerError::communication_error(format!(
+                                "FC returned MSPv2 error for command 0x{expected_cmd:04x}"
+                            )));
+                        }
+                        return Ok(response.payload);
+                    }
+                    _ => {
+                        // Junk byte — drop the `$` and resync.
+                        acc.drain(..1);
+                    }
+                }
+            }
+        }
+        Err(DronetunerError::communication_error(format!(
+            "Timed out waiting for MSPv2 response to command 0x{expected_cmd:04x}"
+        )))
+    }
+
+    /// Read a Betaflight setting by name (`MSP2_COMMON_GET_SETTING`).
+    ///
+    /// Returns the raw value bytes, LE-encoded according to the parameter's
+    /// registered type. Use [`Self::get_setting_u16`] / [`Self::get_setting_u8`]
+    /// for typed accessors.
+    pub async fn get_setting(&mut self, name: &str) -> Result<Vec<u8>> {
+        let mut payload = Vec::with_capacity(name.len() + 1);
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0); // null terminator
+        self.msp2_request(msp2::COMMON_GET_SETTING, &payload).await
+    }
+
+    /// Write a Betaflight setting by name (`MSP2_COMMON_SET_SETTING`).
+    ///
+    /// `value_bytes` must be encoded according to the setting's registered
+    /// type (LE-ordered for multi-byte integers). On unknown setting names
+    /// the FC replies with an error frame which we surface as `Err(...)`.
+    /// RAM-only — call [`Self::save_to_eeprom`] to persist.
+    pub async fn set_setting(&mut self, name: &str, value_bytes: &[u8]) -> Result<()> {
+        let mut payload = Vec::with_capacity(name.len() + 1 + value_bytes.len());
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(value_bytes);
+        let _ack = self.msp2_request(msp2::COMMON_SET_SETTING, &payload).await?;
+        Ok(())
+    }
+
+    /// Convenience: read a u8 setting.
+    pub async fn get_setting_u8(&mut self, name: &str) -> Result<u8> {
+        let bytes = self.get_setting(name).await?;
+        if bytes.is_empty() {
+            return Err(DronetunerError::parse_error(
+                format!("Setting '{name}': empty response"),
+                None,
+            ));
+        }
+        Ok(bytes[0])
+    }
+
+    /// Convenience: read a u16 setting.
+    pub async fn get_setting_u16(&mut self, name: &str) -> Result<u16> {
+        let bytes = self.get_setting(name).await?;
+        if bytes.len() < 2 {
+            return Err(DronetunerError::parse_error(
+                format!("Setting '{name}': expected ≥2 bytes, got {}", bytes.len()),
+                None,
+            ));
+        }
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Convenience: write a u8 setting.
+    pub async fn set_setting_u8(&mut self, name: &str, value: u8) -> Result<()> {
+        self.set_setting(name, &[value]).await
+    }
+
+    /// Convenience: write a u16 setting.
+    pub async fn set_setting_u16(&mut self, name: &str, value: u16) -> Result<()> {
+        self.set_setting(name, &value.to_le_bytes()).await
+    }
+
     /// Stream the entire dataflash to memory.
     ///
     /// Calls `progress(bytes_so_far, total_bytes)` after each chunk so callers
@@ -1404,6 +1574,104 @@ impl MspProtocol {
     fn calculate_crc(&self, data: &[u8]) -> u8 {
         crc8_dvb_s2(data)
     }
+
+    /// Build a V2-framed request, regardless of `self.version`.
+    ///
+    /// V2 framing is required for MSP commands whose code exceeds u8::MAX
+    /// (notably `MSP2_COMMON_SET_SETTING` / `0x1004`). This bypasses the
+    /// u8-bounded [`MspCommand`] enum so we can address arbitrary u16
+    /// commands without rewriting the legacy V1 path.
+    pub fn build_v2_request(&self, command: u16, payload: &[u8]) -> Vec<u8> {
+        let mut message = Vec::with_capacity(9 + payload.len() + 1);
+        message.push(b'$');
+        message.push(b'X');
+        message.push(MspMessageType::Request as u8);
+        message.push(0); // flag byte
+        message.extend_from_slice(&command.to_le_bytes());
+        message.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        message.extend_from_slice(payload);
+        let crc = crc8_dvb_s2(&message[3..]);
+        message.push(crc);
+        message
+    }
+
+    /// Build a V2-framed response. Used by the in-process simulator to
+    /// reply to V2 requests.
+    pub(crate) fn build_v2_response(
+        &self,
+        direction: MspMessageType,
+        command: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut message = Vec::with_capacity(9 + payload.len() + 1);
+        message.push(b'$');
+        message.push(b'X');
+        message.push(direction as u8);
+        message.push(0);
+        message.extend_from_slice(&command.to_le_bytes());
+        message.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        message.extend_from_slice(payload);
+        let crc = crc8_dvb_s2(&message[3..]);
+        message.push(crc);
+        message
+    }
+
+    /// Parse a complete V2 frame (`$X<dir><flag><cmd_lo><cmd_hi><len_lo><len_hi><payload><crc>`).
+    ///
+    /// Returns the response with its u16 command, raw payload, and direction
+    /// byte preserved — the caller is expected to inspect `direction` to
+    /// distinguish success (`>`) from error (`!`) replies.
+    pub fn parse_v2_frame(&self, data: &[u8]) -> Result<MspV2Response> {
+        // Minimum complete V2 frame: 8-byte header + 0-byte payload + 1-byte
+        // CRC = 9 bytes.
+        if data.len() < 9 {
+            return Err(DronetunerError::parse_error(
+                "MSPv2 frame too short (need at least 9 bytes)",
+                None,
+            ));
+        }
+        if data[0] != b'$' || data[1] != b'X' {
+            return Err(DronetunerError::parse_error("Not an MSPv2 frame", None));
+        }
+        let direction = data[2];
+        let _flag = data[3];
+        let command = u16::from_le_bytes([data[4], data[5]]);
+        let payload_size = u16::from_le_bytes([data[6], data[7]]) as usize;
+        // Full frame is header(8) + payload + crc(1).
+        if data.len() < 9 + payload_size {
+            return Err(DronetunerError::parse_error(
+                "Incomplete MSPv2 frame (payload + crc don't fit)",
+                None,
+            ));
+        }
+        let payload = data[8..8 + payload_size].to_vec();
+        let expected_crc = crc8_dvb_s2(&data[3..8 + payload_size]);
+        let actual_crc = data[8 + payload_size];
+        if expected_crc != actual_crc {
+            return Err(DronetunerError::parse_error("MSPv2 CRC mismatch", None));
+        }
+        Ok(MspV2Response {
+            command,
+            payload,
+            direction,
+        })
+    }
+}
+
+/// Parse a Betaflight setting name out of a `MSP2_COMMON_*_SETTING` payload.
+///
+/// The wire format prefixes the value with a null-terminated ASCII name —
+/// e.g. `b"gyro_lpf1_static_hz\0\xfa\x00"` for "set gyro_lpf1_static_hz =
+/// 250". This finds the NUL byte and returns the leading name.
+fn parse_settings_name(payload: &[u8]) -> Result<String> {
+    let nul = payload
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| DronetunerError::parse_error("setting name missing NUL terminator", None))?;
+    let name = std::str::from_utf8(&payload[..nul]).map_err(|_| {
+        DronetunerError::parse_error("setting name is not valid UTF-8", None)
+    })?;
+    Ok(name.to_string())
 }
 
 /// MSPv2 uses CRC8/DVB-S2 (polynomial 0xD5, init 0, no reflection, no XOR-out)
@@ -1439,6 +1707,37 @@ pub struct MspResponse {
     pub command: MspCommand,
     /// Response payload
     pub payload: Vec<u8>,
+}
+
+/// MSPv2 response with the full u16 command code preserved.
+///
+/// The legacy [`MspResponse`] type carries an `MspCommand` enum that's u8-
+/// sized and can't represent V2-only commands like `MSP2_COMMON_SET_SETTING`
+/// (0x1004). This struct is the V2 equivalent — it round-trips raw u16
+/// command codes and a payload, leaving interpretation to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MspV2Response {
+    /// 16-bit MSP command code.
+    pub command: u16,
+    /// Response payload bytes.
+    pub payload: Vec<u8>,
+    /// Direction byte. `>` = success response, `!` = error response.
+    /// Callers should treat `!` as failure.
+    pub direction: u8,
+}
+
+/// MSPv2 command codes we use directly.
+///
+/// These exceed u8 range so they can't live in [`MspCommand`]. They're
+/// dispatched via [`FlightControllerConnection::msp2_request`].
+pub mod msp2 {
+    /// `MSP2_COMMON_GET_SETTING`. Request payload: parameter name as a
+    /// null-terminated string. Response payload: value bytes encoded
+    /// according to the parameter's registered type.
+    pub const COMMON_GET_SETTING: u16 = 0x1003;
+    /// `MSP2_COMMON_SET_SETTING`. Request payload: parameter name as
+    /// a null-terminated string followed by the value bytes (LE).
+    pub const COMMON_SET_SETTING: u16 = 0x1004;
 }
 
 impl MspCommand {
@@ -1598,6 +1897,11 @@ pub struct SimulatorState {
     pub dataflash_chunk_size: usize,
     /// How many times DataflashErase has been received.
     pub dataflash_erases: usize,
+    /// Parameter-by-name table backing `MSP2_COMMON_GET/SET_SETTING`.
+    /// Values are stored as the raw LE-encoded bytes the FC's settings
+    /// table would emit. Seeded with sensible defaults for filter
+    /// settings on construction; tests may override per-key.
+    pub settings: std::collections::HashMap<String, Vec<u8>>,
 }
 
 impl SimulatorState {
@@ -1623,6 +1927,53 @@ impl SimulatorState {
     }
 }
 
+impl SimulatorState {
+    /// Seed `settings` with plausible Betaflight 4.5 defaults for the filter
+    /// parameters the CLI manipulates. Callers can override per-key
+    /// afterwards.
+    fn default_settings() -> std::collections::HashMap<String, Vec<u8>> {
+        use std::collections::HashMap;
+        let mut s: HashMap<String, Vec<u8>> = HashMap::new();
+        // u16 settings — 2 LE bytes each.
+        let u16s: &[(&str, u16)] = &[
+            ("gyro_lpf1_static_hz", 250),
+            ("gyro_lpf1_dyn_min_hz", 250),
+            ("gyro_lpf1_dyn_max_hz", 500),
+            ("gyro_lpf2_static_hz", 500),
+            ("gyro_notch1_hz", 0),
+            ("gyro_notch1_cutoff", 0),
+            ("gyro_notch2_hz", 0),
+            ("gyro_notch2_cutoff", 0),
+            ("dyn_notch_min_hz", 100),
+            ("dyn_notch_max_hz", 600),
+            ("dterm_lpf1_static_hz", 150),
+            ("dterm_lpf1_dyn_min_hz", 75),
+            ("dterm_lpf1_dyn_max_hz", 150),
+            ("dterm_lpf2_static_hz", 150),
+            ("yaw_lowpass_hz", 100),
+            ("rpm_filter_min_hz", 100),
+            ("rpm_filter_q", 500),
+        ];
+        for (k, v) in u16s {
+            s.insert((*k).to_string(), v.to_le_bytes().to_vec());
+        }
+        // u8 settings — 1 byte each.
+        let u8s: &[(&str, u8)] = &[
+            ("gyro_lpf1_type", 0), // PT1
+            ("gyro_lpf2_type", 0), // PT1
+            ("dterm_lpf1_type", 0),
+            ("dterm_lpf2_type", 0),
+            ("dyn_notch_count", 3),
+            ("dyn_notch_q", 250),
+            ("rpm_filter_harmonics", 3),
+        ];
+        for (k, v) in u8s {
+            s.insert((*k).to_string(), vec![*v]);
+        }
+        s
+    }
+}
+
 impl Default for SimulatorState {
     fn default() -> Self {
         Self {
@@ -1640,6 +1991,7 @@ impl Default for SimulatorState {
             // comfortable margin and still makes tests iterate.
             dataflash_chunk_size: 240,
             dataflash_erases: 0,
+            settings: Self::default_settings(),
         }
     }
 }
@@ -1683,6 +2035,24 @@ impl MspSimulator {
             if n == 0 {
                 return Ok(());
             }
+            // Detect framing version from the second header byte. V1 starts
+            // with `$M`, V2 with `$X`; the rest of the parser knows what to
+            // do with each.
+            let is_v2 = n >= 2 && buf[0] == b'$' && buf[1] == b'X';
+            if is_v2 {
+                let parsed = match msp.parse_v2_frame(&buf[..n]) {
+                    Ok(p) if p.direction == MspMessageType::Request as u8 => p,
+                    _ => continue, // malformed or wrong direction
+                };
+                let (out_dir, payload) = match self.handle_v2(&parsed) {
+                    Ok(p) => (MspMessageType::Response, p),
+                    Err(_) => (MspMessageType::Error, Vec::new()),
+                };
+                let response_bytes = msp.build_v2_response(out_dir, parsed.command, &payload);
+                self.transport.write(&response_bytes).await?;
+                self.transport.flush().await?;
+                continue;
+            }
             let request = match msp.parse_request(&buf[..n]) {
                 Ok(req) => req,
                 Err(_) => continue, // ignore malformed traffic
@@ -1698,6 +2068,46 @@ impl MspSimulator {
             };
             self.transport.write(&response_bytes).await?;
             self.transport.flush().await?;
+        }
+    }
+
+    /// Handle an MSPv2 request. Currently routes
+    /// `MSP2_COMMON_GET_SETTING` and `MSP2_COMMON_SET_SETTING` against the
+    /// simulator's in-memory settings table.
+    fn handle_v2(&self, req: &MspV2Response) -> Result<Vec<u8>> {
+        match req.command {
+            msp2::COMMON_GET_SETTING => {
+                let name = parse_settings_name(&req.payload)?;
+                let state = self.state.lock().unwrap();
+                state.settings.get(&name).cloned().ok_or_else(|| {
+                    DronetunerError::communication_error(format!(
+                        "simulator: unknown setting '{name}'"
+                    ))
+                })
+            }
+            msp2::COMMON_SET_SETTING => {
+                let name = parse_settings_name(&req.payload)?;
+                let value_start = name.len() + 1;
+                if req.payload.len() < value_start {
+                    return Err(DronetunerError::parse_error(
+                        "simulator: SetSetting payload missing value",
+                        None,
+                    ));
+                }
+                let value = req.payload[value_start..].to_vec();
+                let mut state = self.state.lock().unwrap();
+                if !state.settings.contains_key(&name) {
+                    return Err(DronetunerError::communication_error(format!(
+                        "simulator: unknown setting '{name}'"
+                    )));
+                }
+                state.settings.insert(name, value);
+                Ok(Vec::new())
+            }
+            _ => Err(DronetunerError::communication_error(format!(
+                "simulator: unhandled MSPv2 command 0x{:04x}",
+                req.command
+            ))),
         }
     }
 
@@ -2201,6 +2611,79 @@ mod tests {
             .await
             .expect_err("should error on unsupported chip");
         assert!(matches!(err, DronetunerError::CommunicationError { .. }));
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_msp2_set_setting_round_trip_via_simulator() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        let state = sim.state.clone();
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        // Default seed value
+        let before = conn.get_setting_u16("gyro_lpf1_static_hz").await.unwrap();
+        assert_eq!(before, 250);
+
+        conn.set_setting_u16("gyro_lpf1_static_hz", 175)
+            .await
+            .expect("set should succeed");
+
+        let after = conn.get_setting_u16("gyro_lpf1_static_hz").await.unwrap();
+        assert_eq!(after, 175);
+
+        // Simulator state mirror.
+        let stored = state
+            .lock()
+            .unwrap()
+            .settings
+            .get("gyro_lpf1_static_hz")
+            .cloned()
+            .unwrap();
+        assert_eq!(stored, 175u16.to_le_bytes());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_msp2_set_setting_unknown_name_is_error() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        let err = conn
+            .set_setting_u16("some_setting_that_does_not_exist", 42)
+            .await
+            .expect_err("simulator should error on unknown setting");
+        assert!(matches!(err, DronetunerError::CommunicationError { .. }));
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_msp2_get_setting_after_set_persists_through_handshake() {
+        // Tests that pre-existing V1 traffic (the handshake) doesn't
+        // confuse the V2 read path.
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        conn.set_setting_u8("dyn_notch_count", 5).await.unwrap();
+        let v = conn.get_setting_u8("dyn_notch_count").await.unwrap();
+        assert_eq!(v, 5);
+
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
