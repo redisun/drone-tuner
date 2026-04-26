@@ -1025,6 +1025,37 @@ async fn dry_connect_and_diff(
         }
     }
 
+    // Read filter config too — surfaces whether the FC actually answers
+    // MSP_FILTER_CONFIG and what its first three stable u16 fields look
+    // like. Useful for diagnosing firmware versions before any writeback.
+    match fc.read_filter_config().await {
+        Ok(filter) => {
+            println!(
+                "\n{} Filter config (read-only): gyro_lpf1={} Hz  dterm_lpf1={} Hz  yaw_lpf={} Hz  ({} bytes)",
+                style("🔧").yellow(),
+                filter.gyro_lpf1_hz(),
+                filter.dterm_lpf1_hz(),
+                filter.yaw_lpf_hz(),
+                filter.as_payload().len(),
+            );
+            if !report.filter_recommendations.is_empty() {
+                println!(
+                    "    {} {} filter recommendation(s) would be printed but not auto-applied — \
+                     payload offsets vary by firmware version.",
+                    style("ℹ️").blue(),
+                    report.filter_recommendations.len()
+                );
+            }
+        }
+        Err(e) => {
+            println!(
+                "\n{} Could not read filter config: {} (continuing — PIDs are unaffected)",
+                style("⚠").yellow(),
+                e
+            );
+        }
+    }
+
     println!(
         "\n{} Dry run complete — drop --dry-run to actually apply.",
         style("ℹ️").blue()

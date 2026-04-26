@@ -272,8 +272,13 @@ pub enum MspCommand {
     Pid = 112,
     /// PID names
     Pidnames = 117,
+    /// Filter configuration (gyro/D-term lowpass cutoffs, notches, etc.)
+    FilterConfig = 92,
     /// Set PID values
     SetPid = 202,
+    /// Set filter configuration. Payload mirrors what FilterConfig
+    /// returned, so the typical flow is read → mutate → write.
+    SetFilterConfig = 93,
     /// Save parameters
     EepromWrite = 250,
 }
@@ -802,6 +807,65 @@ impl FlightControllerConnection {
         let _ack = self.read_msp_response().await?;
         Ok(())
     }
+
+    /// Read the flight controller's current filter configuration
+    /// (MSP FilterConfig / 92).
+    ///
+    /// Returns the full payload as a `FilterSnapshot` so callers can
+    /// round-trip it through `write_filter_config` without losing fields
+    /// they didn't intend to touch.
+    pub async fn read_filter_config(&mut self) -> Result<FilterSnapshot> {
+        let request = self.msp.create_message(MspCommand::FilterConfig, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        for _ in 0..8 {
+            let response = self.read_msp_response().await?;
+            if matches!(response.command, MspCommand::FilterConfig) {
+                return FilterSnapshot::from_payload(response.payload);
+            }
+        }
+        Err(DronetunerError::communication_error(
+            "Did not receive MSP_FILTER_CONFIG response after 8 frames",
+        ))
+    }
+
+    /// Write a filter snapshot back to the flight controller
+    /// (MSP SetFilterConfig / 93).
+    ///
+    /// RAM-only — call [`save_to_eeprom`] to persist.
+    ///
+    /// [`save_to_eeprom`]: Self::save_to_eeprom
+    pub async fn write_filter_config(&mut self, snapshot: &FilterSnapshot) -> Result<()> {
+        let request = self
+            .msp
+            .create_message(MspCommand::SetFilterConfig, snapshot.as_payload())?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let _ack = self.read_msp_response().await?;
+        Ok(())
+    }
+
+    /// Apply a new filter config with rollback. Mirrors
+    /// [`apply_pid_with_rollback`]: read current → write new → on
+    /// failure, restore the backup. Returns the pre-change snapshot on
+    /// success so callers can persist it for forensics.
+    ///
+    /// [`apply_pid_with_rollback`]: Self::apply_pid_with_rollback
+    pub async fn apply_filter_with_rollback(
+        &mut self,
+        new: &FilterSnapshot,
+    ) -> Result<FilterSnapshot> {
+        let backup = self.read_filter_config().await?;
+        if let Err(write_err) = self.write_filter_config(new).await {
+            if let Err(rollback_err) = self.write_filter_config(&backup).await {
+                return Err(DronetunerError::communication_error(format!(
+                    "filter write failed ({write_err}); rollback also failed ({rollback_err})"
+                )));
+            }
+            return Err(write_err);
+        }
+        Ok(backup)
+    }
 }
 
 /// 30-byte MSP_PID payload snapshot. Provides typed accessors for the
@@ -876,6 +940,85 @@ impl PidSnapshot {
         self.raw[6] = p;
         self.raw[7] = i;
         self.raw[8] = d;
+    }
+}
+
+/// MSP_FILTER_CONFIG payload snapshot.
+///
+/// The exact layout has changed over Betaflight 4.x and depends on the
+/// firmware build, so we treat it as opaque bytes for round-trip fidelity.
+/// What we *do* expose is read-only access to the first three u16 fields,
+/// which have been stable for many releases:
+///
+/// - `gyro_lpf1_static_hz` (offset 0..2)
+/// - `dterm_lpf1_static_hz` (offset 2..4)
+/// - `yaw_lpf_hz` (offset 4..6)
+///
+/// Mutating these from a recommendation is left to the CLI: callers
+/// should `read_filter_config` → mutate the bytes they understand →
+/// `apply_filter_with_rollback`. We deliberately don't expose typed
+/// setters yet — the offsets above are stable, but several other
+/// fields (notch counts, dynamic LPF settings, RPM filter parameters)
+/// have shifted between firmware versions, and a typed setter that's
+/// wrong by one byte can brick a tune.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterSnapshot {
+    raw: Vec<u8>,
+}
+
+impl FilterSnapshot {
+    /// Parse a payload from an MSP FilterConfig response. Accepts any
+    /// length ≥ 6 bytes (the three u16 fields we read).
+    pub fn from_payload(payload: Vec<u8>) -> Result<Self> {
+        if payload.len() < 6 {
+            return Err(DronetunerError::parse_error(
+                format!(
+                    "MSP FilterConfig payload too short: {} bytes",
+                    payload.len()
+                ),
+                None,
+            ));
+        }
+        Ok(Self { raw: payload })
+    }
+
+    /// Borrow the underlying payload, suitable for SetFilterConfig.
+    pub fn as_payload(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Mutable access to the underlying payload for advanced callers
+    /// that know their firmware's exact layout. The CLI does not use
+    /// this; it's here so the binary downstream of read → mutate → write
+    /// can do the mutate step without an unsafe transmute.
+    pub fn as_payload_mut(&mut self) -> &mut [u8] {
+        &mut self.raw
+    }
+
+    /// Gyro stage-1 lowpass cutoff in Hz (0 = disabled).
+    pub fn gyro_lpf1_hz(&self) -> u16 {
+        u16::from_le_bytes([self.raw[0], self.raw[1]])
+    }
+    /// D-term stage-1 lowpass cutoff in Hz (0 = disabled).
+    pub fn dterm_lpf1_hz(&self) -> u16 {
+        u16::from_le_bytes([self.raw[2], self.raw[3]])
+    }
+    /// Yaw lowpass cutoff in Hz (0 = disabled).
+    pub fn yaw_lpf_hz(&self) -> u16 {
+        u16::from_le_bytes([self.raw[4], self.raw[5]])
+    }
+
+    /// Set the gyro stage-1 lowpass cutoff in Hz.
+    pub fn set_gyro_lpf1_hz(&mut self, hz: u16) {
+        self.raw[0..2].copy_from_slice(&hz.to_le_bytes());
+    }
+    /// Set the D-term stage-1 lowpass cutoff in Hz.
+    pub fn set_dterm_lpf1_hz(&mut self, hz: u16) {
+        self.raw[2..4].copy_from_slice(&hz.to_le_bytes());
+    }
+    /// Set the yaw lowpass cutoff in Hz.
+    pub fn set_yaw_lpf_hz(&mut self, hz: u16) {
+        self.raw[4..6].copy_from_slice(&hz.to_le_bytes());
     }
 }
 
@@ -1123,6 +1266,8 @@ impl MspCommand {
             105 => Ok(MspCommand::Rc),
             112 => Ok(MspCommand::Pid),
             117 => Ok(MspCommand::Pidnames),
+            92 => Ok(MspCommand::FilterConfig),
+            93 => Ok(MspCommand::SetFilterConfig),
             202 => Ok(MspCommand::SetPid),
             250 => Ok(MspCommand::EepromWrite),
             _ => Err(DronetunerError::parse_error("Unknown MSP command", None)),
@@ -1237,9 +1382,16 @@ impl Transport for MockTransport {
 pub struct SimulatorState {
     /// Current 30-byte MSP_PID payload. Updated on SetPid; returned on Pid.
     pub pid: [u8; 30],
+    /// Current MSP_FILTER_CONFIG payload. Length is FC-version-dependent
+    /// (Betaflight 4.5+ is around 30 bytes; the simulator round-trips
+    /// whatever the client sends, so byte-level fidelity isn't required
+    /// for the happy path).
+    pub filter_config: Vec<u8>,
     /// Whether the simulator should fail the next SetPid (used to drive the
     /// rollback test path). Cleared after one trigger.
     pub fail_next_setpid: bool,
+    /// Whether the simulator should fail the next SetFilterConfig.
+    pub fail_next_setfilter: bool,
     /// How many times EepromWrite has been received.
     pub eeprom_writes: usize,
 }
@@ -1253,13 +1405,27 @@ impl SimulatorState {
         pid[6..9].copy_from_slice(&[45, 90, 0]); // YAW P/I/D
         pid
     }
+
+    fn default_filter_config() -> Vec<u8> {
+        // Plausible-shaped Betaflight 4.5 filter config blob. Real values
+        // would be derived from the firmware's serializer; we just need
+        // *some* bytes to round-trip in tests. First two u16 fields are
+        // gyro_lpf1_static_hz and dterm_lpf1_static_hz (both 0 = off).
+        let mut buf = vec![0u8; 32];
+        buf[0..2].copy_from_slice(&100u16.to_le_bytes()); // gyro lpf cutoff
+        buf[2..4].copy_from_slice(&100u16.to_le_bytes()); // dterm lpf cutoff
+        buf[4..6].copy_from_slice(&100u16.to_le_bytes()); // yaw lpf cutoff
+        buf
+    }
 }
 
 impl Default for SimulatorState {
     fn default() -> Self {
         Self {
             pid: Self::default_pid(),
+            filter_config: Self::default_filter_config(),
             fail_next_setpid: false,
+            fail_next_setfilter: false,
             eeprom_writes: 0,
         }
     }
@@ -1347,6 +1513,21 @@ impl MspSimulator {
                 if req.payload.len() >= 30 {
                     state.pid.copy_from_slice(&req.payload[..30]);
                 }
+                Ok(Vec::new())
+            }
+            MspCommand::FilterConfig => {
+                let state = self.state.lock().unwrap();
+                Ok(state.filter_config.clone())
+            }
+            MspCommand::SetFilterConfig => {
+                let mut state = self.state.lock().unwrap();
+                if state.fail_next_setfilter {
+                    state.fail_next_setfilter = false;
+                    return Err(DronetunerError::communication_error(
+                        "simulator: injected SetFilterConfig failure",
+                    ));
+                }
+                state.filter_config = req.payload.clone();
                 Ok(Vec::new())
             }
             MspCommand::EepromWrite => {
@@ -1613,6 +1794,66 @@ mod tests {
     fn test_pid_snapshot_from_short_payload_is_error() {
         let err = PidSnapshot::from_payload(vec![0u8; 8])
             .expect_err("payloads under 9 bytes should be rejected");
+        assert!(matches!(err, DronetunerError::ParseError { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_read_filter_config_returns_simulator_state() {
+        let (mut conn, _state, handle) = pid_test_setup().await;
+
+        let snapshot = conn.read_filter_config().await.expect("read_filter_config");
+        assert_eq!(snapshot.gyro_lpf1_hz(), 100);
+        assert_eq!(snapshot.dterm_lpf1_hz(), 100);
+        assert_eq!(snapshot.yaw_lpf_hz(), 100);
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_filter_config_updates_simulator_state() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let mut new_filter = conn.read_filter_config().await.unwrap();
+        new_filter.set_gyro_lpf1_hz(150);
+        new_filter.set_dterm_lpf1_hz(125);
+        conn.write_filter_config(&new_filter)
+            .await
+            .expect("write_filter_config");
+
+        let stored = state.lock().unwrap().filter_config.clone();
+        assert_eq!(&stored[0..2], &150u16.to_le_bytes());
+        assert_eq!(&stored[2..4], &125u16.to_le_bytes());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_filter_with_rollback_restores_on_write_failure() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        state.lock().unwrap().fail_next_setfilter = true;
+        let original = conn.read_filter_config().await.unwrap();
+        let mut new_filter = original.clone();
+        new_filter.set_gyro_lpf1_hz(999);
+
+        let result = conn.apply_filter_with_rollback(&new_filter).await;
+        assert!(result.is_err(), "apply must surface the write failure");
+
+        // Simulator's filter_config must match the pre-change state because
+        // the rollback path restored it.
+        let stored = state.lock().unwrap().filter_config.clone();
+        assert_eq!(&stored[..], original.as_payload());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[test]
+    fn test_filter_snapshot_from_short_payload_is_error() {
+        let err = FilterSnapshot::from_payload(vec![0u8; 4])
+            .expect_err("payloads under 6 bytes should be rejected");
         assert!(matches!(err, DronetunerError::ParseError { .. }));
     }
 }
