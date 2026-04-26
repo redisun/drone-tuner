@@ -1,274 +1,286 @@
-# FPV Drone Tuning Platform
+# drone-tuner
 
-A high-performance Rust-based platform for analyzing FPV drone blackbox logs and providing intelligent tuning recommendations.
+A Rust CLI that reads a Betaflight blackbox log, analyses it for PID/filter
+problems, and writes safer values back to the flight controller over MSP.
 
-## Project Structure
+It's been validated end-to-end on two real quads (Jeno STM32H743, TBS
+Source One STM32F7x2): pull a log → analyse → apply recommended PIDs
+→ persist to EEPROM. Both quads survived multiple tune iterations and
+power cycles.
 
-This project follows a workspace-based architecture with separate crates for modularity and reusability:
+## Status
+
+| Capability | State |
+|---|---|
+| Blackbox parser (Betaflight BBL) | Working |
+| FFT + oscillation detection | Working |
+| PID and filter recommendations | Working, calibrated against real flights |
+| Step-response analysis | Working |
+| MSP read/write (PID, filter config, EEPROM) | Working on hardware (Jeno H743, TBS Source One F7) |
+| Onboard dataflash pull (`--pull-bbl`) | Implemented + simulator-tested; real-hardware verification pending |
+| Desktop GUI (Tauri) | Not started |
+| ML pattern recognition | Not started |
+| Tune marketplace | Not started |
+
+`docs/PROJECT_ASSESSMENT.md` keeps the prioritised roadmap.
+
+## How it works, step by step
+
+The interesting command is `tune`. Here's what it does, in order, when
+you run it against a real FC.
+
+### 1. Resolve the blackbox file
+
+Two sources are supported:
+
+- **Local file**: `drone-tuner tune path/to/flight.bbl --connection /dev/ttyACM0`
+- **Pull from FC**: `drone-tuner tune --pull-bbl --connection /dev/ttyACM0`
+
+With `--pull-bbl`, the tool issues `MSP_DATAFLASH_SUMMARY` (cmd 70) to
+get the chip's used/total bytes, then loops `MSP_DATAFLASH_READ` (cmd 71)
+until the whole blob is in memory. A live progress bar shows
+bytes/sec and ETA. The pulled bytes are written to a tempdir
+(`/tmp/drone-tuner-pull-<ts>.bbl`) — pass `--keep-bbl <PATH>` to land
+them somewhere persistent.
+
+V1 framing caps each chunk at ~240 bytes, so a 4 MB log is ~17 000
+roundtrips. On real serial at 115 200 baud this is the slow part of the
+pipeline (tens of seconds).
+
+### 2. Parse
+
+`SimpleBlackboxParser` walks the BBL header, picks the requested session
+(default: most recent; override with `--session N` or
+`--session-strategy {first,last,longest}`), and decodes the I/P frame
+stream into a `FlightSession`. Sample rate is derived from the looptime
+header.
+
+A spinner shows "parsing …" and the final line reports `parsed N samples
+(M ms)`.
+
+### 3. Analyse
+
+`AnalysisEngine::analyze` runs three things in parallel-conceptually:
+
+1. **FFT (Welch's method)** on each gyro axis, 1024-sample windows with
+   50% overlap, hanning-windowed. Peaks are extracted from the resulting
+   PSD.
+2. **Oscillation classification.** Each peak is bucketed by frequency
+   band: < ~30 Hz is treated as flight dynamics, 30–80 Hz as P-term,
+   80–250 Hz as D-term, 250–500 Hz as mechanical/motor resonance.
+3. **Step-response detector** scans `rcCommand` for sticks crossing 30%
+   of full deflection within 50 ms. For each step it captures the
+   pre/post window, computes rise time, overshoot, settling time, and
+   steady-state error in deg/s.
+
+The output is an `AnalysisReport` with PID and filter recommendations,
+each tagged with a priority (`Critical`/`High`/`Medium`/`Low`) and a
+plain-language reason. PID recs are derived from the step-response data
+when available, falling back to oscillation heuristics otherwise.
+
+### 4. Display recommendations
+
+The report is printed regardless of whether you intend to apply
+anything. Each rec has an icon, a "current → recommended" line, and a
+reason:
 
 ```
-drone-tuner/
-├── crates/
-│   ├── drone-tuner-core/    # Core analysis library
-│   └── drone-tuner-cli/     # Command-line interface
-├── examples/                # Usage examples
-├── docs/                   # Technical documentation
-└── README.md              # This file
+🎛️ PID Adjustments:
+    🔴 Yaw P: 76.0 → 53.2
+      Reason: Reduce P-term to decrease overshoot from 32.5% to target 15.0%
+
+🔧 Filter Adjustments:
+    🟡 Dynamic Notch: 1 notches, 16-500 Hz (Q: 10)
+      Expected 15.0% reduction in frame resonance by expanding dynamic notch range
 ```
 
-## Features
+### 5. Apply (only with explicit opt-in)
 
-### Core Library (`drone-tuner-core`)
+The default is **read-only**. To actually write to the FC you have to
+pass one of:
 
-- **Blackbox Parsing**: Support for Betaflight and other flight controller log formats
-- **FFT Analysis**: High-performance frequency domain analysis using Welch's method
-- **Oscillation Detection**: Automated detection of P-term, D-term, and mechanical oscillations
-- **Filter Optimization**: Intelligent filter configuration recommendations
-- **Real-time Communication**: Live flight controller connectivity (with `realtime` feature)
-- **Domain Models**: Comprehensive data structures representing flight sessions and analysis results
+- `--auto-apply-safe` — only applies `Low`/`Medium` priority recs.
+- `--apply-all` — applies every rec (including `Critical`/`High`).
 
-### Command-Line Interface (`drone-tuner-cli`)
+The apply phase:
 
-- **File Analysis**: Analyze single blackbox files or entire directories
-- **Batch Processing**: Process multiple flights with progress tracking
-- **Multiple Output Formats**: Pretty-printed, JSON, and CSV output options
-- **Flight Comparison**: Compare multiple flights and identify patterns
-- **Validation Tools**: Verify blackbox file integrity and detect common issues
+1. Opens the FC connection (USB serial via `serialport`, or the
+   in-process `simulator://` scheme for dry runs).
+2. Reads the current full PID payload via `MSP_PID` (cmd 112) — all 30
+   bytes. We round-trip the entire payload so axes the tool doesn't
+   touch (LEVEL/MAG/NAV/etc.) come back unchanged.
+3. Computes the new payload by mutating only the recommended (axis,
+   term) tuples.
+4. Calls `apply_pid_with_rollback`, which is **read → write → on
+   write-or-ack failure, restore the backup**. The pre-change snapshot
+   is also returned to the caller for forensics.
+5. With `--backup <PATH>`, dumps that pre-change snapshot to JSON.
+6. With `--save-eeprom`, sends `MSP_EEPROM_WRITE` (cmd 250) so the
+   change survives a power cycle. Without it, RAM-only changes will
+   revert on next reboot — itself a useful safety net.
+7. Appends one row to `~/.local/share/drone-tuner/history.jsonl` (or
+   `$XDG_DATA_HOME/drone-tuner/history.jsonl`) recording the FC
+   identity, the BBL fingerprint, the before/after PIDs, and whether
+   the change was persisted.
 
-## Quick Start
+Each step gets a section banner and a result line on stdout, so you can
+see exactly where you are even when run under CI or with output piped
+to a file:
 
-### Installation
+```
+✏️ ── Apply ──
+  ✓ connected: BTFL 4.5.1 (api 1.46.0, target STM32H743)
+  ✓ current: roll=(42, 85, 35) pitch=(46, 90, 38) yaw=(45, 90, 0)
+  📝 1 PID change(s) staged:
+    Yaw   P/I/D: (45, 90, 0) → (53, 90, 0)
+  ✓ PIDs written; backup retained in memory
+  💾 backup → tune-backup-20260426-130045.json
+  ✓ changes persisted across power cycles
+📒 Tune logged to ~/.local/share/drone-tuner/history.jsonl
+  ✅ Tune complete.
+```
+
+### 6. Filter writeback (read-only for now)
+
+Filter recommendations are computed and printed, and `MSP_FILTER_CONFIG`
+(cmd 92) is read on dry-run so you can see the FC's current
+gyro/D-term/yaw lowpass cutoffs. **Writeback isn't auto-applied** —
+the `MSP_FILTER_CONFIG` payload layout shifts between Betaflight 4.x
+versions and a typed setter that's wrong by one byte can brick a tune.
+Apply filter changes from Configurator until we have per-firmware-version
+offset detection.
+
+## Connection schemes
+
+The `--connection` argument supports three forms:
+
+- `/dev/ttyACM0`, `/dev/ttyUSB0`, `COM3` — bare device path → USB serial.
+- `serial:///dev/ttyACM0` — same thing, explicit scheme.
+- `simulator://` — in-process MSP simulator. Handshake works, PID
+  read/write round-trip, but dataflash is empty.
+- `simulator://path/to/file.bbl` — in-process simulator with its
+  dataflash preloaded from a real BBL. Lets you exercise the full
+  `--pull-bbl` chain without serial hardware.
+
+## Commands
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd drone-tuner
+drone-tuner info                                  # version + capability check
+drone-tuner analyze logs/flight.bbl                # parse + analyse, print report
+drone-tuner analyze logs/                          # batch over a directory
+drone-tuner analyze logs/flight.bbl --list-sessions
+drone-tuner analyze logs/flight.bbl --detailed --show-details
 
-# Build the project
-cargo build --release
+drone-tuner compare flight1.bbl flight2.bbl flight3.bbl
+
+drone-tuner validate logs/ --check-issues
+
+drone-tuner monitor /dev/ttyACM0 --rate 100 --duration 30
+
+drone-tuner tune path/to/flight.bbl                          # analyse, no writes
+drone-tuner tune path/to/flight.bbl --connection /dev/ttyACM0 --dry-run
+drone-tuner tune --pull-bbl --connection /dev/ttyACM0        # download + analyse
+drone-tuner tune --pull-bbl --connection /dev/ttyACM0 --keep-bbl ~/logs/flight.bbl
+drone-tuner tune path/flight.bbl --connection /dev/ttyACM0 --auto-apply-safe --save-eeprom
+drone-tuner tune path/flight.bbl --connection /dev/ttyACM0 --apply-all --save-eeprom \
+            --backup ./pre-tune.json
+
+drone-tuner export flight.bbl --output dump.json --format json --include-fft
 ```
 
-### Basic Usage
+Global flags: `--verbose`, `--detailed-info`, `--output-format
+{pretty,json,csv}`.
 
-```bash
-# Show system information and capabilities
-cargo run --bin drone-tuner info
+## Safety design
 
-# Analyze a single blackbox file
-cargo run --bin drone-tuner analyze path/to/flight.bbl
+The tool can change parameters that affect flight safety. The defaults
+are deliberately paranoid:
 
-# Analyze multiple files with JSON output
-cargo run --bin drone-tuner analyze --output json logs/
+- **No writes without an explicit flag.** `tune` reads but does not
+  apply unless `--auto-apply-safe` or `--apply-all` is set.
+- **Atomic writeback with rollback.** Every PID write goes
+  read → write → on-failure-restore-backup. The backup snapshot is also
+  returned to the caller so it can be persisted to disk.
+- **EEPROM persistence is opt-in.** Without `--save-eeprom`, changes are
+  RAM-only and revert on the next power cycle.
+- **Filter writeback is gated** until per-firmware-version offset
+  detection lands (see step 6).
 
-# Compare multiple flights
-cargo run --bin drone-tuner compare flight1.bbl flight2.bbl flight3.bbl
+The history JSONL log gives you a paper trail per FC across every tune
+iteration, keyed on `board_id` + `target_name`.
 
-# Validate blackbox files
-cargo run --bin drone-tuner validate --check-issues logs/
+## Project layout
+
+```
+crates/
+├── drone-tuner-core/         # analysis library
+│   └── src/
+│       ├── analysis.rs       # FFT + oscillation detection + filter optimiser
+│       ├── analysis/pid.rs   # step-response analysis + PID recommendations
+│       ├── blackbox/         # custom Betaflight BBL parser
+│       ├── domain.rs         # FlightSession, AnalysisReport, recommendation types
+│       ├── filters.rs        # Butterworth / notch / biquad design
+│       ├── realtime.rs       # MSP framing, FlightControllerConnection, simulator
+│       └── error.rs
+└── drone-tuner-cli/          # binary `drone-tuner`
+    ├── src/main.rs
+    ├── src/history.rs        # ~/.local/share/drone-tuner/history.jsonl
+    └── tests/                # integration + command-specific suites
+
+test_data/                    # real .bbl fixtures used by calibration tests
+docs/                         # PRD, technical doc, project assessment
 ```
 
-### Library Usage
+There are **no Cargo feature flags**. `tune`, `monitor`, MSP serial,
+and the in-process `simulator://` simulator are all default-on.
+
+## Library usage
 
 ```rust
 use drone_tuner_core::{AnalysisEngine, BlackboxParser};
 
-// Parse a blackbox file
-let data = std::fs::read("flight.bbl")?;
+let bytes = std::fs::read("flight.bbl")?;
 let mut parser = BlackboxParser::new();
-let session = parser.parse_file(&data)?;
+let session = parser.parse_file(&bytes)?;
 
-// Analyze for oscillations and get recommendations
 let mut engine = AnalysisEngine::new();
 let report = engine.analyze(&session)?;
 
-println!("Tune quality: {:.1}/100", report.tune_quality_score);
-println!("Issues found: {}", report.detected_issues.len());
+println!("Quality score: {:.1}", report.tune_quality_score);
+for rec in &report.pid_recommendations {
+    println!("{:?} {:?}: {:.1} → {:.1}",
+             rec.axis, rec.term, rec.current_value, rec.recommended_value);
+}
 ```
 
-## Architecture Overview
+Realtime usage:
 
-### Domain-Driven Design
+```rust
+use drone_tuner_core::realtime::FlightControllerConnection;
 
-The core library is built around a rich domain model that captures the essential concepts of drone tuning:
+let mut fc = FlightControllerConnection::connect("/dev/ttyACM0").await?;
+let pids = fc.read_pid().await?;
+let summary = fc.read_dataflash_summary().await?;
+let blob = fc.pull_dataflash(|done, total| {
+    eprintln!("{done}/{total}");
+}).await?;
+```
 
-- **FlightSession**: Complete flight data with metadata, telemetry, and analysis results
-- **TelemetryData**: Time-series sensor data (gyro, accelerometer, motors, etc.)
-- **AnalysisReport**: Comprehensive analysis results with confidence scores
-- **FilterConfiguration**: Current and recommended filter settings
-- **HardwareConfiguration**: Drone setup information
-
-### Performance Characteristics
-
-- **FFT Analysis**: Optimized using RustFFT for blazing-fast frequency analysis
-- **Memory Efficiency**: Zero-copy parsing where possible, efficient data structures
-- **Concurrent Processing**: Designed for batch processing of multiple flights
-- **Streaming**: Real-time analysis capabilities for live tuning sessions
-
-### Safety and Reliability
-
-- **Memory Safety**: Rust's ownership system prevents memory corruption
-- **Error Handling**: Comprehensive error types with context information
-- **Input Validation**: Robust parsing that handles corrupted or malformed data
-- **Testing**: Extensive unit tests, integration tests, and benchmarks
-
-## Development
-
-### Prerequisites
-
-- Rust 1.70+ (2021 edition)
-- Cargo for dependency management
-
-### Building
+## Building and testing
 
 ```bash
-# Debug build
-cargo build
+cargo build --release                # release binary at target/release/drone-tuner
 
-# Release build (optimized)
-cargo build --release
+cargo test -p drone-tuner-core       # 94 unit tests
+cargo test -p drone-tuner-core --test calibration   # real-flight regression fixtures
+cargo test -p drone-tuner-cli                       # ~70 CLI tests
 
-# Run tests
-cargo test
-
-# Run benchmarks
-cargo bench
-
-# Check code quality
 cargo clippy
 cargo fmt
 ```
 
-### Project Features
-
-The core library supports optional features:
-
-- `realtime`: Enables real-time flight controller communication (requires `serialport`)
-
-Enable features during build:
-
-```bash
-cargo build --features realtime
-```
-
-### Benchmarking
-
-Performance benchmarks are available for critical components:
-
-```bash
-# Run all benchmarks
-cargo bench
-
-# Run specific benchmark
-cargo bench fft_analysis
-cargo bench blackbox_parser
-```
-
-### Testing
-
-The project includes comprehensive testing:
-
-```bash
-# Run all tests
-cargo test
-
-# Run tests with output
-cargo test -- --nocapture
-
-# Run tests for specific crate
-cargo test -p drone-tuner-core
-```
-
-## Technical Details
-
-### Supported Formats
-
-- **Blackbox Logs**: Betaflight BBL format (compressed and uncompressed)
-- **Data Fields**: Gyro, accelerometer, motors, PID errors, RC commands
-- **Firmware**: Betaflight, INAV, ArduPilot (with appropriate field mappings)
-
-### Analysis Capabilities
-
-- **Frequency Analysis**: Power spectral density using Welch's method
-- **Peak Detection**: Automatic identification of problematic frequencies
-- **Oscillation Classification**: P-term, D-term, mechanical, and motor noise
-- **Filter Design**: Butterworth, notch, and dynamic notch filters
-- **Performance Metrics**: Tune quality scoring and confidence assessment
-
-### Real-time Features (Optional)
-
-- **MSP Protocol**: MultiWii Serial Protocol for flight controller communication
-- **Live Telemetry**: Real-time data streaming and analysis
-- **Parameter Management**: Read/write flight controller parameters
-- **Auto-tuning**: Automated tuning sequences with safety checks
-
-## Output Examples
-
-### Pretty Format (Default)
-
-```
-📊 /path/to/flight.bbl
-  Duration: 45.2s
-  Samples: 45187
-  Sample rate: 1000 Hz
-  Analysis time: 0.85s
-
-  Tune Quality: 73.5/100
-
-  ⚠ Issues found:
-    • P-term oscillation detected at 52.3 Hz. Consider reducing P gain.
-    • D-term oscillation detected at 180.1 Hz. Consider reducing D gain or lowering D-term filter cutoff.
-
-  🔧 Filter recommendations:
-    • AddNotchFilter at 52.3 Hz
-    • AdjustLowPassCutoff at 180.1 Hz
-
-  📈 Frequency Analysis:
-    Top frequency peaks:
-      1. 52.3 Hz (amplitude: 2.15)
-      2. 180.1 Hz (amplitude: 1.87)
-      3. 340.5 Hz (amplitude: 0.92)
-```
-
-### JSON Format
-
-```json
-{
-  "version": "0.1.0",
-  "timestamp": "2024-01-15T10:30:00Z",
-  "results": [
-    {
-      "file": "/path/to/flight.bbl",
-      "status": "success",
-      "tune_quality": 73.5,
-      "duration_ms": 45200,
-      "sample_rate": 1000.0,
-      "samples": 45187,
-      "analysis_time_ms": 850,
-      "issues": 2,
-      "filter_recommendations": 2,
-      "pid_recommendations": 0
-    }
-  ]
-}
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes following Rust best practices
-4. Add tests for new functionality
-5. Run `cargo test` and `cargo clippy`
-6. Commit your changes (`git commit -m 'Add amazing feature'`)
-7. Push to the branch (`git push origin feature/amazing-feature`)
-8. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT OR Apache-2.0 license.
-
 ## Acknowledgments
 
-- RustFFT for high-performance FFT implementation
-- The FPV community for domain expertise and testing
-- Betaflight project for blackbox format documentation
+- RustFFT for the FFT backbone
+- Betaflight for the blackbox format and MSP protocol
+- The FPV community
