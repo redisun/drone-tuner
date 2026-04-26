@@ -198,7 +198,12 @@ struct TuneArgs {
     #[arg(value_name = "FILE")]
     input: Option<PathBuf>,
 
-    /// Connection string for applying changes
+    /// Connection string. Accepts a device path (`/dev/ttyACM0`,
+    /// `COM3`), a `serial://` or `simulator://` URI, or the literal
+    /// `auto` to scan USB serial ports and pick the FC automatically.
+    /// Auto-discover also kicks in when this flag is omitted but an
+    /// FC operation is requested (`--pull-bbl`, `--apply-all`,
+    /// `--auto-apply-safe`).
     #[arg(long, value_name = "CONNECTION")]
     connection: Option<String>,
 
@@ -789,15 +794,9 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
 async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()> {
     print_stage("Tune", "drone-tuner ✈️");
 
-    // Validate flag combos. `--pull-bbl` needs --connection because there's
-    // nothing to pull from otherwise; `--keep-bbl` only makes sense when we
-    // actually have a pulled file to keep; an explicit input together with
+    // Validate flag combos. `--keep-bbl` only makes sense when we actually
+    // have a pulled file to keep; an explicit input together with
     // `--pull-bbl` is ambiguous so reject it.
-    if args.pull_bbl && args.connection.is_none() {
-        return Err(anyhow::anyhow!(
-            "--pull-bbl requires --connection <CONNECTION>"
-        ));
-    }
     if args.keep_bbl.is_some() && !args.pull_bbl {
         return Err(anyhow::anyhow!(
             "--keep-bbl only makes sense together with --pull-bbl"
@@ -814,11 +813,31 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         ));
     }
 
+    // Resolve the connection string up-front. If --pull-bbl / --apply-all
+    // / --auto-apply-safe is set with no explicit --connection, we'll
+    // auto-discover the FC's serial port. The same resolved value is
+    // reused for every FC roundtrip in this run (pull, dry-connect, apply).
+    let resolved_connection = resolve_connection(&args)?;
+    let was_auto_discovered = match (&resolved_connection, args.connection.as_deref()) {
+        (Some(_), None) => true,        // omitted, discovered
+        (Some(_), Some("auto")) => true, // explicit `auto`, discovered
+        _ => false,
+    };
+    if let (Some(c), true) = (&resolved_connection, was_auto_discovered) {
+        println!(
+            "{} auto-discovered FC at {}",
+            style("🔌").blue(),
+            style(c).bold()
+        );
+    }
+
     // Resolve the .bbl path: download from FC or use the user-provided file.
     let bbl_path = match (&args.input, args.pull_bbl) {
         (Some(p), false) => p.clone(),
         (None, true) => {
-            let connection = args.connection.as_deref().unwrap();
+            let connection = resolved_connection
+                .as_deref()
+                .expect("resolve_connection guarantees Some when --pull-bbl is set");
             pull_bbl_from_fc(connection, args.keep_bbl.as_deref(), args.erase_after_pull)
                 .await
                 .context("Failed to pull BBL from flight controller")?
@@ -990,13 +1009,14 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
     }
 
     // Decide whether/how to apply.
-    match (&args.connection, args.dry_run) {
+    match (resolved_connection.as_deref(), args.dry_run) {
         (None, true) => {
             println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
         }
         (None, false) => {
             println!(
-                "\n{} Specify --connection to apply changes to flight controller",
+                "\n{} Specify --connection (or --apply-all/--auto-apply-safe to auto-discover) \
+                 to apply changes to flight controller",
                 style("ℹ️").blue()
             );
         }
@@ -1163,6 +1183,124 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+/// Pick a single serial port from a list of candidates likely to be a
+/// Betaflight flight controller. Pulled out for unit-testability —
+/// [`discover_fc_port`] wraps it with the live `available_ports` call.
+///
+/// Strategy:
+/// 1. Drop anything that isn't a USB serial port.
+/// 2. Prefer ports whose USB descriptor matches STMicroelectronics
+///    (VID `0x0483`) — that's STM32 VCP, the default Betaflight USB
+///    enumeration on the vast majority of boards.
+/// 3. If no STM32 VCP found, fall back to all USB ports — covers the
+///    smaller set of boards using AT32 / CH340 / CP210x.
+/// 4. Refuse to guess if more than one candidate remains; print the
+///    list and ask the user to pass `--connection <PATH>`.
+fn pick_fc_port_from(
+    ports: Vec<serialport::SerialPortInfo>,
+) -> Result<serialport::SerialPortInfo> {
+    use serialport::SerialPortType;
+
+    let usb_ports: Vec<_> = ports
+        .into_iter()
+        .filter(|p| matches!(p.port_type, SerialPortType::UsbPort(_)))
+        .collect();
+
+    if usb_ports.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No USB serial devices found. Plug your FC in (and make sure \
+             it's not in DFU/bootloader mode), then re-run."
+        ));
+    }
+
+    let stm32: Vec<_> = usb_ports
+        .iter()
+        .filter(|p| matches!(&p.port_type, SerialPortType::UsbPort(usb) if usb.vid == 0x0483))
+        .cloned()
+        .collect();
+    let candidates = if !stm32.is_empty() {
+        stm32
+    } else {
+        usb_ports
+    };
+
+    match candidates.len() {
+        1 => Ok(candidates.into_iter().next().unwrap()),
+        n => {
+            let names: Vec<String> = candidates
+                .iter()
+                .map(|p| match &p.port_type {
+                    SerialPortType::UsbPort(usb) => format!(
+                        "{} (vid:{:04x} pid:{:04x}{}{})",
+                        p.port_name,
+                        usb.vid,
+                        usb.pid,
+                        usb.manufacturer
+                            .as_deref()
+                            .map(|m| format!(" {m}"))
+                            .unwrap_or_default(),
+                        usb.product
+                            .as_deref()
+                            .map(|p| format!(" / {p}"))
+                            .unwrap_or_default(),
+                    ),
+                    _ => p.port_name.clone(),
+                })
+                .collect();
+            Err(anyhow::anyhow!(
+                "Found {n} USB serial device(s); auto-discover only picks when there's exactly \
+                 one candidate. Pass --connection <PATH> to choose:\n  - {}",
+                names.join("\n  - ")
+            ))
+        }
+    }
+}
+
+/// Auto-discover the FC's serial port. Returns the device path
+/// (e.g. `/dev/ttyACM0`) of the only plausible candidate.
+fn discover_fc_port() -> Result<String> {
+    let ports = serialport::available_ports()
+        .context("Failed to enumerate serial ports — is the user in the dialout group?")?;
+    let pick = pick_fc_port_from(ports)?;
+    Ok(pick.port_name)
+}
+
+/// Resolve a `--connection` argument into a usable connection string.
+///
+/// - `Some("auto")` → run [`discover_fc_port`] and hard-fail on error
+///   (the user explicitly opted in, so a failure is their problem to fix).
+/// - `Some(other)`  → pass through verbatim (covers `/dev/...`,
+///   `serial://...`, `simulator://...`).
+/// - `None` + `--pull-bbl` → auto-discover, hard-fail on error
+///   (`--pull-bbl` has no fallback path — without a port there's nothing
+///   to pull).
+/// - `None` + `--apply-all` / `--auto-apply-safe` → try auto-discover,
+///   but on failure print a warning and return `None` so the run
+///   continues in analysis-only mode. Avoids surprising users whose FC
+///   isn't plugged in.
+/// - `None` and no FC operation requested → return `None`.
+fn resolve_connection(args: &TuneArgs) -> Result<Option<String>> {
+    let soft_fc = args.apply_all || args.auto_apply_safe;
+    match args.connection.as_deref() {
+        Some("auto") => Ok(Some(discover_fc_port()?)),
+        Some(c) => Ok(Some(c.to_string())),
+        None if args.pull_bbl => Ok(Some(discover_fc_port()?)),
+        None if soft_fc => match discover_fc_port() {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => {
+                eprintln!(
+                    "  {} auto-discover skipped ({}); proceeding in analysis-only mode. \
+                     Pass --connection <PATH> to apply.",
+                    style("⚠").yellow(),
+                    e
+                );
+                Ok(None)
+            }
+        },
+        None => Ok(None),
     }
 }
 
@@ -3049,6 +3187,85 @@ async fn export_to_python(
 
     std::fs::write(output_path, content)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod port_discovery_tests {
+    use super::*;
+    use serialport::{SerialPortInfo, SerialPortType, UsbPortInfo};
+
+    fn usb(name: &str, vid: u16, pid: u16) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: SerialPortType::UsbPort(UsbPortInfo {
+                vid,
+                pid,
+                serial_number: None,
+                manufacturer: None,
+                product: None,
+            }),
+        }
+    }
+
+    fn non_usb(name: &str) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: SerialPortType::Unknown,
+        }
+    }
+
+    #[test]
+    fn picks_lone_stm32_vcp() {
+        let pick = pick_fc_port_from(vec![usb("/dev/ttyACM0", 0x0483, 0x5740)]).unwrap();
+        assert_eq!(pick.port_name, "/dev/ttyACM0");
+    }
+
+    #[test]
+    fn prefers_stm32_when_usb_to_uart_also_present() {
+        // STM32 VCP wins even when a CH340 (1a86) bridge is also plugged in.
+        let pick = pick_fc_port_from(vec![
+            usb("/dev/ttyUSB0", 0x1a86, 0x7523),
+            usb("/dev/ttyACM0", 0x0483, 0x5740),
+        ])
+        .unwrap();
+        assert_eq!(pick.port_name, "/dev/ttyACM0");
+    }
+
+    #[test]
+    fn falls_back_to_any_usb_when_no_stm32() {
+        let pick = pick_fc_port_from(vec![usb("/dev/ttyUSB0", 0x1a86, 0x7523)]).unwrap();
+        assert_eq!(pick.port_name, "/dev/ttyUSB0");
+    }
+
+    #[test]
+    fn errors_when_two_stm32_vcps_are_present() {
+        let err = pick_fc_port_from(vec![
+            usb("/dev/ttyACM0", 0x0483, 0x5740),
+            usb("/dev/ttyACM1", 0x0483, 0x5740),
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("/dev/ttyACM0"));
+        assert!(msg.contains("/dev/ttyACM1"));
+        assert!(msg.contains("--connection"));
+    }
+
+    #[test]
+    fn errors_when_no_usb_serial() {
+        let err = pick_fc_port_from(vec![non_usb("/dev/ttyS0")]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.to_lowercase().contains("no usb serial"));
+    }
+
+    #[test]
+    fn ignores_non_usb_ports_when_picking() {
+        let pick = pick_fc_port_from(vec![
+            non_usb("/dev/ttyS0"),
+            usb("/dev/ttyACM0", 0x0483, 0x5740),
+        ])
+        .unwrap();
+        assert_eq!(pick.port_name, "/dev/ttyACM0");
+    }
 }
 
 #[cfg(test)]
