@@ -1137,17 +1137,22 @@ async fn pull_bbl_from_fc(
 
     // Decide where the file lands. Default name embeds the FC's craft
     // name so multi-quad logs don't collide and `ls` makes sense.
+    //
+    // `--keep-bbl <PATH>` accepts either a file path (used verbatim) or
+    // an existing directory (in which case we generate a per-craft
+    // filename inside it). Treating "~/ " or "~/logs/" as "save into
+    // that dir" matches what users expect, and avoids the
+    // `Is a directory (os error 21)` write failure.
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let slug = fc.fc_info().and_then(craft_name_slug);
+    let auto_filename = match &slug {
+        Some(name) => format!("drone-tuner-pull-{name}-{ts}.bbl"),
+        None => format!("drone-tuner-pull-{ts}.bbl"),
+    };
     let path: PathBuf = match keep_path {
+        Some(p) if p.is_dir() => p.join(&auto_filename),
         Some(p) => p.to_path_buf(),
-        None => {
-            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-            let slug = fc.fc_info().and_then(craft_name_slug);
-            let stem = match slug {
-                Some(name) => format!("drone-tuner-pull-{name}-{ts}.bbl"),
-                None => format!("drone-tuner-pull-{ts}.bbl"),
-            };
-            std::env::temp_dir().join(stem)
-        }
+        None => std::env::temp_dir().join(&auto_filename),
     };
 
     let pull_pb = ProgressBar::new(summary.used_size as u64);
@@ -1173,15 +1178,27 @@ async fn pull_bbl_from_fc(
     println!("  {} saved → {}", style("💾").blue(), path.display());
 
     if erase {
-        // Erase is intentionally not wired through `FlightControllerConnection`
-        // yet — the command is destructive and we want a deliberate review
-        // before exposing it. Surface a friendly note here so the flag
-        // doesn't silently no-op.
-        println!(
-            "  {} --erase-after-pull is staged but not yet wired; \
-             use Betaflight Configurator if you need to clear the chip.",
-            style("⚠").yellow()
-        );
+        // The pulled bytes are already on disk by this point, so it's
+        // safe to wipe the chip. Betaflight's MSP_DATAFLASH_ERASE acks
+        // immediately and runs the actual flash wipe in the background;
+        // by the time the analyse → apply phases finish on a typical
+        // 4 MB log, the FC has caught up.
+        let erase_pb = make_spinner("erasing dataflash (acks fast, wipe runs async on FC)");
+        match fc.erase_dataflash().await {
+            Ok(()) => finish_step(
+                erase_pb,
+                "dataflash erase queued (chip will clear in the background)",
+            ),
+            Err(e) => {
+                erase_pb.finish_and_clear();
+                println!(
+                    "  {} dataflash erase failed: {} \
+                     (your BBL is already saved; pull will still complete)",
+                    style("⚠").yellow(),
+                    e
+                );
+            }
+        }
     }
 
     Ok(path)
@@ -1327,36 +1344,24 @@ fn discover_fc_port() -> Result<String> {
 
 /// Resolve a `--connection` argument into a usable connection string.
 ///
-/// - `Some("auto")` → run [`discover_fc_port`] and hard-fail on error
-///   (the user explicitly opted in, so a failure is their problem to fix).
-/// - `Some(other)`  → pass through verbatim (covers `/dev/...`,
-///   `serial://...`, `simulator://...`).
+/// Auto-discovery fires only when the user explicitly asks for it:
+/// - `Some("auto")` → run [`discover_fc_port`] and hard-fail on error.
 /// - `None` + `--pull-bbl` → auto-discover, hard-fail on error
 ///   (`--pull-bbl` has no fallback path — without a port there's nothing
 ///   to pull).
-/// - `None` + `--apply-all` / `--auto-apply-safe` → try auto-discover,
-///   but on failure print a warning and return `None` so the run
-///   continues in analysis-only mode. Avoids surprising users whose FC
-///   isn't plugged in.
-/// - `None` and no FC operation requested → return `None`.
+/// - `Some(other)` → pass through verbatim (covers `/dev/...`,
+///   `serial://...`, `simulator://...`).
+/// - `None` everywhere else → return `None`. `--apply-all` /
+///   `--auto-apply-safe` without an explicit `--connection` keeps the
+///   pre-auto-discover behaviour ("specify --connection ..." prompt)
+///   — being conservative here avoids opening a busy port that some
+///   other process owns and surprising users whose intent was just to
+///   look at recommendations.
 fn resolve_connection(args: &TuneArgs) -> Result<Option<String>> {
-    let soft_fc = args.apply_all || args.auto_apply_safe;
     match args.connection.as_deref() {
         Some("auto") => Ok(Some(discover_fc_port()?)),
         Some(c) => Ok(Some(c.to_string())),
         None if args.pull_bbl => Ok(Some(discover_fc_port()?)),
-        None if soft_fc => match discover_fc_port() {
-            Ok(c) => Ok(Some(c)),
-            Err(e) => {
-                eprintln!(
-                    "  {} auto-discover skipped ({}); proceeding in analysis-only mode. \
-                     Pass --connection <PATH> to apply.",
-                    style("⚠").yellow(),
-                    e
-                );
-                Ok(None)
-            }
-        },
         None => Ok(None),
     }
 }
