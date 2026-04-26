@@ -24,27 +24,44 @@ Key components:
 
 ## Development Status
 
-This is an early-stage project with comprehensive planning documents but no implementation yet. The codebase currently contains only documentation:
-- `docs/technical-development-document.md` - Detailed technical architecture and implementation patterns
-- `docs/prd.md` - Product requirements and feature specifications
+Early-stage but functional. The CLI analyses real Betaflight blackbox files end-to-end (parse → FFT → oscillation detection → filter/PID recommendations). The Tauri desktop app, ML inference, and MSP-based realtime auto-tune are still aspirational — none of that code exists yet.
 
-## Planned Project Structure
+See `docs/PROJECT_ASSESSMENT.md` for the current shortcomings list and prioritised path forward.
+
+Reference docs:
+- `docs/technical-development-document.md` — technical architecture & implementation patterns
+- `docs/prd.md` — product requirements
+- `docs/PROJECT_ASSESSMENT.md` — current state vs. ambition + roadmap
+
+## Project Structure (actual)
+
+Cargo workspace, two crates:
 
 ```
-src/
-├── lib.rs              # Main library entry point
-├── domain/             # Core domain models (FlightSession, TelemetryData, etc.)
-├── analysis/           # Analysis engine (FFT, oscillation detection)
-├── blackbox/           # Blackbox parser implementation
-├── filters/            # Filter optimization algorithms
-├── realtime/           # Flight controller communication
-├── ml/                 # Machine learning components
-└── cli/                # Command-line interface
+crates/
+├── drone-tuner-core/         # analysis library
+│   └── src/
+│       ├── lib.rs            # public API surface
+│       ├── domain.rs         # FlightSession, TelemetryData, recommendations
+│       ├── analysis.rs       # FFT + oscillation detection + filter optimiser + PID analysis
+│       ├── analysis/         # test modules (tests, realistic_tests, debug_tests, debug_d_term)
+│       ├── blackbox/
+│       │   ├── mod.rs        # parsing config / stats / field mappings
+│       │   ├── simple_parser.rs  # custom Betaflight BBL parser (the working one)
+│       │   └── converter.rs  # raw-int → physical-unit conversion
+│       ├── filters.rs        # Butterworth / notch / biquad design
+│       ├── error.rs          # DronetunerError + Result
+│       └── realtime.rs       # MSP scaffolding (feature-gated, not production-ready)
+└── drone-tuner-cli/          # binary `drone-tuner`
+    ├── src/main.rs           # 7 subcommands: info, analyze, compare, validate, monitor, tune, export
+    └── tests/                # integration + command_specific + performance suites
 
-desktop/                # Tauri desktop application
-├── src-tauri/         # Rust backend
-└── src/               # React frontend
+docs/                         # PRD, technical doc, project assessment
+test_data/                    # real .bbl files for integration testing
+examples/                     # standalone example binaries
 ```
+
+Tauri/desktop and ML directories are **not yet present** despite being mentioned in the PRD.
 
 ## Key Technical Decisions
 
@@ -54,36 +71,31 @@ desktop/                # Tauri desktop application
 - **ML Framework**: candle or ONNX runtime for model inference
 - **Communication**: tokio async runtime for real-time FC connectivity
 
-## Core Dependencies (Planned)
+## Core Dependencies (actual)
 
-```toml
-# Scientific computing
-ndarray = "0.15"
-rustfft = "6.0" 
-nalgebra = "0.32"
+Workspace dependencies live in the root `Cargo.toml`. Highlights:
 
-# Machine learning
-candle = "0.3"
+- **Signal processing:** `rustfft 6.2`, `ndarray 0.16`, `nalgebra 0.34`, `num-complex 0.4`
+- **Blackbox parsing:** `blackbox-log 0.4` (reference) + custom `SimpleBlackboxParser`
+- **CLI:** `clap 4.4`, `console`, `indicatif`
+- **Async / realtime (feature-gated):** `tokio 1.35`, `serialport 4.2`, `async-trait`
+- **Serialisation:** `serde`, `serde_json`, `bincode 2.0`
+- **Errors:** `thiserror`, `anyhow`
+- **Tracing:** `tracing`, `tracing-subscriber`
+- **Tests / bench:** `criterion 0.7`, `proptest`, `tokio-test`
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-bincode = "1.3"
-
-# Async runtime
-tokio = { version = "1.0", features = ["full"] }
-
-# Parsing
-nom = "7.0"
-```
+ML deps (`candle`, ONNX runtime) are **not** added yet.
 
 ## Development Phases
 
-1. **Core Foundation**: Blackbox parser and basic FFT analysis
-2. **Analysis Engine**: Oscillation detection and filter recommendations  
-3. **Desktop Application**: Tauri app with visualization
-4. **Real-time Integration**: Live FC communication and auto-tune
-5. **ML Enhancement**: Pattern recognition and anomaly detection
-6. **Community Features**: Tune marketplace and sharing
+1. **Core Foundation** — Blackbox parser and basic FFT analysis. ✅ Done.
+2. **Analysis Engine** — Oscillation detection and filter recommendations. ✅ Working; calibration & golden tests still owed.
+3. **Desktop Application** — Tauri app with visualisation. ❌ Not started.
+4. **Real-time Integration** — Live FC communication and auto-tune. ⚠️ Scaffolding in `realtime.rs`; feature-gated; never tested against a real FC.
+5. **ML Enhancement** — Pattern recognition and anomaly detection. ❌ Not started; deferred until labelled dataset exists.
+6. **Community Features** — Tune marketplace and sharing. ❌ Not started.
+
+For the prioritised cleanup roadmap see `docs/PROJECT_ASSESSMENT.md`.
 
 ## Performance Requirements
 
