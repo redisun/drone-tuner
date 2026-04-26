@@ -34,8 +34,9 @@ you run it against a real FC.
 
 Two sources are supported:
 
-- **Local file**: `drone-tuner tune path/to/flight.bbl --connection /dev/ttyACM0`
-- **Pull from FC**: `drone-tuner tune --pull-bbl --connection /dev/ttyACM0`
+- **Local file**: `drone-tuner tune path/to/flight.bbl`
+- **Pull from FC**: `drone-tuner tune --pull-bbl` — auto-discovers the
+  FC's serial port (or pass `--connection /dev/ttyACM0` to override).
 
 With `--pull-bbl`, the tool issues `MSP_DATAFLASH_SUMMARY` (cmd 70) to
 get the chip's used/total bytes, then loops `MSP_DATAFLASH_READ` (cmd 71)
@@ -175,8 +176,16 @@ PIDs.
 
 ## Connection schemes
 
-The `--connection` argument supports three forms:
+The `--connection` argument supports several forms:
 
+- `auto` — scan USB serial ports and pick the FC automatically. Prefers
+  STM32 VCP (vid `0x0483`, what every Betaflight board enumerates as);
+  falls back to any USB serial. Errors with the candidate list if more
+  than one device is plugged in.
+- *(omitted)* with `--pull-bbl` / `--apply-all` / `--auto-apply-safe` →
+  same auto-discovery as `auto`. `--pull-bbl` hard-fails if no FC is
+  found (it has no fallback); apply flags soft-fail to analysis-only
+  mode so existing workflows aren't broken.
 - `/dev/ttyACM0`, `/dev/ttyUSB0`, `COM3` — bare device path → USB serial.
 - `serial:///dev/ttyACM0` — same thing, explicit scheme.
 - `simulator://` — in-process MSP simulator. Handshake works, PID
@@ -200,13 +209,13 @@ drone-tuner validate logs/ --check-issues
 
 drone-tuner monitor /dev/ttyACM0 --rate 100 --duration 30
 
-drone-tuner tune path/to/flight.bbl                          # analyse, no writes
-drone-tuner tune path/to/flight.bbl --connection /dev/ttyACM0 --dry-run
-drone-tuner tune --pull-bbl --connection /dev/ttyACM0        # download + analyse
-drone-tuner tune --pull-bbl --connection /dev/ttyACM0 --keep-bbl ~/logs/flight.bbl
-drone-tuner tune path/flight.bbl --connection /dev/ttyACM0 --auto-apply-safe --save-eeprom
-drone-tuner tune path/flight.bbl --connection /dev/ttyACM0 --apply-all --save-eeprom \
-            --backup ./pre-tune.json
+drone-tuner tune path/to/flight.bbl                  # analyse only, no writes
+drone-tuner tune --pull-bbl                          # auto-discover FC, pull, analyse
+drone-tuner tune --pull-bbl --apply-all --save-eeprom  # full one-shot tune, auto-discovered
+drone-tuner tune --pull-bbl --keep-bbl ~/logs/flight.bbl
+drone-tuner tune path/to/flight.bbl --connection auto --dry-run  # explicit opt-in
+drone-tuner tune path/flight.bbl --auto-apply-safe --save-eeprom --backup ./pre-tune.json
+drone-tuner tune path/flight.bbl --connection /dev/ttyACM0 --apply-all --save-eeprom
 
 drone-tuner export flight.bbl --output dump.json --format json --include-fft
 ```
