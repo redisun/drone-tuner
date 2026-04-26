@@ -885,6 +885,29 @@ impl FlightControllerConnection {
         Ok(backup)
     }
 
+    /// Erase the entire onboard dataflash (`MSP_DATAFLASH_ERASE` / 72).
+    ///
+    /// **Destructive** — wipes every recorded blackbox session on the
+    /// chip. The caller is expected to have saved any logs they care
+    /// about already.
+    ///
+    /// Betaflight's erase is **asynchronous on the FC side**: the MSP
+    /// handler queues the operation and acks immediately, while the
+    /// actual flash wipe runs in the background (typically 10–60 s for
+    /// a 16 MB chip). MSP keeps responding to other commands during the
+    /// erase, but heavy traffic during the wipe can stutter — wait for
+    /// the next call to [`Self::read_dataflash_summary`] to report
+    /// `used_size = 0` if you need to confirm completion.
+    pub async fn erase_dataflash(&mut self) -> Result<()> {
+        let request = self
+            .msp
+            .create_message(MspCommand::DataflashErase, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let _ack = self.read_msp_response().await?;
+        Ok(())
+    }
+
     /// Read the onboard dataflash summary (MSP_DATAFLASH_SUMMARY / 70).
     ///
     /// Returns whether the FC has a usable dataflash chip, how many bytes
@@ -2793,6 +2816,26 @@ mod tests {
             .expect("pull_dataflash");
         assert_eq!(pulled, blob);
         assert_eq!(last_progress, (blob.len() as u64, blob.len() as u64));
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_erase_dataflash_clears_simulator_state() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        sim.state.lock().unwrap().dataflash = b"some flight data".to_vec();
+        let state = sim.state.clone();
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        assert_eq!(state.lock().unwrap().dataflash_erases, 0);
+        conn.erase_dataflash().await.expect("erase");
+        assert_eq!(state.lock().unwrap().dataflash_erases, 1);
+        assert!(state.lock().unwrap().dataflash.is_empty());
 
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
