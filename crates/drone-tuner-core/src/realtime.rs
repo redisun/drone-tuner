@@ -283,7 +283,13 @@ impl FlightControllerConnection {
     pub async fn connect(connection_string: &str) -> Result<Self> {
         // Parse connection string to determine transport type
         let transport = Self::create_transport(connection_string).await?;
+        Self::from_transport(transport).await
+    }
 
+    /// Create a connection from an already-built transport. Used by the
+    /// in-process MSP simulator to drive the handshake against a fake FC
+    /// without serial hardware.
+    pub async fn from_transport(transport: Box<dyn Transport + Send>) -> Result<Self> {
         let msp = MspProtocol::new();
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
         let (telemetry_tx, _telemetry_rx) = broadcast::channel(1000);
@@ -675,16 +681,36 @@ impl Default for TelemetryConfig {
 }
 
 impl MspProtocol {
-    /// Create a new MSP protocol handler
+    /// Create a new MSP protocol handler.
+    ///
+    /// Defaults to MSPv1 because that's the only framing the production
+    /// `parse_response` path actually decodes today. Switch to V2 once
+    /// `parse_framed` learns the V2 envelope (CRC, 16-bit lengths).
     pub fn new() -> Self {
         Self {
-            version: MspVersion::V2,
+            version: MspVersion::V1,
             sequence: 0,
         }
     }
 
-    /// Create an MSP message
+    /// Create an MSP request message (direction = `<`).
     pub fn create_message(&self, command: MspCommand, payload: &[u8]) -> Result<Vec<u8>> {
+        self.build_framed(MspMessageType::Request, command, payload)
+    }
+
+    /// Create an MSP response message (direction = `>`). Used by the
+    /// in-process MSP simulator to reply to client requests.
+    #[cfg(test)]
+    pub(crate) fn create_response(&self, command: MspCommand, payload: &[u8]) -> Result<Vec<u8>> {
+        self.build_framed(MspMessageType::Response, command, payload)
+    }
+
+    fn build_framed(
+        &self,
+        direction: MspMessageType,
+        command: MspCommand,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
         let mut message = Vec::new();
 
         match self.version {
@@ -692,7 +718,7 @@ impl MspProtocol {
                 // MSPv1 format: $M<direction><size><command><payload><checksum>
                 message.push(b'$');
                 message.push(b'M');
-                message.push(MspMessageType::Request as u8);
+                message.push(direction as u8);
                 message.push(payload.len() as u8);
                 message.push(command as u8);
                 message.extend_from_slice(payload);
@@ -709,7 +735,7 @@ impl MspProtocol {
                 // MSPv2 format is more complex but provides better reliability
                 message.push(b'$');
                 message.push(b'X');
-                message.push(MspMessageType::Request as u8);
+                message.push(direction as u8);
                 message.push(0); // Flag byte
                 message.extend_from_slice(&(command as u16).to_le_bytes());
                 message.extend_from_slice(&(payload.len() as u16).to_le_bytes());
@@ -724,10 +750,21 @@ impl MspProtocol {
         Ok(message)
     }
 
-    /// Parse an MSP response
+    /// Parse an MSP response (direction = `>`).
     pub fn parse_response(&self, data: &[u8]) -> Result<MspResponse> {
+        self.parse_framed(MspMessageType::Response, data)
+    }
+
+    /// Parse an MSP request (direction = `<`). Used by the in-process MSP
+    /// simulator to consume client requests.
+    #[cfg(test)]
+    pub(crate) fn parse_request(&self, data: &[u8]) -> Result<MspResponse> {
+        self.parse_framed(MspMessageType::Request, data)
+    }
+
+    fn parse_framed(&self, expected_direction: MspMessageType, data: &[u8]) -> Result<MspResponse> {
         if data.len() < 5 {
-            return Err(DronetunerError::parse_error("MSP response too short", None));
+            return Err(DronetunerError::parse_error("MSP message too short", None));
         }
 
         // Check for MSP header
@@ -736,18 +773,18 @@ impl MspProtocol {
         }
 
         let direction = data[2];
-        if direction != MspMessageType::Response as u8 {
-            return Err(DronetunerError::parse_error("Not a response message", None));
+        if direction != expected_direction as u8 {
+            return Err(DronetunerError::parse_error(
+                "Wrong MSP direction byte",
+                None,
+            ));
         }
 
         let payload_size = data[3] as usize;
         let command = data[4];
 
         if data.len() < 6 + payload_size {
-            return Err(DronetunerError::parse_error(
-                "Incomplete MSP response",
-                None,
-            ));
+            return Err(DronetunerError::parse_error("Incomplete MSP message", None));
         }
 
         let payload = data[5..5 + payload_size].to_vec();
@@ -835,6 +872,146 @@ impl Transport for UsbSerialTransport {
     }
 }
 
+// ===========================================================================
+// In-process MSP simulator — used by the test suite to exercise the realtime
+// path end-to-end without a physical flight controller.
+// ===========================================================================
+
+/// Mock transport for in-process testing. Pairs with a sibling so anything
+/// one writes the other reads.
+#[cfg(test)]
+pub(crate) struct MockTransport {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    pending: Vec<u8>,
+    description: String,
+}
+
+#[cfg(test)]
+impl MockTransport {
+    /// Build a connected pair: bytes written to `(.0)` arrive at `(.1).read()`,
+    /// and vice versa.
+    pub(crate) fn pair() -> (Self, Self) {
+        let (tx_a, rx_a) = mpsc::unbounded_channel();
+        let (tx_b, rx_b) = mpsc::unbounded_channel();
+        (
+            Self {
+                rx: rx_a,
+                tx: tx_b,
+                pending: Vec::new(),
+                description: "MockTransport(client)".to_string(),
+            },
+            Self {
+                rx: rx_b,
+                tx: tx_a,
+                pending: Vec::new(),
+                description: "MockTransport(server)".to_string(),
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Transport for MockTransport {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.pending.is_empty() {
+            match self.rx.recv().await {
+                Some(data) => self.pending = data,
+                None => return Ok(0), // EOF — channel closed
+            }
+        }
+        let n = self.pending.len().min(buf.len());
+        let drained: Vec<u8> = self.pending.drain(..n).collect();
+        buf[..n].copy_from_slice(&drained);
+        Ok(n)
+    }
+
+    async fn write(&mut self, data: &[u8]) -> Result<usize> {
+        self.tx
+            .send(data.to_vec())
+            .map_err(|e| DronetunerError::communication_error(format!("mock write: {e}")))?;
+        Ok(data.len())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+}
+
+/// Configurable Betaflight FC simulator. Spawn with [`MspSimulator::run`]
+/// to service requests on the server end of a [`MockTransport`] pair.
+#[cfg(test)]
+pub(crate) struct MspSimulator {
+    transport: Box<dyn Transport + Send>,
+    /// 3-byte API version (major, minor, patch).
+    pub(crate) api_version: [u8; 3],
+    /// Firmware variant string ("BTFL", "INAV", ...).
+    pub(crate) firmware_id: String,
+    /// 3-byte firmware version (major, minor, patch).
+    pub(crate) firmware_version: [u8; 3],
+}
+
+#[cfg(test)]
+impl MspSimulator {
+    pub(crate) fn new(transport: Box<dyn Transport + Send>) -> Self {
+        Self {
+            transport,
+            api_version: [1, 46, 0],
+            firmware_id: "BTFL".to_string(),
+            firmware_version: [4, 5, 1],
+        }
+    }
+
+    /// Service requests until the transport closes. Intended to be spawned
+    /// in a `tokio::task`.
+    pub(crate) async fn run(mut self) -> Result<()> {
+        let msp = MspProtocol::new();
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let n = self.transport.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            let request = match msp.parse_request(&buf[..n]) {
+                Ok(req) => req,
+                Err(_) => continue, // ignore malformed traffic
+            };
+            let payload = self.handle(&request);
+            let response = msp.create_response(request.command, &payload)?;
+            self.transport.write(&response).await?;
+            self.transport.flush().await?;
+        }
+    }
+
+    fn handle(&self, req: &MspResponse) -> Vec<u8> {
+        match req.command {
+            MspCommand::ApiVersion => self.api_version.to_vec(),
+            MspCommand::FcVariant => self.firmware_id.as_bytes().to_vec(),
+            MspCommand::FcVersion => self.firmware_version.to_vec(),
+            MspCommand::BoardInfo => b"OMNF7\x04\x00\x00".to_vec(),
+            // RawImu: 18 bytes, 3xi16 gyro + 3xi16 accel + 3xi16 mag
+            MspCommand::RawImu => vec![0u8; 18],
+            // 16 motor outputs, u16 each (only first 4 used in quad)
+            MspCommand::Motor => vec![0u8; 32],
+            MspCommand::Rc => vec![0u8; 16],
+            MspCommand::Pid => vec![0u8; 30],
+            // Pidnames is a comma-separated string; keep it simple.
+            MspCommand::Pidnames => b"ROLL;PITCH;YAW".to_vec(),
+            // Writes return empty payload to acknowledge receipt.
+            MspCommand::SetPid | MspCommand::EepromWrite => Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,11 +1024,11 @@ mod tests {
 
     #[test]
     fn test_msp_message_creation() {
-        let mut msp = MspProtocol::new();
+        let msp = MspProtocol::new();
         let message = msp.create_message(MspCommand::ApiVersion, &[]).unwrap();
 
         assert_eq!(message[0], b'$');
-        assert_eq!(message[1], b'X'); // MSPv2
+        assert_eq!(message[1], b'M'); // MSPv1 — see MspProtocol::new docs
         assert!(message.len() > 5);
     }
 
@@ -860,5 +1037,74 @@ mod tests {
         let config = TelemetryConfig::default();
         assert_eq!(config.rate_hz, 100);
         assert!(!config.enabled_fields.is_empty());
+    }
+
+    /// Round-trip a V1 request through create_message → parse_request.
+    /// The V2 path uses a different framing and parse_framed only handles
+    /// V1 today; this guards V1 against regression.
+    #[test]
+    fn test_msp_v1_request_round_trip() {
+        let msp = MspProtocol {
+            version: MspVersion::V1,
+            sequence: 0,
+        };
+        let payload = vec![0xAA, 0xBB, 0xCC];
+        let frame = msp.create_message(MspCommand::Pid, &payload).unwrap();
+        let parsed = msp.parse_request(&frame).unwrap();
+        assert!(matches!(parsed.command, MspCommand::Pid));
+        assert_eq!(parsed.payload, payload);
+    }
+
+    /// Round-trip a V1 response through create_response → parse_response.
+    #[test]
+    fn test_msp_v1_response_round_trip() {
+        let msp = MspProtocol {
+            version: MspVersion::V1,
+            sequence: 0,
+        };
+        let payload = vec![1, 46, 0];
+        let frame = msp
+            .create_response(MspCommand::ApiVersion, &payload)
+            .unwrap();
+        let parsed = msp.parse_response(&frame).unwrap();
+        assert!(matches!(parsed.command, MspCommand::ApiVersion));
+        assert_eq!(parsed.payload, payload);
+    }
+
+    /// End-to-end: client connects via MockTransport against an MspSimulator
+    /// and the handshake completes with the FC info the simulator was
+    /// configured to return.
+    #[tokio::test]
+    async fn test_handshake_against_simulator() {
+        let (client, server) = MockTransport::pair();
+
+        let mut sim = MspSimulator::new(Box::new(server));
+        // Pin specific values so the assertions below stay deterministic.
+        sim.api_version = [1, 46, 0];
+        sim.firmware_id = "BTFL".to_string();
+        sim.firmware_version = [4, 5, 1];
+
+        let sim_handle = tokio::spawn(sim.run());
+
+        let conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .expect("handshake against simulator should succeed");
+
+        let info = conn
+            .fc_info()
+            .expect("connection must be Connected after handshake");
+        assert_eq!(info.api_version, "1.46.0");
+        assert_eq!(info.firmware_id, "BTFL");
+        assert_eq!(info.firmware_version, "4.5.1");
+
+        // Drop client so the simulator's read returns 0 and run() exits
+        // cleanly. Without this the test would deadlock if we waited on
+        // sim_handle directly.
+        drop(conn);
+        // Give the simulator a moment to notice; it will exit by itself
+        // once the channel closes.
+        tokio::time::timeout(std::time::Duration::from_millis(500), sim_handle)
+            .await
+            .ok();
     }
 }
