@@ -635,10 +635,10 @@ mod tune_scenarios {
         let output_str = String::from_utf8(output).unwrap();
 
         assert!(output_str.contains("Tuning Recommendations:"));
-        // The tune command prints stage banners (e.g. "── Tune ──",
-        // "── Analyze ──") so a user can see where they are in the flow.
-        assert!(output_str.contains("── Tune ──"));
-        assert!(output_str.contains("── Analyze ──"));
+        // The tune command prints stage banners (e.g. "== Tune ==",
+        // "== Analyze ==") so a user can see where they are in the flow.
+        assert!(output_str.contains("== drone-tuner Tune =="));
+        assert!(output_str.contains("== Analyze =="));
     }
 
     /// Without `--connection`, `--dry-run` short-circuits to "no changes

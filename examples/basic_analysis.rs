@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("🚁 FPV Drone Tuning Analysis Example");
+    println!("FPV Drone Tuning Analysis Example");
     println!("=====================================");
     
     // Read the blackbox file
@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     println!("   File size: {} KB", data.len() / 1024);
     
     // Parse the blackbox data
-    println!("🔍 Parsing blackbox data...");
+    println!("Parsing blackbox data...");
     let mut parser = BlackboxParser::new();
     let session = parser.parse_file(&data)?;
     
@@ -40,20 +40,20 @@ fn main() -> Result<()> {
              session.metadata.hardware.flight_controller.version);
     
     // Perform analysis
-    println!("⚡ Analyzing flight data...");
+    println!("Analyzing flight data...");
     let mut engine = AnalysisEngine::new();
     let report = engine.analyze(&session)?;
     
     // Display results
-    println!("\n📊 Analysis Results");
+    println!("\nAnalysis Results");
     println!("==================");
     
-    println!("🎯 Tune Quality Score: {:.1}/100", report.tune_quality_score);
+    println!("Tune Quality Score: {:.1}/100", report.tune_quality_score);
     
     if report.tune_quality_score >= 80.0 {
-        println!("   ✅ Excellent tune quality!");
+        println!("   Excellent tune quality!");
     } else if report.tune_quality_score >= 60.0 {
-        println!("   ⚠️  Good tune, but could be improved");
+        println!("    Good tune, but could be improved");
     } else {
         println!("   ❌ Tune needs significant improvement");
     }
@@ -63,26 +63,26 @@ fn main() -> Result<()> {
         println!("\n🚨 Issues Detected:");
         for (i, issue) in report.detected_issues.iter().enumerate() {
             let severity_icon = match issue.severity {
-                drone_tuner_core::domain::Severity::Critical => "🔴",
+                drone_tuner_core::domain::Severity::Critical => "",
                 drone_tuner_core::domain::Severity::High => "🟠",
-                drone_tuner_core::domain::Severity::Medium => "🟡",
-                drone_tuner_core::domain::Severity::Low => "🟢",
+                drone_tuner_core::domain::Severity::Medium => "",
+                drone_tuner_core::domain::Severity::Low => "",
             };
             println!("   {}. {} {}", i + 1, severity_icon, issue.description);
         }
     } else {
-        println!("\n✅ No significant issues detected!");
+        println!("\nNo significant issues detected!");
     }
     
     // Show filter recommendations
     if !report.filter_recommendations.is_empty() {
-        println!("\n🔧 Filter Recommendations:");
+        println!("\nFilter Recommendations:");
         for (i, rec) in report.filter_recommendations.iter().enumerate() {
             let priority_icon = match rec.priority {
-                drone_tuner_core::domain::Priority::Critical => "🔴",
+                drone_tuner_core::domain::Priority::Critical => "",
                 drone_tuner_core::domain::Priority::High => "🟠",
-                drone_tuner_core::domain::Priority::Medium => "🟡",
-                drone_tuner_core::domain::Priority::Low => "🟢",
+                drone_tuner_core::domain::Priority::Medium => "",
+                drone_tuner_core::domain::Priority::Low => "",
             };
             println!("   {}. {} {:?} at {:.1} Hz", 
                     i + 1, priority_icon, rec.recommendation_type, rec.frequency);
@@ -92,13 +92,13 @@ fn main() -> Result<()> {
     
     // Show PID recommendations
     if !report.pid_recommendations.is_empty() {
-        println!("\n🎛️  PID Recommendations:");
+        println!("\n PID Recommendations:");
         for (i, rec) in report.pid_recommendations.iter().enumerate() {
             let priority_icon = match rec.priority {
-                drone_tuner_core::domain::Priority::Critical => "🔴",
+                drone_tuner_core::domain::Priority::Critical => "",
                 drone_tuner_core::domain::Priority::High => "🟠",
-                drone_tuner_core::domain::Priority::Medium => "🟡",
-                drone_tuner_core::domain::Priority::Low => "🟢",
+                drone_tuner_core::domain::Priority::Medium => "",
+                drone_tuner_core::domain::Priority::Low => "",
             };
             println!("   {}. {} {:?} {:?}: {:.1} → {:.1}", 
                     i + 1, priority_icon, rec.axis, rec.term, 
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     }
     
     // Show frequency analysis summary
-    println!("\n📈 Frequency Analysis:");
+    println!("\nFrequency Analysis:");
     println!("   Spectral peaks found: {}", report.frequency_analysis.peaks.len());
     println!("   Noise floor: {:.3}", report.frequency_analysis.noise_floor);
     
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
     }
     
     // Show confidence scores
-    println!("\n🎯 Confidence Scores:");
+    println!("\nConfidence Scores:");
     println!("   Overall: {:.1}%", report.confidence_scores.overall * 100.0);
     println!("   Oscillation detection: {:.1}%", 
              report.confidence_scores.oscillation_detection * 100.0);
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
     println!("   PID recommendations: {:.1}%", 
              report.confidence_scores.pid_recommendations * 100.0);
     
-    println!("\n🎉 Analysis complete! Use the recommendations above to improve your tune.");
+    println!("\nAnalysis complete! Use the recommendations above to improve your tune.");
     
     Ok(())
 }

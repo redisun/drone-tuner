@@ -90,12 +90,12 @@ ML deps (`candle`, ONNX runtime) are **not** added yet.
 
 ## Development Phases
 
-1. **Core Foundation** — Blackbox parser and basic FFT analysis. ✅ Done.
-2. **Analysis Engine** — Oscillation detection and filter recommendations. ✅ Working; calibration golden tests in place.
-3. **Desktop Application** — Tauri app with visualisation. ❌ Not started.
-4. **Real-time Integration** — Live FC communication and auto-tune. ✅ Validated end-to-end on two real flight controllers; EEPROM persistence verified across power cycles.
-5. **ML Enhancement** — Pattern recognition and anomaly detection. ❌ Not started; deferred until labelled dataset exists.
-6. **Community Features** — Tune marketplace and sharing. ❌ Not started.
+1. **Core Foundation** — Blackbox parser and basic FFT analysis. **Done.**
+2. **Analysis Engine** — Oscillation detection and filter recommendations. **Working** — calibration golden tests in place.
+3. **Desktop Application** — Tauri app with visualisation. **Not started.**
+4. **Real-time Integration** — Live FC communication and auto-tune. **Validated** end-to-end on two real flight controllers; EEPROM persistence verified across power cycles.
+5. **ML Enhancement** — Pattern recognition and anomaly detection. **Not started**; deferred until labelled dataset exists.
+6. **Community Features** — Tune marketplace and sharing. **Not started.**
 
 For the prioritised cleanup roadmap see `docs/PROJECT_ASSESSMENT.md`.
 

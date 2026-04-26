@@ -6,19 +6,19 @@ use std::fs;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_file = "/home/flo/workspace/personal/drone-tuner/btfl_010.bbl";
 
-    println!("🔧 Configuration Inspection Tool");
+    println!("Configuration Inspection Tool");
     println!("=================================");
 
     let data = fs::read(sample_file)?;
-    println!("✅ Loaded file: {:.2} MB", data.len() as f64 / 1_000_000.0);
+    println!("Loaded file: {:.2} MB", data.len() as f64 / 1_000_000.0);
 
     let mut parser = BlackboxParser::new();
     let session = parser.parse_file(&data)?;
 
-    println!("\n🎛️ Hardware Configuration:");
+    println!("\nHardware Configuration:");
 
     // Flight Controller Info
-    println!("📡 Flight Controller:");
+    println!("Flight Controller:");
     println!(
         "   - Firmware: {}",
         session.metadata.hardware.flight_controller.firmware
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // PID Configuration
-    println!("\n🎯 PID Configuration:");
+    println!("\nPID Configuration:");
     println!(
         "   Roll  PID: P={:.1}, I={:.1}, D={:.1}",
         session.metadata.hardware.pid_config.roll.p,
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Show RC rates from PID settings
-    println!("\n🎮 RC Configuration:");
+    println!("\nRC Configuration:");
     println!(
         "   RC Rates: [{:.1}, {:.1}, {:.1}]",
         session
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Filter Configuration
-    println!("\n🔧 Filter Configuration:");
+    println!("\nFilter Configuration:");
     println!(
         "   Gyro filters: {} configured",
         session.metadata.hardware.filter_config.gyro_filters.len()
@@ -103,6 +103,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("\n✅ Configuration inspection complete!");
+    println!("\nConfiguration inspection complete!");
     Ok(())
 }

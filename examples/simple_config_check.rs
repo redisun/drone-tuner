@@ -6,16 +6,16 @@ use std::fs;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_file = "/home/flo/workspace/personal/drone-tuner/btfl_010.bbl";
 
-    println!("🔧 Simple Configuration Check");
+    println!("Simple Configuration Check");
     println!("=============================");
 
     let data = fs::read(sample_file)?;
-    println!("✅ Loaded file: {:.2} MB", data.len() as f64 / 1_000_000.0);
+    println!("Loaded file: {:.2} MB", data.len() as f64 / 1_000_000.0);
 
     let mut parser = BlackboxParser::new();
     let session = parser.parse_file(&data)?;
 
-    println!("\n📡 Flight Controller:");
+    println!("\nFlight Controller:");
     println!(
         "   - Firmware: {}",
         session.metadata.hardware.flight_controller.firmware
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         session.metadata.hardware.flight_controller.loop_rate
     );
 
-    println!("\n🎯 PID Values:");
+    println!("\nPID Values:");
     println!(
         "   Roll  PID: P={:.1}, I={:.1}, D={:.1}",
         session.metadata.hardware.pid_config.roll.p,
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         session.metadata.hardware.pid_config.yaw.d
     );
 
-    println!("\n🔧 Filter Info:");
+    println!("\nFilter Info:");
     println!(
         "   Gyro filters: {} configured",
         session.metadata.hardware.filter_config.gyro_filters.len()
@@ -82,11 +82,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .contains("Unknown");
 
     if has_real_config {
-        println!("\n✅ Configuration extracted successfully from blackbox headers!");
+        println!("\nConfiguration extracted successfully from blackbox headers!");
     } else {
         println!("\n❌ Still using default configuration - header extraction may not be working");
     }
 
-    println!("\n✅ Configuration check complete!");
+    println!("\nConfiguration check complete!");
     Ok(())
 }

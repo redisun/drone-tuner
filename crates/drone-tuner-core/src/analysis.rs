@@ -1125,7 +1125,7 @@ mod basic_tests {
             "Should not use hardcoded 50.0 value"
         );
 
-        println!("✅ PID recommendations now use actual values:");
+        println!("PID recommendations now use actual values:");
         for rec in &recommendations {
             println!(
                 "  {:?} {}: {:.1} → {:.1}",

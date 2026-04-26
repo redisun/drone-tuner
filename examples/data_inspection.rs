@@ -6,16 +6,16 @@ use std::fs;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_file = "/home/flo/workspace/personal/drone-tuner/btfl_010.bbl";
 
-    println!("🔍 Data Inspection Tool");
+    println!("Data Inspection Tool");
     println!("======================");
 
     let data = fs::read(sample_file)?;
-    println!("✅ Loaded file: {:.2} MB", data.len() as f64 / 1_000_000.0);
+    println!("Loaded file: {:.2} MB", data.len() as f64 / 1_000_000.0);
 
     let mut parser = BlackboxParser::new();
     let session = parser.parse_file(&data)?;
 
-    println!("\n📊 Sample Data Values:");
+    println!("\nSample Data Values:");
 
     // Check first 10 gyro samples
     println!("🌀 First 10 Gyro samples (rad/s):");
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Check accelerometer values
-    println!("\n📈 First 10 Accelerometer samples (m/s²):");
+    println!("\nFirst 10 Accelerometer samples (m/s²):");
     for i in 0..10.min(session.telemetry.accel.len()) {
         if let Some(accel) = session.telemetry.accel.get(i) {
             let magnitude = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Check RC commands
-    println!("\n🎮 RC Command availability:");
+    println!("\nRC Command availability:");
     println!(
         "  Roll: {} samples",
         session.telemetry.rc_commands.roll.len()
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if !session.telemetry.rc_commands.roll.is_empty() {
-        println!("\n🎮 First 10 RC Command samples:");
+        println!("\nFirst 10 RC Command samples:");
         for i in 0..10.min(session.telemetry.rc_commands.roll.len()) {
             println!(
                 "  {}: roll={:.0}, pitch={:.0}, yaw={:.0}, throttle={:.0}",
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Statistical analysis
-    println!("\n📈 Data Statistics:");
+    println!("\nData Statistics:");
 
     if !session.telemetry.gyro.is_empty() {
         let gyro_x_values = &session.telemetry.gyro.x;
@@ -106,6 +106,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("\n✅ Data inspection complete!");
+    println!("\nData inspection complete!");
     Ok(())
 }

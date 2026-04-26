@@ -25,5 +25,17 @@ test_data/*
 !test_data/btfl_all_old.bbl
 !test_data/jeno_after.bbl
 !test_data/tbs_after.bbl
-docs
+
+# Track only the docs referenced from README / CLAUDE.md. Working notes,
+# old auto-generated reports, and upstream parser refs stay local.
+docs/*
+!docs/PROJECT_ASSESSMENT.md
+!docs/prd.md
+!docs/technical-development-document.md
+
+# Local Claude Code state (per-machine settings, transcripts).
 .claude
+
+# Artifacts the `tune` flow drops in the working dir.
+tune-backup-*.json
+drone-tuner-pull-*.bbl

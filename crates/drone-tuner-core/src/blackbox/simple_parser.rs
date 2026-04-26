@@ -1721,7 +1721,7 @@ impl SimpleBlackboxParser {
 
     /// Log detailed session breakdown for --list-sessions
     fn log_session_breakdown(&self, sessions: &[SessionInfo]) {
-        info!("📁 Sessions in blackbox file:");
+        info!("Sessions in blackbox file:");
 
         let mut _total_frames = 0u64;
         let mut total_duration = 0.0f32;
