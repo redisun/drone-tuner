@@ -63,13 +63,14 @@ jobs:
           else
             cargo build --workspace --all-targets --features ${{ matrix.features }}
           fi
-      # Core lib tests — the CLI integration suite uses dummy fixtures the
-      # parser rightly rejects and is currently red; gate it back on once
-      # the calibration suite lands.
+      # Core lib + calibration golden tests. The CLI integration suite
+      # uses dummy fixtures the parser rightly rejects and is currently
+      # red; gate it back on once those fixtures are real.
       - name: Test
         run: |
           if [ "${{ matrix.features }}" = "default" ]; then
             cargo test -p drone-tuner-core --lib
+            cargo test -p drone-tuner-core --test calibration
           else
             cargo test -p drone-tuner-core --lib --features ${{ matrix.features }}
           fi

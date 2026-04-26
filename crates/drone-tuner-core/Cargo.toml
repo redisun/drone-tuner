@@ -33,6 +33,7 @@ realtime = ["tokio", "serialport"]
 proptest = { workspace = true }
 criterion = { workspace = true }
 tokio-test = "0.4"
+insta = { workspace = true }
 
 [[bench]]
 name = "fft_analysis"

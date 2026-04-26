@@ -1,0 +1,27 @@
+---
+source: crates/drone-tuner-core/tests/calibration.rs
+assertion_line: 176
+expression: "ReportSummary::from_report(&report)"
+---
+{
+  "issues_by_severity": {
+    "critical": 4,
+    "high": 8,
+    "low": 11,
+    "medium": 11
+  },
+  "issues_by_type": {
+    "mechanical_resonance": 23,
+    "p_term_oscillation": 11
+  },
+  "filter_recommendations_by_type": {
+    "adjust_dynamic_notch": 23
+  },
+  "pid_recommendations_by_axis_term": {
+    "pitch_i": 1,
+    "roll_i": 1,
+    "roll_p": 1,
+    "yaw_i": 1
+  },
+  "tune_quality_bucket": "very_poor"
+}
