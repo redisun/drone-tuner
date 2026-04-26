@@ -1258,6 +1258,100 @@ mod concurrent_execution_tests {
     }
 }
 
+/// End-to-end tests against the in-process MSP simulator. Built only when
+/// the CLI is compiled with `--features test-support`.
+#[cfg(feature = "test-support")]
+mod simulator_tests {
+    use super::*;
+
+    /// `tune --connection simulator:// --dry-run --auto-apply-safe` should
+    /// connect to the in-process simulator, read its PID values, print a
+    /// diff, and exit cleanly without writing.
+    #[test]
+    fn test_tune_simulator_dry_run_diff() {
+        let blackbox_file = test_blackbox_file();
+        if !blackbox_file.exists() {
+            return;
+        }
+        cli_cmd()
+            .arg("tune")
+            .arg(&blackbox_file)
+            .arg("--connection")
+            .arg("simulator://")
+            .arg("--dry-run")
+            .arg("--auto-apply-safe")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Connected"))
+            .stdout(predicate::str::contains("Dry run complete"));
+    }
+
+    /// `tune --connection simulator:// --apply-all` should apply every
+    /// recommendation and report success without --save-eeprom (RAM only).
+    #[test]
+    fn test_tune_simulator_apply_all_ram_only() {
+        let blackbox_file = test_blackbox_file();
+        if !blackbox_file.exists() {
+            return;
+        }
+        cli_cmd()
+            .arg("tune")
+            .arg(&blackbox_file)
+            .arg("--connection")
+            .arg("simulator://")
+            .arg("--apply-all")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Connected"))
+            .stdout(
+                predicate::str::contains("Write succeeded")
+                    .or(predicate::str::contains("No PID recommendations matched")),
+            )
+            .stdout(predicate::str::contains("RAM-only"));
+    }
+
+    /// `tune --connection simulator:// --apply-all --save-eeprom` should
+    /// also persist via EEPROM_WRITE.
+    #[test]
+    fn test_tune_simulator_apply_all_with_eeprom() {
+        let blackbox_file = test_blackbox_file();
+        if !blackbox_file.exists() {
+            return;
+        }
+        cli_cmd()
+            .arg("tune")
+            .arg(&blackbox_file)
+            .arg("--connection")
+            .arg("simulator://")
+            .arg("--apply-all")
+            .arg("--save-eeprom")
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("Changes persisted")
+                    .or(predicate::str::contains("No PID recommendations matched")),
+            );
+    }
+
+    /// Without --auto-apply-safe or --apply-all, the writeback step should
+    /// be a no-op even when --connection is given.
+    #[test]
+    fn test_tune_simulator_skip_without_opt_in() {
+        let blackbox_file = test_blackbox_file();
+        if !blackbox_file.exists() {
+            return;
+        }
+        cli_cmd()
+            .arg("tune")
+            .arg(&blackbox_file)
+            .arg("--connection")
+            .arg("simulator://")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("skipping writeback"));
+    }
+}
+
 mod feature_flag_tests {
     use super::*;
 

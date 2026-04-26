@@ -50,6 +50,7 @@ jobs:
           - default
           - experimental
           - realtime
+          - test-support
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,6 +71,10 @@ jobs:
             cargo test -p drone-tuner-core --lib
             cargo test -p drone-tuner-core --test calibration
             cargo test -p drone-tuner-cli --tests
+          elif [ "${{ matrix.features }}" = "test-support" ]; then
+            # End-to-end CLI tests against the in-process MSP simulator.
+            cargo test -p drone-tuner-core --lib --features test-support
+            cargo test -p drone-tuner-cli --tests --features test-support
           else
             cargo test -p drone-tuner-core --lib --features ${{ matrix.features }}
           fi

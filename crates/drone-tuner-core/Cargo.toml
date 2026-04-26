@@ -28,6 +28,9 @@ async-trait = { workspace = true }
 [features]
 default = []
 realtime = ["tokio", "serialport"]
+# Exposes MockTransport/MspSimulator publicly so CLI tests and demos
+# can drive the realtime path without serial hardware. Implies realtime.
+test-support = ["realtime"]
 
 [dev-dependencies]
 proptest = { workspace = true }

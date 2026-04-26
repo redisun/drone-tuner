@@ -930,31 +930,155 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         }
     }
 
-    // Decide whether/how to apply. --dry-run wins over everything else.
-    if args.dry_run {
-        println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
-    } else if let Some(connection) = &args.connection {
-        #[cfg(feature = "realtime")]
-        {
-            apply_pid_recommendations_via_fc(connection, &args, &analysis.report).await?;
+    // Decide whether/how to apply.
+    match (&args.connection, args.dry_run) {
+        (None, true) | (None, false) if args.dry_run => {
+            println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
         }
-
-        #[cfg(not(feature = "realtime"))]
-        {
-            let _ = connection;
+        (None, _) => {
             println!(
-                "{} Real-time tuning is not available in this build",
-                style("⚠").yellow()
+                "\n{} Specify --connection to apply changes to flight controller",
+                style("ℹ️").blue()
             );
-            println!("Rebuild with --features realtime to enable this feature");
         }
-    } else {
-        println!(
-            "\n{} Specify --connection to apply changes to flight controller",
-            style("ℹ️").blue()
-        );
+        (Some(connection), true) => {
+            // Dry-run + connection: actually open the FC, read current state,
+            // show what WOULD change, but don't write. Useful for verifying
+            // hardware connectivity before committing to a tune.
+            #[cfg(feature = "realtime")]
+            {
+                dry_connect_and_diff(connection, &args, &analysis.report).await?;
+            }
+            #[cfg(not(feature = "realtime"))]
+            {
+                let _ = connection;
+                println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
+                println!(
+                    "{} Real-time tuning is not available in this build",
+                    style("⚠").yellow()
+                );
+            }
+        }
+        (Some(connection), false) => {
+            #[cfg(feature = "realtime")]
+            {
+                apply_pid_recommendations_via_fc(connection, &args, &analysis.report).await?;
+            }
+            #[cfg(not(feature = "realtime"))]
+            {
+                let _ = connection;
+                println!(
+                    "{} Real-time tuning is not available in this build",
+                    style("⚠").yellow()
+                );
+                println!("Rebuild with --features realtime to enable this feature");
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Open an [`FlightControllerConnection`] from a connection string.
+///
+/// Supports the `simulator://` scheme when built with the `test-support`
+/// feature, which spawns an in-process [`MspSimulator`] so the rest of the
+/// realtime path can be exercised without serial hardware.
+#[cfg(feature = "realtime")]
+async fn open_fc_connection(
+    connection: &str,
+) -> Result<drone_tuner_core::realtime::FlightControllerConnection> {
+    use drone_tuner_core::realtime::FlightControllerConnection;
+
+    if connection == "simulator://" {
+        #[cfg(feature = "test-support")]
+        {
+            use drone_tuner_core::realtime::{MockTransport, MspSimulator};
+            let (client, server) = MockTransport::pair();
+            let sim = MspSimulator::new(Box::new(server));
+            tokio::spawn(async move {
+                let _ = sim.run().await;
+            });
+            FlightControllerConnection::from_transport(Box::new(client))
+                .await
+                .context("Failed to connect to in-process MSP simulator")
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            Err(anyhow::anyhow!(
+                "simulator:// requires the `test-support` Cargo feature. \
+                 Rebuild with --features test-support to use it."
+            ))
+        }
+    } else {
+        FlightControllerConnection::connect(connection)
+            .await
+            .context("Failed to connect to flight controller")
+    }
+}
+
+/// Open the FC, read current PID, show what would change without writing.
+/// Lets users verify their hardware connection works before committing
+/// to a real tune.
+#[cfg(feature = "realtime")]
+async fn dry_connect_and_diff(
+    connection: &str,
+    args: &TuneArgs,
+    report: &drone_tuner_core::domain::AnalysisReport,
+) -> Result<()> {
+    println!(
+        "\n{} Dry run — connecting to {} to read current PID values (no writes)...",
+        style("🔗").yellow(),
+        connection
+    );
+    let mut fc = open_fc_connection(connection).await?;
+    println!("{} Connected", style("✓").green());
+
+    let current = fc
+        .read_pid()
+        .await
+        .context("Failed to read current PID values from FC")?;
+    let mut proposed = current.clone();
+    let count = apply_pid_recs_to_snapshot(&mut proposed, &report.pid_recommendations, args);
+
+    if count == 0 {
+        println!(
+            "\n{} No PID changes would be applied (need --auto-apply-safe or --apply-all to opt in).",
+            style("ℹ️").blue()
+        );
+    } else {
+        println!(
+            "\n{} {} PID change(s) WOULD be applied:",
+            style("📝").yellow(),
+            count
+        );
+        if current.roll() != proposed.roll() {
+            println!(
+                "    Roll  P/I/D: {:?} → {:?}",
+                current.roll(),
+                proposed.roll()
+            );
+        }
+        if current.pitch() != proposed.pitch() {
+            println!(
+                "    Pitch P/I/D: {:?} → {:?}",
+                current.pitch(),
+                proposed.pitch()
+            );
+        }
+        if current.yaw() != proposed.yaw() {
+            println!(
+                "    Yaw   P/I/D: {:?} → {:?}",
+                current.yaw(),
+                proposed.yaw()
+            );
+        }
+    }
+
+    println!(
+        "\n{} Dry run complete — drop --dry-run to actually apply.",
+        style("ℹ️").blue()
+    );
     Ok(())
 }
 
@@ -978,8 +1102,6 @@ async fn apply_pid_recommendations_via_fc(
     args: &TuneArgs,
     report: &drone_tuner_core::domain::AnalysisReport,
 ) -> Result<()> {
-    use drone_tuner_core::realtime::FlightControllerConnection;
-
     if !args.auto_apply_safe && !args.apply_all {
         println!(
             "\n{} No --auto-apply-safe or --apply-all flag — skipping writeback. \
@@ -994,9 +1116,7 @@ async fn apply_pid_recommendations_via_fc(
         style("🔗").blue()
     );
 
-    let mut fc = FlightControllerConnection::connect(connection)
-        .await
-        .context("Failed to connect to flight controller")?;
+    let mut fc = open_fc_connection(connection).await?;
     println!("{} Connected", style("✓").green());
 
     // Read current PID and decide what to write.

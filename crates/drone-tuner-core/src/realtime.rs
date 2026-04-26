@@ -844,7 +844,7 @@ impl MspProtocol {
 
     /// Create an MSP response message (direction = `>`). Used by the
     /// in-process MSP simulator to reply to client requests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn create_response(&self, command: MspCommand, payload: &[u8]) -> Result<Vec<u8>> {
         self.build_framed(MspMessageType::Response, command, payload)
     }
@@ -901,7 +901,7 @@ impl MspProtocol {
 
     /// Parse an MSP request (direction = `<`). Used by the in-process MSP
     /// simulator to consume client requests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn parse_request(&self, data: &[u8]) -> Result<MspResponse> {
         self.parse_framed(MspMessageType::Request, data)
     }
@@ -1023,19 +1023,19 @@ impl Transport for UsbSerialTransport {
 
 /// Mock transport for in-process testing. Pairs with a sibling so anything
 /// one writes the other reads.
-#[cfg(test)]
-pub(crate) struct MockTransport {
+#[cfg(any(test, feature = "test-support"))]
+pub struct MockTransport {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     tx: mpsc::UnboundedSender<Vec<u8>>,
     pending: Vec<u8>,
     description: String,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl MockTransport {
     /// Build a connected pair: bytes written to `(.0)` arrive at `(.1).read()`,
     /// and vice versa.
-    pub(crate) fn pair() -> (Self, Self) {
+    pub fn pair() -> (Self, Self) {
         let (tx_a, rx_a) = mpsc::unbounded_channel();
         let (tx_b, rx_b) = mpsc::unbounded_channel();
         (
@@ -1055,7 +1055,7 @@ impl MockTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 impl Transport for MockTransport {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -1093,19 +1093,19 @@ impl Transport for MockTransport {
 
 /// Shared simulator state — kept behind an Arc<Mutex<_>> so tests can peek
 /// at it concurrently with the simulator task.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
-pub(crate) struct SimulatorState {
+pub struct SimulatorState {
     /// Current 30-byte MSP_PID payload. Updated on SetPid; returned on Pid.
-    pub(crate) pid: [u8; 30],
+    pub pid: [u8; 30],
     /// Whether the simulator should fail the next SetPid (used to drive the
     /// rollback test path). Cleared after one trigger.
-    pub(crate) fail_next_setpid: bool,
+    pub fail_next_setpid: bool,
     /// How many times EepromWrite has been received.
-    pub(crate) eeprom_writes: usize,
+    pub eeprom_writes: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl SimulatorState {
     fn default_pid() -> [u8; 30] {
         // Plausible Betaflight defaults for ROLL/PITCH/YAW; rest 0.
@@ -1117,7 +1117,7 @@ impl SimulatorState {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Default for SimulatorState {
     fn default() -> Self {
         Self {
@@ -1130,22 +1130,26 @@ impl Default for SimulatorState {
 
 /// Configurable Betaflight FC simulator. Spawn with [`MspSimulator::run`]
 /// to service requests on the server end of a [`MockTransport`] pair.
-#[cfg(test)]
-pub(crate) struct MspSimulator {
+#[cfg(any(test, feature = "test-support"))]
+pub struct MspSimulator {
     transport: Box<dyn Transport + Send>,
     /// 3-byte API version (major, minor, patch).
-    pub(crate) api_version: [u8; 3],
+    pub api_version: [u8; 3],
     /// Firmware variant string ("BTFL", "INAV", ...).
-    pub(crate) firmware_id: String,
+    pub firmware_id: String,
     /// 3-byte firmware version (major, minor, patch).
-    pub(crate) firmware_version: [u8; 3],
-    /// Mutable state shared with the test for assertions / fault injection.
-    pub(crate) state: std::sync::Arc<std::sync::Mutex<SimulatorState>>,
+    pub firmware_version: [u8; 3],
+    /// Mutable state shared with consumers for assertions / fault injection.
+    pub state: std::sync::Arc<std::sync::Mutex<SimulatorState>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl MspSimulator {
-    pub(crate) fn new(transport: Box<dyn Transport + Send>) -> Self {
+    /// Construct a simulator bound to the given transport.
+    ///
+    /// Default FC fingerprint is Betaflight 4.5.1 on API 1.46.0; mutate the
+    /// public fields after construction if you want different values.
+    pub fn new(transport: Box<dyn Transport + Send>) -> Self {
         Self {
             transport,
             api_version: [1, 46, 0],
@@ -1157,7 +1161,7 @@ impl MspSimulator {
 
     /// Service requests until the transport closes. Intended to be spawned
     /// in a `tokio::task`.
-    pub(crate) async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         let msp = MspProtocol::new();
         let mut buf = vec![0u8; 1024];
         loop {
