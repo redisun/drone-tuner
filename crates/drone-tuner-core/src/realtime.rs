@@ -1179,11 +1179,29 @@ impl FlightControllerConnection {
         &mut self,
         mut progress: F,
     ) -> Result<Vec<u8>> {
-        // Default to 4 KB chunks via V2 framing — ~32× fewer roundtrips
-        // than the V1 legacy 128-byte default, which is the difference
-        // between a few-KB/s and ~100 KB/s pull on real hardware.
-        const PREFERRED_CHUNK_SIZE: u16 = 4096;
+        self.pull_dataflash_with(progress_to_callback(&mut progress), 1024)
+            .await
+    }
 
+    /// Like [`Self::pull_dataflash`] but with an explicit chunk size hint.
+    ///
+    /// `chunk_size` is the V2 chunk size we ask Betaflight for. Default
+    /// (1024) is conservative: experimentally, 4 KB chunks worked on the
+    /// first request but caused the FC to stall on subsequent ones on
+    /// some Betaflight 4.5 builds, presumably because the USB CDC TX
+    /// buffer hadn't drained before the next request landed. 1024 is
+    /// still ~8× faster than V1's 128-byte legacy default and stays well
+    /// within the FC's tx buffer.
+    ///
+    /// Mid-stream V1 fallback: if any V2 chunk request fails during the
+    /// pull loop (not just the probe), we switch to V1 for the remainder
+    /// rather than aborting. The user gets their data even if V2 is
+    /// flaky on their firmware build.
+    pub async fn pull_dataflash_with<F: FnMut(u64, u64)>(
+        &mut self,
+        mut progress: F,
+        chunk_size: u16,
+    ) -> Result<Vec<u8>> {
         let summary = self.read_dataflash_summary().await?;
         if !summary.supported {
             return Err(DronetunerError::communication_error(
@@ -1200,13 +1218,11 @@ impl FlightControllerConnection {
         let mut buf = Vec::with_capacity(total as usize);
         progress(0, total);
 
-        // Probe V2 with the first chunk. If V2 fails (older firmware that
-        // doesn't speak it for cmd 71), fall back to V1's slower legacy
-        // chunks rather than aborting the whole pull.
+        // Probe V2 with the first chunk. If V2 fails on probe (older
+        // firmware that doesn't speak it for cmd 71), fall straight to
+        // V1's slower legacy chunks rather than aborting.
         let mut use_v2 = true;
-        let first = self
-            .read_dataflash_chunk_v2(0, PREFERRED_CHUNK_SIZE)
-            .await;
+        let first = self.read_dataflash_chunk_v2(0, chunk_size).await;
         let (echoed, chunk) = match first {
             Ok(ok) => ok,
             Err(_) => {
@@ -1226,17 +1242,33 @@ impl FlightControllerConnection {
         buf.extend_from_slice(&chunk);
         progress(buf.len() as u64, total);
 
-        // Iteration cap: even at 128-byte chunks (worst case), a 32 MB chip
-        // is ~262k roundtrips. 400k gives generous margin against runaways.
+        // Iteration cap: even at 128-byte chunks, a 32 MB chip is ~262k
+        // roundtrips. 400k gives generous margin against runaways.
         for _ in 0..400_000 {
             if (offset as u64) >= total {
                 break;
             }
-            let (echoed, chunk) = if use_v2 {
-                self.read_dataflash_chunk_v2(offset, PREFERRED_CHUNK_SIZE)
-                    .await?
+            let chunk_result = if use_v2 {
+                self.read_dataflash_chunk_v2(offset, chunk_size).await
             } else {
-                self.read_dataflash_chunk(offset).await?
+                self.read_dataflash_chunk(offset).await
+            };
+            let (echoed, chunk) = match chunk_result {
+                Ok(ok) => ok,
+                Err(e) if use_v2 => {
+                    // Mid-stream V2 failure. Some Betaflight builds
+                    // happily return the first 4 KB chunk over V2 then
+                    // stall on the second; rather than bail, drop to V1
+                    // for the rest of the pull starting from the failing
+                    // offset. The user gets their bytes, just slower.
+                    tracing::warn!(
+                        "MSP V2 dataflash read failed at offset {offset}: {e}. \
+                         Falling back to V1 framing for the remaining bytes."
+                    );
+                    use_v2 = false;
+                    self.read_dataflash_chunk(offset).await?
+                }
+                Err(e) => return Err(e),
             };
             if echoed != offset {
                 return Err(DronetunerError::communication_error(format!(
@@ -1253,6 +1285,14 @@ impl FlightControllerConnection {
         }
         Ok(buf)
     }
+}
+
+/// Helper to turn a `&mut F` progress callback into an owned closure for
+/// the underlying `pull_dataflash_with` call. Just makes the wrapper at
+/// the top of the file a one-liner instead of duplicating the closure
+/// body.
+fn progress_to_callback<F: FnMut(u64, u64)>(f: &mut F) -> impl FnMut(u64, u64) + '_ {
+    move |done, total| f(done, total)
 }
 
 /// Onboard-dataflash summary (MSP_DATAFLASH_SUMMARY / 70).
