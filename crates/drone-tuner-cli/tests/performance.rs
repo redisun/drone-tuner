@@ -221,7 +221,7 @@ mod memory_tests {
             run_with_timeout(cmd, 120)
         }
         .success()
-        .stdout(predicate::str::contains("Found 50 blackbox file(s)"));
+        .stderr(predicate::str::contains("Found 50 blackbox file(s)"));
     }
 
     #[test]
@@ -327,7 +327,7 @@ mod stress_tests {
                 .arg(max_files.to_string())
                 .assert()
                 .success()
-                .stdout(predicate::str::contains(format!(
+                .stderr(predicate::str::contains(format!(
                     "Found {} blackbox file(s)",
                     max_files.min(100)
                 )));
@@ -372,14 +372,18 @@ mod stress_tests {
             fs::write(&small_file, common::create_minimal_blackbox_data()).unwrap();
         }
 
-        // Should handle many small files efficiently
+        // Should handle many small files efficiently. Pass --max-files
+        // explicitly so we exercise the full 200, not the default 100 cap.
         {
             let mut cmd = create_test_command();
-            cmd.arg("analyze").arg(&small_files_dir);
+            cmd.arg("analyze")
+                .arg(&small_files_dir)
+                .arg("--max-files")
+                .arg("200");
             run_with_timeout(cmd, 120)
         }
         .success()
-        .stdout(predicate::str::contains("Found 200 blackbox file(s)"));
+        .stderr(predicate::str::contains("Found 200 blackbox file(s)"));
     }
 
     #[test]
@@ -403,7 +407,7 @@ mod stress_tests {
             run_with_timeout(cmd, 120)
         }
         .success()
-        .stdout(predicate::str::contains("Found 5 blackbox file(s)"));
+        .stderr(predicate::str::contains("Found 5 blackbox file(s)"));
     }
 
     #[test]
@@ -415,7 +419,7 @@ mod stress_tests {
 
         for format in &formats {
             create_test_command()
-                .arg("--output")
+                .arg("--output-format")
                 .arg(format)
                 .arg("analyze")
                 .arg(&test_files.oscillating_file)

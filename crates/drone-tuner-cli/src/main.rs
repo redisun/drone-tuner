@@ -42,6 +42,30 @@ struct Cli {
     command: Commands,
 }
 
+/// Parse a unit-interval float (`0.0..=1.0`) from the CLI; rejects out-of-
+/// range values with a clap-style error message.
+fn parse_unit_interval(s: &str) -> std::result::Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("must be between 0.0 and 1.0, got {v}"))
+    }
+}
+
+/// Parse a 1-based session index. Zero is rejected so `--session 0` is a
+/// clean error rather than silently behaving like the default.
+fn parse_one_based_index(s: &str) -> std::result::Result<usize, String> {
+    let v: usize = s
+        .parse()
+        .map_err(|e| format!("not a positive integer: {e}"))?;
+    if v == 0 {
+        Err("session index must be 1 or greater".to_string())
+    } else {
+        Ok(v)
+    }
+}
+
 /// Available output formats
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum OutputFormat {
@@ -93,8 +117,8 @@ struct AnalyzeArgs {
     #[arg(long)]
     show_details: bool,
 
-    /// Minimum confidence threshold for recommendations
-    #[arg(long, default_value = "0.7")]
+    /// Minimum confidence threshold for recommendations (0.0..=1.0)
+    #[arg(long, default_value = "0.7", value_parser = parse_unit_interval)]
     min_confidence: f32,
 
     /// Maximum number of files to process in batch
@@ -102,7 +126,7 @@ struct AnalyzeArgs {
     max_files: usize,
 
     /// Select specific session to analyze (1-based index, default: last session)
-    #[arg(long, short)]
+    #[arg(long, short, value_parser = parse_one_based_index)]
     session: Option<usize>,
 
     /// List all sessions in the blackbox file without analyzing
@@ -268,11 +292,13 @@ async fn analyze_command(
     let files = find_blackbox_files(&args.input, args.max_files)?;
 
     if files.is_empty() {
-        println!("{}", style("No blackbox files found").red());
+        eprintln!("{}", style("No blackbox files found").red());
         return Ok(());
     }
 
-    println!(
+    // Status messages go to stderr so machine-readable output formats
+    // (CSV, JSON) keep stdout clean and parseable.
+    eprintln!(
         "{} Found {} blackbox file(s) to analyze",
         style("✓").green(),
         files.len()
@@ -328,15 +354,17 @@ async fn analyze_command(
     )
     .await?;
 
-    // Print summary
-    let successful = results.iter().filter(|(_, result)| result.is_ok()).count();
-    let failed = results.len() - successful;
+    // Print summary — only in pretty mode so CSV/JSON stdout stays clean.
+    if matches!(output_format, OutputFormat::Pretty) {
+        let successful = results.iter().filter(|(_, result)| result.is_ok()).count();
+        let failed = results.len() - successful;
 
-    println!();
-    println!("{} Analysis Summary", style("📊").blue());
-    println!("  Successful: {}", style(successful).green());
-    if failed > 0 {
-        println!("  Failed: {}", style(failed).red());
+        println!();
+        println!("{} Analysis Summary", style("📊").blue());
+        println!("  Successful: {}", style(successful).green());
+        if failed > 0 {
+            println!("  Failed: {}", style(failed).red());
+        }
     }
 
     Ok(())
@@ -456,6 +484,13 @@ fn find_blackbox_files(input_path: &PathBuf, max_files: usize) -> Result<Vec<Pat
                 }
             }
         }
+    } else {
+        // Path doesn't exist (or is e.g. a broken symlink). An empty
+        // directory is a non-error case; a missing path is not.
+        return Err(anyhow::anyhow!(
+            "Failed to read file: {} does not exist",
+            input_path.display()
+        ));
     }
 
     Ok(files)
@@ -463,7 +498,9 @@ fn find_blackbox_files(input_path: &PathBuf, max_files: usize) -> Result<Vec<Pat
 
 /// Handle the compare command
 async fn compare_command(args: CompareArgs, output_format: OutputFormat) -> Result<()> {
-    println!(
+    // Status messages go to stderr so machine-readable output formats
+    // (CSV, JSON) keep stdout clean and parseable.
+    eprintln!(
         "{} Comparing {} flights",
         style("🔍").blue(),
         args.files.len()
@@ -494,7 +531,7 @@ async fn compare_command(args: CompareArgs, output_format: OutputFormat) -> Resu
         {
             Ok(result) => results.push(result),
             Err(e) => {
-                println!(
+                eprintln!(
                     "{} Failed to analyze {}: {}",
                     style("✗").red(),
                     file.display(),
@@ -506,7 +543,7 @@ async fn compare_command(args: CompareArgs, output_format: OutputFormat) -> Resu
     }
 
     if results.len() < 2 {
-        println!(
+        eprintln!(
             "{} Need at least 2 successfully analyzed flights to compare",
             style("!").yellow()
         );
@@ -1556,7 +1593,15 @@ fn print_comparison_pretty(comparison: &FlightComparison) {
 
 /// Print comparison as JSON
 fn print_comparison_json(comparison: &FlightComparison) -> Result<()> {
-    let json = serde_json::to_string_pretty(comparison)
+    // Wrap with the same envelope as `analyze --output-format json` so
+    // downstream consumers can rely on a consistent top-level shape.
+    let envelope = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "timestamp": chrono::Utc::now(),
+        "flights": &comparison.flights,
+        "summary": &comparison.summary,
+    });
+    let json = serde_json::to_string_pretty(&envelope)
         .context("Failed to serialize comparison to JSON")?;
     println!("{}", json);
     Ok(())

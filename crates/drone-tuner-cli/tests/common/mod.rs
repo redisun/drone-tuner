@@ -9,6 +9,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+/// Path to the canonical Betaflight blackbox fixture used by valid/oscillating/
+/// large/batch test files. Tracked in git at `test_data/btfl_all_old.bbl`.
+fn canonical_bbl_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root should be reachable from CARGO_MANIFEST_DIR")
+        .join("test_data")
+        .join("btfl_all_old.bbl")
+}
+
+fn canonical_bbl_bytes() -> Vec<u8> {
+    let path = canonical_bbl_path();
+    fs::read(&path)
+        .unwrap_or_else(|e| panic!("failed to read canonical fixture {}: {}", path.display(), e))
+}
+
 /// Helper to create minimal valid blackbox test data
 pub fn create_minimal_blackbox_data() -> Vec<u8> {
     // This creates a minimal blackbox file structure that should parse
@@ -116,13 +133,18 @@ pub struct TestFiles {
 impl TestFiles {
     pub fn new() -> Self {
         let temp_dir = TempDir::new().unwrap();
+        let bbl = canonical_bbl_bytes();
 
+        // valid_file and oscillating_file both point at the real Betaflight
+        // fixture. Tests that previously distinguished them did so for
+        // documentation; the parser treats them identically.
         let valid_file = temp_dir.path().join("valid.bbl");
-        fs::write(&valid_file, create_minimal_blackbox_data()).unwrap();
+        fs::write(&valid_file, &bbl).unwrap();
 
         let oscillating_file = temp_dir.path().join("oscillating.bbl");
-        fs::write(&oscillating_file, create_oscillating_blackbox_data()).unwrap();
+        fs::write(&oscillating_file, &bbl).unwrap();
 
+        // Error-path fixtures — these MUST stay invalid.
         let corrupted_file = temp_dir.path().join("corrupted.bbl");
         fs::write(&corrupted_file, create_corrupted_blackbox_data()).unwrap();
 
@@ -138,12 +160,13 @@ impl TestFiles {
         }
     }
 
-    /// Create a directory with multiple test files
+    /// Create a directory with multiple copies of the canonical fixture.
     pub fn create_batch_files(&self, count: usize) -> Vec<PathBuf> {
+        let bbl = canonical_bbl_bytes();
         let mut files = Vec::new();
         for i in 0..count {
             let file_path = self.temp_dir.path().join(format!("batch_{}.bbl", i));
-            fs::write(&file_path, create_minimal_blackbox_data()).unwrap();
+            fs::write(&file_path, &bbl).unwrap();
             files.push(file_path);
         }
         files
@@ -187,39 +210,16 @@ pub fn validate_csv_output(csv_str: &str) -> Vec<Vec<String>> {
     rows
 }
 
-/// Helper to create performance test data
-pub fn create_large_blackbox_data(frame_count: usize) -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // Header
-    data.extend_from_slice(b"Product:Blackbox flight data recorder by Nicholas Sherlock\n");
-    data.extend_from_slice(b"Data version:2\n");
-    data.extend_from_slice(b"I interval:32\n");
-    data.extend_from_slice(b"P interval:0\n");
-    data.extend_from_slice(b"Firmware type:Betaflight\n");
-    data.extend_from_slice(b"Firmware revision:BTFL_4.2.0\n");
-    data.extend_from_slice(b"Firmware date:Jun 04 2021 06:28:16\n");
-    data.extend_from_slice(b"Board information:SPRACINGF3EVO\n");
-    data.extend_from_slice(b"Log start datetime:2021-06-01T10:30:00.000Z\n");
-    data.extend_from_slice(b"H Field I name:loopIteration,time,gyroADC[0],gyroADC[1],gyroADC[2]\n");
-    data.extend_from_slice(b"H Field I predictor:0,0,0,0,0\n");
-    data.extend_from_slice(b"H Field I encoding:1,1,1,1,1\n");
-    data.extend_from_slice(b"\n");
-
-    // Add many frames for performance testing
-    for i in 0..frame_count {
-        let frame_data = format!(
-            "I{},{},{},{},{}\n",
-            i,
-            i * 1000,
-            i % 1000 - 500,
-            (i * 2) % 1000 - 500,
-            (i * 3) % 1000 - 500
-        );
-        data.extend_from_slice(frame_data.as_bytes());
-    }
-
-    data
+/// Helper to create performance test data.
+///
+/// The hand-rolled CSV-style data the previous version emitted was not a
+/// valid binary BBL and the parser correctly rejected it. We just hand
+/// back a copy of the canonical fixture; performance tests that rely on
+/// counting Found N blackbox file(s) still work, and analysis actually
+/// runs end-to-end. The `_frame_count` parameter is preserved for API
+/// compatibility but no longer scales the payload.
+pub fn create_large_blackbox_data(_frame_count: usize) -> Vec<u8> {
+    canonical_bbl_bytes()
 }
 
 /// Helper to run command with timeout

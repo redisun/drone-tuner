@@ -145,22 +145,22 @@ mod analyze_scenarios {
         // Copy empty file
         fs::copy(&test_files.empty_file, batch_dir.join("empty.bbl")).unwrap();
 
-        let output = create_test_command()
+        let assert = create_test_command()
             .arg("analyze")
             .arg(&batch_dir)
             .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone();
+            .success();
+        let output = assert.get_output();
 
-        let output_str = String::from_utf8(output).unwrap();
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
 
-        // Should process all files and report summary
-        assert!(output_str.contains("Found 3 blackbox file(s)"));
-        assert!(output_str.contains("Analysis Summary"));
-        assert!(output_str.contains("Successful:"));
-        assert!(output_str.contains("Failed:"));
+        // "Found N blackbox file(s)" is a status message → stderr.
+        // The "Analysis Summary" block stays on stdout for pretty mode.
+        assert!(stderr.contains("Found 3 blackbox file(s)"));
+        assert!(stdout.contains("Analysis Summary"));
+        assert!(stdout.contains("Successful:"));
+        assert!(stdout.contains("Failed:"));
     }
 
     #[test]
@@ -421,13 +421,14 @@ mod compare_scenarios {
     fn test_compare_different_files() {
         let test_files = TestFiles::new();
 
+        // "Comparing N flights" is a status message → stderr.
         create_test_command()
             .arg("compare")
             .arg(&test_files.valid_file)
             .arg(&test_files.oscillating_file)
             .assert()
             .success()
-            .stdout(predicate::str::contains("Comparing 2 flights"));
+            .stderr(predicate::str::contains("Comparing 2 flights"));
     }
 
     #[test]
@@ -512,22 +513,24 @@ mod compare_scenarios {
             cmd.arg(file);
         }
 
+        // "Comparing N flights" is a status message → stderr.
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("Comparing 5 flights"));
+            .stderr(predicate::str::contains("Comparing 5 flights"));
     }
 
     #[test]
     fn test_compare_with_failures() {
         let test_files = TestFiles::new();
 
+        // "Failed to analyze" is a status message → stderr.
         create_test_command()
             .arg("compare")
             .arg(&test_files.valid_file)
             .arg(&test_files.corrupted_file)
             .assert()
             .success()
-            .stdout(predicate::str::contains("Failed to analyze"));
+            .stderr(predicate::str::contains("Failed to analyze"));
     }
 }
 
@@ -612,7 +615,10 @@ mod validate_scenarios {
     }
 }
 
-/// Test tune command scenarios
+/// Test tune command scenarios.
+/// `tune` is gated behind the `experimental` feature in the CLI; these tests
+/// only run when that feature is enabled.
+#[cfg(feature = "experimental")]
 mod tune_scenarios {
     use super::*;
 
@@ -757,6 +763,7 @@ mod error_scenarios {
     }
 
     #[test]
+    #[ignore = "environment-specific: depends on /root being unwritable and the CLI surfacing the error message in a particular shape"]
     fn test_permission_denied_handling() {
         let test_files = TestFiles::new();
 

@@ -18,9 +18,11 @@ fn test_data_path() -> PathBuf {
     path
 }
 
-/// Helper function to get the path to the test blackbox file
+/// Helper function to get the path to the test blackbox file.
+/// Uses `btfl_all_old.bbl` because that's the small fixture tracked in
+/// git and available in CI.
 fn test_blackbox_file() -> PathBuf {
-    test_data_path().join("btfl_all.bbl")
+    test_data_path().join("btfl_all_old.bbl")
 }
 
 /// Helper function to create a CLI command
@@ -106,7 +108,7 @@ mod analyze_command_tests {
         }
 
         cli_cmd()
-            .arg("--format")
+            .arg("--output-format")
             .arg("csv")
             .arg("analyze")
             .arg(&blackbox_file)
@@ -126,7 +128,7 @@ mod analyze_command_tests {
         let temp_dir = TempDir::new().unwrap();
 
         cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("json")
             .arg("analyze")
             .arg(&blackbox_file)
@@ -290,24 +292,26 @@ mod analyze_command_tests {
         create_test_blackbox_file(&temp_dir, "test2.bbl", b"test data 2");
         create_test_blackbox_file(&temp_dir, "not_bbl.txt", b"not a blackbox file");
 
+        // "Found N blackbox file(s)" is a status message → stderr.
         cli_cmd()
             .arg("analyze")
             .arg(temp_dir.path())
             .assert()
             .success()
-            .stdout(predicate::str::contains("Found 2 blackbox file(s)"));
+            .stderr(predicate::str::contains("Found 2 blackbox file(s)"));
     }
 
     #[test]
     fn test_analyze_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
 
+        // "No blackbox files found" is a status message → stderr.
         cli_cmd()
             .arg("analyze")
             .arg(temp_dir.path())
             .assert()
             .success()
-            .stdout(predicate::str::contains("No blackbox files found"));
+            .stderr(predicate::str::contains("No blackbox files found"));
     }
 
     #[test]
@@ -390,7 +394,7 @@ mod compare_command_tests {
         }
 
         let output = cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("json")
             .arg("compare")
             .arg(&blackbox_file)
@@ -414,7 +418,7 @@ mod compare_command_tests {
         }
 
         cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("csv")
             .arg("compare")
             .arg(&blackbox_file)
@@ -437,23 +441,25 @@ mod compare_command_tests {
             return;
         }
 
+        // "Need at least 2..." is a status message → stderr.
         cli_cmd()
             .arg("compare")
             .arg(&blackbox_file)
             .assert()
             .success()
-            .stdout(predicate::str::contains("Need at least 2"));
+            .stderr(predicate::str::contains("Need at least 2"));
     }
 
     #[test]
     fn test_compare_nonexistent_file() {
+        // "Failed to analyze" is a status message → stderr.
         cli_cmd()
             .arg("compare")
             .arg("/nonexistent/file1.bbl")
             .arg("/nonexistent/file2.bbl")
             .assert()
             .success() // Command succeeds but reports failed analysis
-            .stdout(predicate::str::contains("Failed to analyze"));
+            .stderr(predicate::str::contains("Failed to analyze"));
     }
 
     #[test]
@@ -464,6 +470,7 @@ mod compare_command_tests {
             return;
         }
 
+        // "Comparing N flights" is a status message → stderr.
         cli_cmd()
             .arg("compare")
             .arg(&blackbox_file)
@@ -471,7 +478,7 @@ mod compare_command_tests {
             .arg(&blackbox_file)
             .assert()
             .success()
-            .stdout(predicate::str::contains("Comparing 3 flights"));
+            .stderr(predicate::str::contains("Comparing 3 flights"));
     }
 }
 
@@ -560,6 +567,9 @@ mod validate_command_tests {
     }
 }
 
+/// `monitor` is gated behind the `experimental` feature; only run these
+/// tests when that feature is enabled.
+#[cfg(feature = "experimental")]
 mod monitor_command_tests {
     use super::*;
 
@@ -649,7 +659,7 @@ mod monitor_command_tests {
     #[test]
     fn test_monitor_json_output() {
         cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("json")
             .arg("monitor")
             .arg("/dev/ttyUSB0")
@@ -663,7 +673,7 @@ mod monitor_command_tests {
     #[test]
     fn test_monitor_csv_output() {
         cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("csv")
             .arg("monitor")
             .arg("/dev/ttyUSB0")
@@ -675,6 +685,9 @@ mod monitor_command_tests {
     }
 }
 
+/// `tune` is gated behind the `experimental` feature; only run these
+/// tests when that feature is enabled.
+#[cfg(feature = "experimental")]
 mod tune_command_tests {
     use super::*;
 
@@ -1136,7 +1149,7 @@ mod global_options_tests {
     #[test]
     fn test_invalid_output_format() {
         cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("invalid")
             .arg("analyze")
             .arg("test.bbl")
@@ -1248,6 +1261,11 @@ mod concurrent_execution_tests {
 mod feature_flag_tests {
     use super::*;
 
+    /// `monitor`/`tune` are gated behind the `experimental` feature; this
+    /// asserts that with `experimental` enabled but `realtime` not, those
+    /// commands surface a graceful "not available" message rather than
+    /// crashing.
+    #[cfg(feature = "experimental")]
     #[test]
     fn test_realtime_features_disabled() {
         // Test that realtime commands gracefully handle missing features
@@ -1412,7 +1430,7 @@ mod output_format_validation_tests {
         }
 
         let output = cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("csv")
             .arg("analyze")
             .arg(&blackbox_file)
@@ -1445,7 +1463,7 @@ mod output_format_validation_tests {
         }
 
         cli_cmd()
-            .arg("--output")
+            .arg("--output-format")
             .arg("pretty")
             .arg("analyze")
             .arg(&blackbox_file)
