@@ -48,4 +48,10 @@ serde_json = { workspace = true }
 
 [features]
 default = []
-realtime = ["drone-tuner-core/realtime"]
+# Enables half-finished commands (tune, monitor). They compile and run but
+# parameter writeback is stubbed and behaviour is not stable. Off by default
+# so a `cargo install drone-tuner-cli` user only sees commands that work.
+experimental = []
+# Enables live FC connectivity in core; implies experimental because the
+# only commands that use it (monitor, tune) are themselves experimental.
+realtime = ["drone-tuner-core/realtime", "experimental"]

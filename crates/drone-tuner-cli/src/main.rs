@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use console::{style, Term};
-use drone_tuner_core::domain::{FilterRecommendationType, Priority};
+use drone_tuner_core::domain::FilterRecommendationType;
+#[cfg(feature = "experimental")]
+use drone_tuner_core::domain::Priority;
 use drone_tuner_core::{AnalysisEngine, BlackboxParser, FlightSession};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -60,9 +62,11 @@ enum Commands {
     Compare(CompareArgs),
     /// Validate blackbox file format
     Validate(ValidateArgs),
-    /// Connect to flight controller for real-time monitoring
+    /// [experimental] Connect to flight controller for real-time monitoring
+    #[cfg(feature = "experimental")]
     Monitor(MonitorArgs),
-    /// Auto-tune PID parameters based on analysis
+    /// [experimental] Auto-tune PID parameters based on analysis
+    #[cfg(feature = "experimental")]
     Tune(TuneArgs),
     /// Export analysis results in various formats
     Export(ExportArgs),
@@ -140,6 +144,7 @@ struct ValidateArgs {
 }
 
 /// Arguments for the monitor command
+#[cfg(feature = "experimental")]
 #[derive(Args)]
 struct MonitorArgs {
     /// Connection string (e.g., /dev/ttyUSB0 or COM3)
@@ -164,6 +169,7 @@ struct MonitorArgs {
 }
 
 /// Arguments for the tune command
+#[cfg(feature = "experimental")]
 #[derive(Args)]
 struct TuneArgs {
     /// Path to blackbox file to analyze for tuning
@@ -225,7 +231,9 @@ async fn main() -> Result<()> {
         }
         Commands::Compare(args) => compare_command(args, cli.output_format).await,
         Commands::Validate(args) => validate_command(args, cli.output_format).await,
+        #[cfg(feature = "experimental")]
         Commands::Monitor(args) => monitor_command(args, cli.output_format).await,
+        #[cfg(feature = "experimental")]
         Commands::Tune(args) => tune_command(args, cli.output_format).await,
         Commands::Export(args) => export_command(args, cli.output_format).await,
         Commands::Info => info_command().await,
@@ -594,11 +602,15 @@ async fn validate_single_file(file_path: &PathBuf, check_issues: bool) -> Result
 }
 
 /// Handle the monitor command
+#[cfg(feature = "experimental")]
 async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Result<()> {
+    eprintln!(
+        "{} `monitor` is EXPERIMENTAL — the MSP transport has never been validated against a real FC. Behaviour is not stable.",
+        style("⚠").yellow().bold()
+    );
     #[cfg(feature = "realtime")]
     {
         use drone_tuner_core::realtime::*;
-        use std::time::Duration;
 
         println!("🔗 Connecting to flight controller at {}", _args.connection);
 
@@ -709,7 +721,12 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
 }
 
 /// Handle the tune command
+#[cfg(feature = "experimental")]
 async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()> {
+    eprintln!(
+        "{} `tune` is EXPERIMENTAL — recommendations are produced but parameter writeback is stubbed. Use `analyze` for stable analysis.",
+        style("⚠").yellow().bold()
+    );
     println!(
         "{} Analyzing blackbox for tuning recommendations",
         style("🔧").blue()

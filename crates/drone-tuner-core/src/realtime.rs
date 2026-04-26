@@ -4,11 +4,8 @@
 //! including USB serial, Bluetooth, and WiFi connections. It implements the MSP
 //! (MultiWii Serial Protocol) for parameter reading/writing and telemetry streaming.
 
-use crate::domain::*;
 use crate::error::{DronetunerError, Result};
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
 
@@ -52,7 +49,7 @@ pub enum ConnectionState {
 }
 
 /// Flight controller information obtained during connection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightControllerInfo {
     /// API version
     pub api_version: String,
@@ -337,28 +334,28 @@ impl FlightControllerConnection {
 
         // Read response
         let response = self.read_msp_response().await?;
-        let api_version = self.parse_api_version(&response)?;
+        let api_version = self.parse_api_version(&response.payload)?;
 
         // Request firmware variant
         let variant_msg = self.msp.create_message(MspCommand::FcVariant, &[])?;
         self.transport.write(&variant_msg).await?;
 
         let response = self.read_msp_response().await?;
-        let firmware_id = self.parse_firmware_variant(&response)?;
+        let firmware_id = self.parse_firmware_variant(&response.payload)?;
 
         // Request firmware version
         let version_msg = self.msp.create_message(MspCommand::FcVersion, &[])?;
         self.transport.write(&version_msg).await?;
 
         let response = self.read_msp_response().await?;
-        let firmware_version = self.parse_firmware_version(&response)?;
+        let firmware_version = self.parse_firmware_version(&response.payload)?;
 
         // Request board information
         let board_msg = self.msp.create_message(MspCommand::BoardInfo, &[])?;
         self.transport.write(&board_msg).await?;
 
         let response = self.read_msp_response().await?;
-        let (board_id, target_name) = self.parse_board_info(&response)?;
+        let (board_id, target_name) = self.parse_board_info(&response.payload)?;
 
         let fc_info = FlightControllerInfo {
             api_version,
@@ -385,7 +382,7 @@ impl FlightControllerConnection {
         self.telemetry_config = config;
 
         // Spawn telemetry reading task
-        let mut transport_clone = self.clone_transport()?;
+        let transport_clone = self.clone_transport()?;
         let msp_clone = self.msp.clone();
         let telemetry_tx = self.telemetry_broadcast.clone();
         let telemetry_config = self.telemetry_config.clone();
@@ -442,7 +439,7 @@ impl FlightControllerConnection {
     async fn read_telemetry_frame(
         transport: &mut Box<dyn Transport + Send>,
         msp: &MspProtocol,
-        config: &TelemetryConfig,
+        _config: &TelemetryConfig,
     ) -> Result<TelemetryFrame> {
         let mut frame = TelemetryFrame {
             timestamp: Instant::now(),
@@ -571,7 +568,7 @@ impl FlightControllerConnection {
         }
     }
 
-    fn parse_board_info(&self, data: &[u8]) -> Result<(String, String)> {
+    fn parse_board_info(&self, _data: &[u8]) -> Result<(String, String)> {
         // Simplified parsing - real implementation would properly decode board info
         Ok(("Unknown".to_string(), "Unknown".to_string()))
     }
@@ -687,7 +684,7 @@ impl MspProtocol {
     }
 
     /// Create an MSP message
-    pub fn create_message(&mut self, command: MspCommand, payload: &[u8]) -> Result<Vec<u8>> {
+    pub fn create_message(&self, command: MspCommand, payload: &[u8]) -> Result<Vec<u8>> {
         let mut message = Vec::new();
 
         match self.version {
