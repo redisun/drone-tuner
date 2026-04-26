@@ -1092,10 +1092,21 @@ async fn pull_bbl_from_fc(
     let connect_pb = make_spinner(format!("connecting to {connection}"));
     let mut fc = open_fc_connection(connection).await?;
     let info_line = match fc.fc_info() {
-        Some(info) => format!(
-            "connected: {} {} (api {}, target {})",
-            info.firmware_id, info.firmware_version, info.api_version, info.target_name
-        ),
+        Some(info) => {
+            let name_suffix = if info.craft_name.is_empty() {
+                String::new()
+            } else {
+                format!(", craft \"{}\"", info.craft_name)
+            };
+            format!(
+                "connected: {} {} (api {}, target {}{})",
+                info.firmware_id,
+                info.firmware_version,
+                info.api_version,
+                info.target_name,
+                name_suffix
+            )
+        }
         None => "connected".to_string(),
     };
     finish_step(connect_pb, info_line);
@@ -1124,12 +1135,18 @@ async fn pull_bbl_from_fc(
         ));
     }
 
-    // Decide where the file lands.
+    // Decide where the file lands. Default name embeds the FC's craft
+    // name so multi-quad logs don't collide and `ls` makes sense.
     let path: PathBuf = match keep_path {
         Some(p) => p.to_path_buf(),
         None => {
             let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-            std::env::temp_dir().join(format!("drone-tuner-pull-{ts}.bbl"))
+            let slug = fc.fc_info().and_then(craft_name_slug);
+            let stem = match slug {
+                Some(name) => format!("drone-tuner-pull-{name}-{ts}.bbl"),
+                None => format!("drone-tuner-pull-{ts}.bbl"),
+            };
+            std::env::temp_dir().join(stem)
         }
     };
 
@@ -1168,6 +1185,46 @@ async fn pull_bbl_from_fc(
     }
 
     Ok(path)
+}
+
+/// Sanitise an arbitrary string (typically the FC's `craft_name`) into
+/// something safe to splat into a filename: ASCII alphanumerics, `_`,
+/// and `-` are kept; everything else (spaces, punctuation, non-ASCII)
+/// becomes `_`. Repeated underscores collapse and leading/trailing
+/// underscores are trimmed so we don't get `__jeno__`.
+///
+/// Returns `None` for inputs that produce an empty result (so callers
+/// can fall back to a timestamp or fixed prefix without printing a
+/// dangling separator).
+fn sanitize_filename_part(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+            last_was_underscore = false;
+        } else if c == '_' || c.is_whitespace() {
+            if !last_was_underscore && !out.is_empty() {
+                out.push('_');
+                last_was_underscore = true;
+            }
+        }
+        // Anything else (punctuation, non-ASCII): drop silently.
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Build a filename suffix from the FC's craft name. Returns
+/// `Some("jeno")` for `craft_name = "Jeno"`, `Some("tbs_source_one")`
+/// for `craft_name = "TBS Source One"`, and `None` when the name is
+/// empty or sanitises away to nothing.
+fn craft_name_slug(info: &drone_tuner_core::realtime::FlightControllerInfo) -> Option<String> {
+    sanitize_filename_part(&info.craft_name).map(|s| s.to_lowercase())
 }
 
 /// Pretty-print byte counts as KB/MB/GB.
@@ -1478,10 +1535,21 @@ async fn apply_pid_recommendations_via_fc(
     let connect_pb = make_spinner(format!("connecting to {connection}"));
     let mut fc = open_fc_connection(connection).await?;
     let info_line = match fc.fc_info() {
-        Some(info) => format!(
-            "connected: {} {} (api {}, target {})",
-            info.firmware_id, info.firmware_version, info.api_version, info.target_name
-        ),
+        Some(info) => {
+            let name_suffix = if info.craft_name.is_empty() {
+                String::new()
+            } else {
+                format!(", craft \"{}\"", info.craft_name)
+            };
+            format!(
+                "connected: {} {} (api {}, target {}{})",
+                info.firmware_id,
+                info.firmware_version,
+                info.api_version,
+                info.target_name,
+                name_suffix
+            )
+        }
         None => "connected".to_string(),
     };
     finish_step(connect_pb, info_line);
@@ -1645,11 +1713,17 @@ async fn apply_pid_recommendations_via_fc(
         );
     }
 
-    // Persist backup to disk if requested.
+    // Persist backup to disk if requested. Default filename embeds the
+    // craft name (sanitised) so `ls tune-backup-*.json` is human-readable
+    // when multiple quads share a workdir.
     if let Some(maybe_path) = &args.backup {
         let path = maybe_path.clone().unwrap_or_else(|| {
             let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-            PathBuf::from(format!("tune-backup-{ts}.json"))
+            let slug = fc.fc_info().and_then(craft_name_slug);
+            match slug {
+                Some(name) => PathBuf::from(format!("tune-backup-{name}-{ts}.json")),
+                None => PathBuf::from(format!("tune-backup-{ts}.json")),
+            }
         });
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "schema": "drone-tuner-pid-backup-v1",
@@ -3187,6 +3261,55 @@ async fn export_to_python(
 
     std::fs::write(output_path, content)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod craft_name_tests {
+    use super::*;
+
+    #[test]
+    fn sanitises_simple_name() {
+        assert_eq!(sanitize_filename_part("Jeno"), Some("Jeno".to_string()));
+    }
+
+    #[test]
+    fn collapses_spaces_to_underscore() {
+        assert_eq!(
+            sanitize_filename_part("TBS Source One"),
+            Some("TBS_Source_One".to_string())
+        );
+    }
+
+    #[test]
+    fn drops_punctuation_and_emoji() {
+        assert_eq!(
+            sanitize_filename_part("My/Quad! 🚁"),
+            Some("MyQuad".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_empty_or_pure_junk() {
+        assert_eq!(sanitize_filename_part(""), None);
+        assert_eq!(sanitize_filename_part("///"), None);
+        assert_eq!(sanitize_filename_part("   "), None);
+    }
+
+    #[test]
+    fn trims_underscores_at_edges() {
+        assert_eq!(
+            sanitize_filename_part("  my quad  "),
+            Some("my_quad".to_string())
+        );
+    }
+
+    #[test]
+    fn collapses_consecutive_separators() {
+        assert_eq!(
+            sanitize_filename_part("foo   bar"),
+            Some("foo_bar".to_string())
+        );
+    }
 }
 
 #[cfg(test)]
