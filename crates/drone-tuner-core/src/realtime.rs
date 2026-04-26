@@ -907,12 +907,13 @@ impl FlightControllerConnection {
         ))
     }
 
-    /// Read a chunk of dataflash starting at `offset`.
+    /// Read a chunk of dataflash starting at `offset` (V1 framing).
     ///
-    /// Request payload is the u32 LE offset. The response begins with the
-    /// same u32 LE offset (echoed back) followed by the chunk bytes. Returns
-    /// `(offset_echoed, chunk)` so the caller can sanity-check progress.
-    /// Chunk size is FC-decided — typically 1–4 KB per request.
+    /// Request payload is the u32 LE offset only — Betaflight responds with
+    /// its legacy 128-byte default chunk. For larger chunks (4 KB+) and
+    /// faster pulls, use [`Self::read_dataflash_chunk_v2`] instead.
+    ///
+    /// Returns `(echoed_offset, chunk)` so the caller can sanity-check.
     pub async fn read_dataflash_chunk(&mut self, offset: u32) -> Result<(u32, Vec<u8>)> {
         let request = self
             .msp
@@ -922,28 +923,53 @@ impl FlightControllerConnection {
         for _ in 0..8 {
             let response = self.read_msp_response().await?;
             if matches!(response.command, MspCommand::DataflashRead) {
-                if response.payload.len() < 4 {
-                    return Err(DronetunerError::parse_error(
-                        format!(
-                            "MSP_DATAFLASH_READ payload too short: {} bytes",
-                            response.payload.len()
-                        ),
-                        None,
-                    ));
-                }
-                let echoed = u32::from_le_bytes([
-                    response.payload[0],
-                    response.payload[1],
-                    response.payload[2],
-                    response.payload[3],
-                ]);
-                let chunk = response.payload[4..].to_vec();
-                return Ok((echoed, chunk));
+                return Self::decode_dataflash_chunk(&response.payload);
             }
         }
         Err(DronetunerError::communication_error(
             "Did not receive MSP_DATAFLASH_READ response after 8 frames",
         ))
+    }
+
+    /// Read a chunk of dataflash starting at `offset` (V2 framing with
+    /// requested chunk size).
+    ///
+    /// Sends the optional `u16 chunk_size` after the offset; Betaflight
+    /// returns up to that many bytes (typically capped at ~4 KB by the
+    /// firmware). V2 framing is required because a single MSPv1 frame
+    /// can't carry payloads larger than 255 bytes.
+    ///
+    /// Drastically faster than [`Self::read_dataflash_chunk`] for big
+    /// pulls — fewer roundtrips, same wire bandwidth.
+    pub async fn read_dataflash_chunk_v2(
+        &mut self,
+        offset: u32,
+        chunk_size: u16,
+    ) -> Result<(u32, Vec<u8>)> {
+        let mut payload = Vec::with_capacity(6);
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.extend_from_slice(&chunk_size.to_le_bytes());
+        let response = self
+            .msp2_request(MspCommand::DataflashRead as u16, &payload)
+            .await?;
+        Self::decode_dataflash_chunk(&response)
+    }
+
+    /// Shared response decoder for both V1 and V2 dataflash read paths:
+    /// `[u32 echoed_offset, ..chunk_bytes]`.
+    fn decode_dataflash_chunk(payload: &[u8]) -> Result<(u32, Vec<u8>)> {
+        if payload.len() < 4 {
+            return Err(DronetunerError::parse_error(
+                format!(
+                    "MSP_DATAFLASH_READ payload too short: {} bytes",
+                    payload.len()
+                ),
+                None,
+            ));
+        }
+        let echoed =
+            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        Ok((echoed, payload[4..].to_vec()))
     }
 
     /// Best-effort read of the FC's craft / pilot name (`MSP_NAME` / 10).
@@ -1153,6 +1179,11 @@ impl FlightControllerConnection {
         &mut self,
         mut progress: F,
     ) -> Result<Vec<u8>> {
+        // Default to 4 KB chunks via V2 framing — ~32× fewer roundtrips
+        // than the V1 legacy 128-byte default, which is the difference
+        // between a few-KB/s and ~100 KB/s pull on real hardware.
+        const PREFERRED_CHUNK_SIZE: u16 = 4096;
+
         let summary = self.read_dataflash_summary().await?;
         if !summary.supported {
             return Err(DronetunerError::communication_error(
@@ -1169,14 +1200,44 @@ impl FlightControllerConnection {
         let mut buf = Vec::with_capacity(total as usize);
         progress(0, total);
 
-        let mut offset: u32 = 0;
-        // Cap iterations: a 32 MB chip at 256-byte chunks tops out around
-        // 130k iterations. 200k gives a generous ceiling against runaway loops.
-        for _ in 0..200_000 {
+        // Probe V2 with the first chunk. If V2 fails (older firmware that
+        // doesn't speak it for cmd 71), fall back to V1's slower legacy
+        // chunks rather than aborting the whole pull.
+        let mut use_v2 = true;
+        let first = self
+            .read_dataflash_chunk_v2(0, PREFERRED_CHUNK_SIZE)
+            .await;
+        let (echoed, chunk) = match first {
+            Ok(ok) => ok,
+            Err(_) => {
+                use_v2 = false;
+                self.read_dataflash_chunk(0).await?
+            }
+        };
+        if echoed != 0 {
+            return Err(DronetunerError::communication_error(format!(
+                "FC echoed dataflash offset {echoed} for first chunk; expected 0"
+            )));
+        }
+        if chunk.is_empty() {
+            return Ok(buf);
+        }
+        let mut offset: u32 = chunk.len() as u32;
+        buf.extend_from_slice(&chunk);
+        progress(buf.len() as u64, total);
+
+        // Iteration cap: even at 128-byte chunks (worst case), a 32 MB chip
+        // is ~262k roundtrips. 400k gives generous margin against runaways.
+        for _ in 0..400_000 {
             if (offset as u64) >= total {
                 break;
             }
-            let (echoed, chunk) = self.read_dataflash_chunk(offset).await?;
+            let (echoed, chunk) = if use_v2 {
+                self.read_dataflash_chunk_v2(offset, PREFERRED_CHUNK_SIZE)
+                    .await?
+            } else {
+                self.read_dataflash_chunk(offset).await?
+            };
             if echoed != offset {
                 return Err(DronetunerError::communication_error(format!(
                     "FC echoed dataflash offset {echoed}, expected {offset} — sync lost"
@@ -2119,6 +2180,36 @@ impl MspSimulator {
     /// `MSP2_COMMON_GET_SETTING` and `MSP2_COMMON_SET_SETTING` against the
     /// simulator's in-memory settings table.
     fn handle_v2(&self, req: &MspV2Response) -> Result<Vec<u8>> {
+        // Dataflash reads under V2 use the 6-byte request format:
+        // u32 offset + u16 chunk_size. Honour the requested size up to
+        // the simulator's configured cap so real-hardware performance
+        // gains can be exercised in tests.
+        if req.command == MspCommand::DataflashRead as u16 {
+            if req.payload.len() < 6 {
+                return Err(DronetunerError::parse_error(
+                    "MSP_DATAFLASH_READ V2 request needs offset+chunk_size",
+                    None,
+                ));
+            }
+            let offset = u32::from_le_bytes([
+                req.payload[0],
+                req.payload[1],
+                req.payload[2],
+                req.payload[3],
+            ]) as usize;
+            let requested = u16::from_le_bytes([req.payload[4], req.payload[5]]) as usize;
+            let state = self.state.lock().unwrap();
+            // Honour the client's requested chunk size. Real Betaflight
+            // caps at its firmware-defined maximum; the simulator just
+            // serves up to the remaining blob length.
+            let mut response = Vec::with_capacity(4 + requested);
+            response.extend_from_slice(&(offset as u32).to_le_bytes());
+            if offset < state.dataflash.len() {
+                let end = (offset + requested).min(state.dataflash.len());
+                response.extend_from_slice(&state.dataflash[offset..end]);
+            }
+            return Ok(response);
+        }
         match req.command {
             msp2::COMMON_GET_SETTING => {
                 let name = parse_settings_name(&req.payload)?;
@@ -2608,6 +2699,32 @@ mod tests {
         assert_eq!(summary.total_size, 1_048_576);
 
         let _ = state; // keep alive
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    /// Verify the V2 chunk path returns up to the requested size in one
+    /// roundtrip — that's the whole point of switching from V1's 128-byte
+    /// legacy chunks to V2's 4 KB chunks.
+    #[tokio::test]
+    async fn test_read_dataflash_chunk_v2_returns_requested_size() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        // Big enough to exceed the V1 255-byte payload cap.
+        let blob: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        sim.state.lock().unwrap().dataflash = blob.clone();
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        // Request 2048 bytes — would be impossible to fit in a single V1
+        // frame, so this fails fast if the V2 path ever regresses.
+        let (echoed, chunk) = conn.read_dataflash_chunk_v2(0, 2048).await.unwrap();
+        assert_eq!(echoed, 0);
+        assert_eq!(chunk.len(), 2048);
+        assert_eq!(&chunk[..], &blob[..2048]);
+
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
