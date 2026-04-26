@@ -1119,7 +1119,10 @@ mod simulator_tests {
             .arg("--auto-apply-safe")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Connected"))
+            .stdout(
+                predicate::str::contains("Connected")
+                    .or(predicate::str::contains("connected:")),
+            )
             .stdout(predicate::str::contains("Dry run complete"));
     }
 
@@ -1139,9 +1142,9 @@ mod simulator_tests {
             .arg("--apply-all")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Connected"))
+            .stdout(predicate::str::contains("connected:"))
             .stdout(
-                predicate::str::contains("Write succeeded")
+                predicate::str::contains("PIDs written")
                     .or(predicate::str::contains("No PID recommendations matched")),
             )
             .stdout(predicate::str::contains("RAM-only"));
@@ -1165,7 +1168,7 @@ mod simulator_tests {
             .assert()
             .success()
             .stdout(
-                predicate::str::contains("Changes persisted")
+                predicate::str::contains("changes persisted across power cycles")
                     .or(predicate::str::contains("No PID recommendations matched")),
             );
     }

@@ -192,13 +192,34 @@ struct MonitorArgs {
 /// Arguments for the tune command
 #[derive(Args)]
 struct TuneArgs {
-    /// Path to blackbox file to analyze for tuning
+    /// Path to blackbox file to analyze for tuning. Optional when
+    /// `--pull-bbl` is set; in that case the file is downloaded from the
+    /// FC's onboard dataflash.
     #[arg(value_name = "FILE")]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     /// Connection string for applying changes
     #[arg(long, value_name = "CONNECTION")]
     connection: Option<String>,
+
+    /// Download the most recent blackbox session from the FC's onboard
+    /// dataflash before analysis. Requires `--connection`. The pulled
+    /// bytes are written to a temp file (or `--keep-bbl <PATH>` if set)
+    /// and fed into the same parse → tune flow as a local file.
+    #[arg(long)]
+    pull_bbl: bool,
+
+    /// Where to save the pulled .bbl file. Without this flag the file is
+    /// written to a tempdir and deleted on exit. Has no effect without
+    /// `--pull-bbl`.
+    #[arg(long, value_name = "PATH")]
+    keep_bbl: Option<PathBuf>,
+
+    /// Erase the FC's onboard dataflash after a successful pull. Off by
+    /// default — most users want their flight history preserved across
+    /// tune iterations. Has no effect without `--pull-bbl`.
+    #[arg(long)]
+    erase_after_pull: bool,
 
     /// Only show recommendations without applying
     #[arg(long)]
@@ -760,14 +781,55 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
 
 /// Handle the tune command
 async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()> {
-    println!(
-        "{} Analyzing blackbox for tuning recommendations",
-        style("🔧").blue()
-    );
+    print_stage("Tune", "drone-tuner ✈️");
+
+    // Validate flag combos. `--pull-bbl` needs --connection because there's
+    // nothing to pull from otherwise; `--keep-bbl` only makes sense when we
+    // actually have a pulled file to keep; an explicit input together with
+    // `--pull-bbl` is ambiguous so reject it.
+    if args.pull_bbl && args.connection.is_none() {
+        return Err(anyhow::anyhow!(
+            "--pull-bbl requires --connection <CONNECTION>"
+        ));
+    }
+    if args.keep_bbl.is_some() && !args.pull_bbl {
+        return Err(anyhow::anyhow!(
+            "--keep-bbl only makes sense together with --pull-bbl"
+        ));
+    }
+    if args.erase_after_pull && !args.pull_bbl {
+        return Err(anyhow::anyhow!(
+            "--erase-after-pull only makes sense together with --pull-bbl"
+        ));
+    }
+    if args.input.is_some() && args.pull_bbl {
+        return Err(anyhow::anyhow!(
+            "Pass either a positional BBL file OR --pull-bbl, not both"
+        ));
+    }
+
+    // Resolve the .bbl path: download from FC or use the user-provided file.
+    let bbl_path = match (&args.input, args.pull_bbl) {
+        (Some(p), false) => p.clone(),
+        (None, true) => {
+            let connection = args.connection.as_deref().unwrap();
+            pull_bbl_from_fc(connection, args.keep_bbl.as_deref(), args.erase_after_pull)
+                .await
+                .context("Failed to pull BBL from flight controller")?
+        }
+        (None, false) => {
+            return Err(anyhow::anyhow!(
+                "No blackbox file given. Pass a path, or --pull-bbl to download from the FC."
+            ))
+        }
+        (Some(_), true) => unreachable!("guarded above"),
+    };
+
+    print_stage("Analyze", "🔍");
 
     // Analyze the blackbox file first
     let analyze_args = AnalyzeArgs {
-        input: args.input.clone(),
+        input: bbl_path.clone(),
         output_dir: None,
         detailed: true,
         show_details: false,
@@ -781,7 +843,16 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
 
     // Get analysis results
     let mut engine = AnalysisEngine::new();
-    let analysis = analyze_single_file(&mut engine, &args.input, &analyze_args).await?;
+    let analysis_pb = make_spinner(format!("parsing {}", bbl_path.display()));
+    let analysis = analyze_single_file(&mut engine, &bbl_path, &analyze_args).await?;
+    finish_step(
+        analysis_pb,
+        format!(
+            "parsed {} samples ({} ms)",
+            analysis.session.telemetry.gyro.len(),
+            analysis.analysis_time.as_millis()
+        ),
+    );
 
     // Display tuning recommendations
     println!("\n{} Tuning Recommendations:", style("📋").green());
@@ -930,27 +1001,193 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
             dry_connect_and_diff(connection, &args, &analysis.report).await?;
         }
         (Some(connection), false) => {
-            apply_pid_recommendations_via_fc(connection, &args, &analysis.report).await?;
+            apply_pid_recommendations_via_fc(connection, &bbl_path, &args, &analysis.report)
+                .await?;
         }
     }
 
     Ok(())
 }
 
+/// Print a section header. The whole tune flow is broken into named stages
+/// so users can see where they are without scrolling.
+fn print_stage(name: &str, icon: &str) {
+    println!(
+        "\n{} {}",
+        style(icon).bold(),
+        style(format!("── {name} ──")).bold().cyan()
+    );
+}
+
+/// Build a small spinner with a stable style. Used for transient
+/// progress feedback during MSP roundtrips that take ≤1s.
+fn make_spinner(msg: impl Into<String>) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(msg.into());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
+/// Tear down a transient spinner and print a final result line on stdout.
+///
+/// Indicatif suppresses output when stderr isn't a TTY (CI, redirected
+/// runs), so a `finish_with_message` alone vanishes in those cases. By
+/// also writing to stdout we keep the result line visible regardless of
+/// where the run is happening.
+fn finish_step(pb: ProgressBar, message: impl Into<String>) {
+    let msg = message.into();
+    pb.finish_and_clear();
+    println!("  {} {}", style("✓").green(), msg);
+}
+
+/// Pull the FC's onboard dataflash to a `.bbl` file with a live progress
+/// bar. Returns the path to the saved file.
+///
+/// If `keep_path` is `Some`, the file is written there verbatim. Otherwise
+/// it goes to `std::env::temp_dir()/drone-tuner-pull-<ts>.bbl`. We print
+/// the destination so the user can pick the file up later.
+///
+/// `erase` triggers MSP_DATAFLASH_ERASE after a successful read — useful
+/// for clearing the chip between tune iterations so the next pull only
+/// contains the *new* flight, but defaults off because most users want
+/// their flight history preserved.
+async fn pull_bbl_from_fc(
+    connection: &str,
+    keep_path: Option<&Path>,
+    erase: bool,
+) -> Result<PathBuf> {
+    print_stage("Pull", "📥");
+
+    let connect_pb = make_spinner(format!("connecting to {connection}"));
+    let mut fc = open_fc_connection(connection).await?;
+    let info_line = match fc.fc_info() {
+        Some(info) => format!(
+            "connected: {} {} (api {}, target {})",
+            info.firmware_id, info.firmware_version, info.api_version, info.target_name
+        ),
+        None => "connected".to_string(),
+    };
+    finish_step(connect_pb, info_line);
+
+    let summary_pb = make_spinner("reading dataflash summary");
+    let summary = fc.read_dataflash_summary().await?;
+    finish_step(
+        summary_pb,
+        format!(
+            "dataflash: {} used / {} total ({} sectors)",
+            format_bytes(summary.used_size as u64),
+            format_bytes(summary.total_size as u64),
+            summary.sectors,
+        ),
+    );
+
+    if !summary.supported {
+        return Err(anyhow::anyhow!(
+            "FC reports no onboard dataflash chip — looks like an SD-card \
+             or no-blackbox board. Pull is not supported here."
+        ));
+    }
+    if summary.used_size == 0 {
+        return Err(anyhow::anyhow!(
+            "FC dataflash is empty. Record a flight first, then re-run."
+        ));
+    }
+
+    // Decide where the file lands.
+    let path: PathBuf = match keep_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            std::env::temp_dir().join(format!("drone-tuner-pull-{ts}.bbl"))
+        }
+    };
+
+    let pull_pb = ProgressBar::new(summary.used_size as u64);
+    pull_pb.set_style(
+        ProgressStyle::with_template(
+            "  {spinner:.cyan} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pull_pb.set_message("downloading dataflash");
+    pull_pb.enable_steady_tick(std::time::Duration::from_millis(120));
+    let pull_pb_for_cb = pull_pb.clone();
+    let blob = fc
+        .pull_dataflash(move |done, _total| pull_pb_for_cb.set_position(done))
+        .await
+        .context("Dataflash pull failed")?;
+    finish_step(pull_pb, format!("downloaded {}", format_bytes(blob.len() as u64)));
+
+    // Persist.
+    std::fs::write(&path, &blob)
+        .with_context(|| format!("Failed to write pulled BBL to {}", path.display()))?;
+    println!("  {} saved → {}", style("💾").blue(), path.display());
+
+    if erase {
+        // Erase is intentionally not wired through `FlightControllerConnection`
+        // yet — the command is destructive and we want a deliberate review
+        // before exposing it. Surface a friendly note here so the flag
+        // doesn't silently no-op.
+        println!(
+            "  {} --erase-after-pull is staged but not yet wired; \
+             use Betaflight Configurator if you need to clear the chip.",
+            style("⚠").yellow()
+        );
+    }
+
+    Ok(path)
+}
+
+/// Pretty-print byte counts as KB/MB/GB.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Open an [`FlightControllerConnection`] from a connection string.
 ///
-/// Supports the `simulator://` scheme, which spawns an in-process
-/// [`MspSimulator`] so the rest of the MSP path can be exercised without
-/// serial hardware.
+/// Supported schemes:
+/// - `simulator://` — in-process [`MspSimulator`] with no preloaded
+///   dataflash (handshake + PID/filter round-trips work; `--pull-bbl`
+///   will report an empty chip).
+/// - `simulator://<path-to.bbl>` — same simulator, but its dataflash is
+///   preloaded with the bytes of the given file. Lets the `--pull-bbl`
+///   path be exercised end-to-end against a real BBL fixture.
+/// - `serial:///dev/ttyACM0` (or a bare device path) — physical FC.
 async fn open_fc_connection(
     connection: &str,
 ) -> Result<drone_tuner_core::realtime::FlightControllerConnection> {
     use drone_tuner_core::realtime::FlightControllerConnection;
 
-    if connection == "simulator://" {
+    if let Some(rest) = connection.strip_prefix("simulator://") {
         use drone_tuner_core::realtime::{MockTransport, MspSimulator};
         let (client, server) = MockTransport::pair();
         let sim = MspSimulator::new(Box::new(server));
+        if !rest.is_empty() {
+            // Preload the simulator's dataflash with the file. This lets
+            // `--pull-bbl --connection simulator://test_data/btfl.bbl`
+            // exercise the full pull → analyze → write flow.
+            let bytes = std::fs::read(rest)
+                .with_context(|| format!("simulator://: failed to read preload file '{rest}'"))?;
+            let mut state = sim.state.lock().unwrap();
+            state.dataflash = bytes;
+        }
         tokio::spawn(async move {
             let _ = sim.run().await;
         });
@@ -1079,6 +1316,7 @@ async fn dry_connect_and_diff(
 ///   revert on next reboot — itself a useful safety net.
 async fn apply_pid_recommendations_via_fc(
     connection: &str,
+    bbl_path: &Path,
     args: &TuneArgs,
     report: &drone_tuner_core::domain::AnalysisReport,
 ) -> Result<()> {
@@ -1091,43 +1329,80 @@ async fn apply_pid_recommendations_via_fc(
         return Ok(());
     }
 
-    println!(
-        "\n{} Connecting to flight controller to apply changes...",
-        style("🔗").blue()
-    );
+    print_stage("Apply", "✏️");
 
+    let connect_pb = make_spinner(format!("connecting to {connection}"));
     let mut fc = open_fc_connection(connection).await?;
-    println!("{} Connected", style("✓").green());
+    let info_line = match fc.fc_info() {
+        Some(info) => format!(
+            "connected: {} {} (api {}, target {})",
+            info.firmware_id, info.firmware_version, info.api_version, info.target_name
+        ),
+        None => "connected".to_string(),
+    };
+    finish_step(connect_pb, info_line);
 
     // Read current PID and decide what to write.
+    let read_pb = make_spinner("reading current PID values");
     let current = fc
         .read_pid()
         .await
         .context("Failed to read current PID values from FC")?;
+    finish_step(
+        read_pb,
+        format!(
+            "current: roll={:?} pitch={:?} yaw={:?}",
+            current.roll(),
+            current.pitch(),
+            current.yaw()
+        ),
+    );
+
     let mut new_snapshot = current.clone();
     let applied = apply_pid_recs_to_snapshot(&mut new_snapshot, &report.pid_recommendations, args);
 
     if applied == 0 {
         println!(
-            "{} No PID recommendations matched the active filters; nothing to write.",
+            "  {} No PID recommendations matched the active filters; nothing to write.",
             style("ℹ️").blue()
         );
         return Ok(());
     }
 
+    // Show the diff before writing so the user can sanity-check.
     println!(
-        "{} Writing {} PID change(s) with rollback safety net...",
-        style("📝").blue(),
+        "  {} {} PID change(s) staged:",
+        style("📝").yellow(),
         applied
     );
+    if current.roll() != new_snapshot.roll() {
+        println!(
+            "    Roll  P/I/D: {:?} → {:?}",
+            current.roll(),
+            new_snapshot.roll()
+        );
+    }
+    if current.pitch() != new_snapshot.pitch() {
+        println!(
+            "    Pitch P/I/D: {:?} → {:?}",
+            current.pitch(),
+            new_snapshot.pitch()
+        );
+    }
+    if current.yaw() != new_snapshot.yaw() {
+        println!(
+            "    Yaw   P/I/D: {:?} → {:?}",
+            current.yaw(),
+            new_snapshot.yaw()
+        );
+    }
+
+    let write_pb = make_spinner("writing PIDs (with rollback safety net)");
     let backup = fc
         .apply_pid_with_rollback(&new_snapshot)
         .await
         .context("PID writeback failed (any partial write was rolled back)")?;
-    println!(
-        "{} Write succeeded; backup retained in memory.",
-        style("✓").green()
-    );
+    finish_step(write_pb, "PIDs written; backup retained in memory");
 
     // Persist backup to disk if requested.
     if let Some(maybe_path) = &args.backup {
@@ -1145,24 +1420,20 @@ async fn apply_pid_recommendations_via_fc(
         }))?;
         std::fs::write(&path, json)
             .with_context(|| format!("Failed to write backup snapshot to {}", path.display()))?;
-        println!(
-            "{} Backup snapshot saved to {}",
-            style("💾").blue(),
-            path.display()
-        );
+        println!("  {} backup → {}", style("💾").blue(), path.display());
     }
 
     let mut persisted_to_eeprom = false;
     if args.save_eeprom {
-        println!("{} Persisting changes to EEPROM...", style("💾").blue());
+        let save_pb = make_spinner("persisting to EEPROM");
         fc.save_to_eeprom().await.context(
             "EEPROM write failed; RAM changes are still in effect but will revert on power cycle",
         )?;
         persisted_to_eeprom = true;
-        println!("{} Changes persisted.", style("✓").green());
+        finish_step(save_pb, "changes persisted across power cycles");
     } else {
         println!(
-            "{} Changes are RAM-only and will revert on power cycle. \
+            "  {} Changes are RAM-only and will revert on power cycle. \
              Re-run with --save-eeprom to persist.",
             style("ℹ️").blue()
         );
@@ -1172,7 +1443,7 @@ async fn apply_pid_recommendations_via_fc(
     // must never break the successful writeback that just completed.
     if let Err(e) = record_history(
         &fc,
-        &args.input,
+        bbl_path,
         &backup,
         &new_snapshot,
         applied,
@@ -1180,6 +1451,8 @@ async fn apply_pid_recommendations_via_fc(
     ) {
         warn!("Failed to append tune history entry: {e:#}");
     }
+
+    println!("\n  {} Tune complete.", style("✅").green());
 
     Ok(())
 }
@@ -2470,8 +2743,11 @@ mod tests {
 
     fn args(auto: bool, all: bool) -> TuneArgs {
         TuneArgs {
-            input: PathBuf::from("dummy"),
+            input: Some(PathBuf::from("dummy")),
             connection: None,
+            pull_bbl: false,
+            keep_bbl: None,
+            erase_after_pull: false,
             dry_run: false,
             backup: None,
             auto_apply_safe: auto,
