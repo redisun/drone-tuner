@@ -41,8 +41,11 @@ pub struct StepResponse {
     pub oscillation_frequency: f32,
     /// Estimated damping ratio
     pub damping_ratio: f32,
-    /// Steady-state error as percentage
-    pub steady_state_error: f32,
+    /// Absolute steady-state tracking error in deg/s, when the step was
+    /// large enough and the command stayed put long enough to make the
+    /// metric meaningful. `None` for transient stick movements where
+    /// "steady state" was never reached.
+    pub steady_state_error_dps: Option<f32>,
 }
 
 /// Step response performance metrics
@@ -53,7 +56,93 @@ struct StepMetrics {
     overshoot_percent: f32,
     oscillation_frequency: f32,
     damping_ratio: f32,
-    steady_state_error: f32,
+    steady_state_error_dps: Option<f32>,
+}
+
+/// Hard upper bounds for PID gains. The analyzer never recommends values
+/// above these and stops recommending increases once the current value is
+/// within `headroom_skip_pct` of the cap. Tuned for modern Betaflight 4.x
+/// on a 4S-6S 5" freestyle quad — adjust for racing or tinywhoops.
+#[derive(Debug, Clone)]
+struct PidLimits {
+    p_max: f32,
+    i_max: f32,
+    d_max: f32,
+    /// Skip recommending an increase if `current >= max * (1 - headroom_skip_pct)`.
+    /// Prevents asymptotic recommendations that nudge gains by less than the
+    /// FC's integer resolution.
+    headroom_skip_pct: f32,
+}
+
+impl Default for PidLimits {
+    fn default() -> Self {
+        Self {
+            p_max: 80.0,
+            i_max: 180.0,
+            d_max: 60.0,
+            headroom_skip_pct: 0.10,
+        }
+    }
+}
+
+/// Minimum stick deflection (fraction of full RC range, [-1.0, 1.0]) for a
+/// step to count as steady-state-capable. Below this the gyro never reaches
+/// a sustainable rate and "steady-state error" is meaningless.
+const SS_CAPABLE_MIN_STEP: f32 = 0.30;
+/// Maximum allowed RC command drift across the analysis window for the
+/// step to count as steady-state-capable. If the pilot moved the stick
+/// again before the response settled, we can't tell command-tracking error
+/// from a fresh transient.
+const SS_CAPABLE_MAX_DRIFT: f32 = 0.10;
+/// Minimum number of steady-state-capable responses we need before we
+/// trust an averaged steady-state error figure enough to act on it.
+const SS_MIN_VALID_RESPONSES: usize = 3;
+/// Threshold in deg/s above which we recommend bumping I-term. 30 deg/s
+/// is roughly 4-5% of typical full-stick rate (~600-700 deg/s) — small
+/// enough to catch real bias, large enough to ignore measurement noise.
+const SS_ERROR_RECOMMEND_DPS: f32 = 30.0;
+/// Conservative I-term increase per iteration. The previous value of 20%
+/// caused runaway recommendations because the FC's tune quickly lands
+/// near (but not at) the SS-error threshold and the algorithm keeps
+/// nudging. 10% lets each iteration's effect be visible in the next bbl.
+const I_TERM_BUMP: f32 = 1.10;
+/// Minimum absolute scale at which we treat an `rc_commands` axis as
+/// having meaningful range. Below this we assume the pilot didn't touch
+/// the stick during the log and skip step analysis for that axis.
+const RC_NORMALIZE_MIN_SCALE: f32 = 5.0;
+/// Default Betaflight rcCommand range. Roll/pitch/yaw are signed ints
+/// scaled to roughly +/- 500 (post-deadband, pre-rates). We use the
+/// observed maximum absolute value in the log as the scale instead of
+/// hard-coding 500, so the analyzer also works on logs that already came
+/// in normalized — see `normalize_rc_axis`.
+const RC_NORMALIZE_FALLBACK: f32 = 500.0;
+
+/// Normalize one axis of rc_commands to roughly [-1.0, 1.0] using the
+/// 99th-percentile absolute value as the scale. Returns the scale used so
+/// callers can sanity-check it. Robust to the two conventions we see in
+/// the wild: raw Betaflight rcCommand ([-500, 500]) and pre-normalized
+/// floats ([-1, 1]).
+fn normalize_rc_axis(rc: &[f32]) -> (Vec<f32>, f32) {
+    if rc.is_empty() {
+        return (Vec::new(), 1.0);
+    }
+    let mut abs_vals: Vec<f32> = rc.iter().map(|v| v.abs()).collect();
+    // Partial sort by ordered_cmp so NaNs don't poison the sort.
+    abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p99_idx = ((abs_vals.len() as f32) * 0.99) as usize;
+    let p99 = abs_vals
+        .get(p99_idx.min(abs_vals.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0.0);
+    // If the log barely moves the stick we don't have signal — fall back
+    // to the Betaflight scale so step detection doesn't divide by ~0.
+    let scale = if p99 < RC_NORMALIZE_MIN_SCALE {
+        RC_NORMALIZE_FALLBACK
+    } else {
+        p99
+    };
+    let normalized = rc.iter().map(|v| v / scale).collect();
+    (normalized, scale)
 }
 
 impl PidAnalyzer {
@@ -78,23 +167,37 @@ impl PidAnalyzer {
         } else {
             tracing::info!("RC command data available, performing step response analysis");
 
+            // Normalize rc_commands to ~[-1, 1] before step detection so
+            // thresholds (min step, max drift, SS-capable cutoff) are unit-
+            // independent of whether the bbl came in raw Betaflight units
+            // ([-500, 500]) or already normalized.
+            let (roll_rc, roll_scale) = normalize_rc_axis(&telemetry.rc_commands.roll);
+            let (pitch_rc, pitch_scale) = normalize_rc_axis(&telemetry.rc_commands.pitch);
+            let (yaw_rc, yaw_scale) = normalize_rc_axis(&telemetry.rc_commands.yaw);
+            tracing::debug!(
+                "RC normalization scales: roll={:.1} pitch={:.1} yaw={:.1}",
+                roll_scale,
+                pitch_scale,
+                yaw_scale
+            );
+
             // Detect step responses for each axis
             let roll_responses = self.detect_step_responses(
-                &telemetry.rc_commands.roll,
+                &roll_rc,
                 &telemetry.gyro.x,
                 telemetry.sample_rate,
                 Axis::Roll,
             )?;
 
             let pitch_responses = self.detect_step_responses(
-                &telemetry.rc_commands.pitch,
+                &pitch_rc,
                 &telemetry.gyro.y,
                 telemetry.sample_rate,
                 Axis::Pitch,
             )?;
 
             let yaw_responses = self.detect_step_responses(
-                &telemetry.rc_commands.yaw,
+                &yaw_rc,
                 &telemetry.gyro.z,
                 telemetry.sample_rate,
                 Axis::Yaw,
@@ -151,41 +254,63 @@ impl PidAnalyzer {
             ));
         }
 
-        let min_step_size = 0.1; // Minimum step size to consider (10% of full range)
-        let min_duration_samples = (0.05 * sample_rate) as usize; // 50ms minimum
-        let max_duration_samples = (2.0 * sample_rate) as usize; // 2s maximum
+        // Real pilot stick movements happen over ~50-200ms. At 3205Hz that's
+        // hundreds of samples — a single-sample delta detector would never
+        // fire on a gradual stick move and instead picks up only quantization
+        // noise. Use a windowed detector: at each position, look at the RC
+        // change between `pre_window` ago and `post_window` ahead. If the
+        // pre-window was steady, the post-window is steady, and the gap
+        // between them is large, it's a real step.
+        let pre_window = ((0.05 * sample_rate) as usize).max(5); // 50ms history
+        let post_window = ((0.10 * sample_rate) as usize).max(10); // 100ms forward
+        let refractory = ((0.30 * sample_rate) as usize).max(30); // 300ms cooldown
+        let min_step_size = 0.10; // 10% of full stick deflection
+        let max_pre_jitter = 0.05; // pre-step stability tolerance
+        let max_post_jitter = 0.10; // post-step settle tolerance
 
-        // Find step inputs in RC commands
-        for i in 1..rc_commands.len() {
-            let step_size = (rc_commands[i] - rc_commands[i - 1]).abs();
+        // Sliding mean+range over a window — cheap stability check.
+        let window_range = |start: usize, end: usize| -> (f32, f32) {
+            let slice = &rc_commands[start..end];
+            let mean = slice.iter().sum::<f32>() / slice.len() as f32;
+            let max_dev = slice
+                .iter()
+                .map(|v| (v - mean).abs())
+                .fold(0.0_f32, f32::max);
+            (mean, max_dev)
+        };
 
-            // Check if this is a significant step
-            if step_size > min_step_size {
-                // Look for the end of the step (when RC command stabilizes)
-                let mut step_end = i;
-                for j in (i + 1)..rc_commands.len().min(i + max_duration_samples) {
-                    if (rc_commands[j] - rc_commands[i]).abs() > step_size * 0.2 {
-                        // Command changed significantly again, this step ended
-                        break;
-                    }
-                    step_end = j;
+        let mut last_step_end = 0;
+        let mut i = pre_window;
+        while i + post_window < rc_commands.len() {
+            // Skip until we're past the previous step's refractory period.
+            if i < last_step_end {
+                i += 1;
+                continue;
+            }
+
+            let (pre_mean, pre_jitter) = window_range(i - pre_window, i);
+            let (post_mean, post_jitter) = window_range(i, i + post_window);
+            let step_size = (post_mean - pre_mean).abs();
+
+            if step_size > min_step_size
+                && pre_jitter < max_pre_jitter
+                && post_jitter < max_post_jitter
+            {
+                let response = self.analyze_step_response(
+                    i,
+                    i + post_window,
+                    rc_commands,
+                    gyro_response,
+                    sample_rate,
+                    axis.clone(),
+                )?;
+                if let Some(resp) = response {
+                    responses.push(resp);
                 }
-
-                // Ensure minimum duration
-                if step_end - i >= min_duration_samples {
-                    let response = self.analyze_step_response(
-                        i,
-                        step_end,
-                        rc_commands,
-                        gyro_response,
-                        sample_rate,
-                        axis.clone(),
-                    )?;
-
-                    if let Some(resp) = response {
-                        responses.push(resp);
-                    }
-                }
+                last_step_end = i + refractory;
+                i += refractory;
+            } else {
+                i += 1;
             }
         }
 
@@ -202,8 +327,16 @@ impl PidAnalyzer {
         sample_rate: f32,
         axis: Axis,
     ) -> Result<Option<StepResponse>> {
-        let step_command = rc_commands[step_start];
-        let initial_command = rc_commands[step_start - 1];
+        // Recompute the windowed pre/post means so the step magnitude here
+        // matches what the detector saw (single-sample deltas would pick
+        // up quantization noise instead of the actual stick movement).
+        let pre_w = ((0.05 * sample_rate) as usize).max(5).min(step_start);
+        let post_w = ((0.10 * sample_rate) as usize).max(10);
+        let pre_slice = &rc_commands[step_start - pre_w..step_start];
+        let post_end = (step_start + post_w).min(rc_commands.len());
+        let post_slice = &rc_commands[step_start..post_end];
+        let initial_command = pre_slice.iter().sum::<f32>() / pre_slice.len() as f32;
+        let step_command = post_slice.iter().sum::<f32>() / post_slice.len() as f32;
         let command_change = step_command - initial_command;
 
         // Extract response window (extend a bit beyond step to see settling)
@@ -221,12 +354,29 @@ impl PidAnalyzer {
         // For gyro, we expect it to be proportional to the rate command
         let expected_response = command_change * 500.0; // Rough scaling, should be configurable
 
+        // For steady-state error to be a real measurement we need (a) a step
+        // big enough that the gyro can plausibly reach a sustained rate and
+        // (b) the post-step command stayed put. The detector already
+        // enforces a stability bound on the analysis window; here we just
+        // require a stricter step magnitude and that the command stayed
+        // close to `step_command` (the post-step plateau) for the full
+        // settling window.
+        let cmd_window_end = (step_start + analysis_window).min(rc_commands.len());
+        let cmd_window = &rc_commands[step_start..cmd_window_end];
+        let max_cmd_drift = cmd_window
+            .iter()
+            .map(|&c| (c - step_command).abs())
+            .fold(0.0f32, f32::max);
+        let is_ss_capable =
+            command_change.abs() >= SS_CAPABLE_MIN_STEP && max_cmd_drift <= SS_CAPABLE_MAX_DRIFT;
+
         // Calculate performance metrics
         let metrics = self.calculate_step_metrics(
             response_window,
             baseline_gyro,
             expected_response,
             sample_rate,
+            is_ss_capable,
         )?;
 
         Ok(Some(StepResponse {
@@ -238,7 +388,7 @@ impl PidAnalyzer {
             overshoot_percent: metrics.overshoot_percent,
             oscillation_frequency: metrics.oscillation_frequency,
             damping_ratio: metrics.damping_ratio,
-            steady_state_error: metrics.steady_state_error,
+            steady_state_error_dps: metrics.steady_state_error_dps,
         }))
     }
 
@@ -249,6 +399,7 @@ impl PidAnalyzer {
         baseline: f32,
         expected_final: f32,
         sample_rate: f32,
+        is_ss_capable: bool,
     ) -> Result<StepMetrics> {
         let dt = 1.0 / sample_rate;
 
@@ -317,13 +468,20 @@ impl PidAnalyzer {
             1.0 // Well damped
         };
 
-        // Calculate steady-state error
-        let final_samples = response.len().min(10); // Last 10 samples
-        let steady_state_value = response[response.len() - final_samples..]
-            .iter()
-            .sum::<f32>()
-            / final_samples as f32;
-        let steady_state_error = ((steady_state_value - target_value) / expected_final.abs()).abs();
+        // Steady-state error: the absolute gap between where the gyro ended
+        // up and where it should have ended up, in deg/s. We only emit it
+        // for responses where the step was big enough and the command was
+        // held steady — see SS_CAPABLE_* constants. Averaging the last
+        // ~50ms of the window gives a tighter "where did it actually
+        // settle" reading than the previous 10-sample tail.
+        let steady_state_error_dps = if is_ss_capable {
+            let tail_len = ((sample_rate * 0.05) as usize).clamp(5, response.len());
+            let tail_start = response.len() - tail_len;
+            let steady_state_value = response[tail_start..].iter().sum::<f32>() / tail_len as f32;
+            Some((steady_state_value - target_value).abs())
+        } else {
+            None
+        };
 
         Ok(StepMetrics {
             rise_time,
@@ -331,7 +489,7 @@ impl PidAnalyzer {
             overshoot_percent,
             oscillation_frequency,
             damping_ratio,
-            steady_state_error,
+            steady_state_error_dps,
         })
     }
 
@@ -566,36 +724,46 @@ impl PidAnalyzer {
             Axis::Yaw => &pid_config.yaw,
         };
 
-        // Check for persistent bias in error
+        let limits = PidLimits::default();
+        let i_headroom_floor = limits.i_max * (1.0 - limits.headroom_skip_pct);
+
+        // Check for persistent bias in error. Use the same conservative
+        // bump (+10%) and absolute cap as the step-response path so the
+        // two paths can't disagree on what "safe" means.
         let error_mean = error_data.iter().sum::<f32>() / error_data.len() as f32;
-        if error_mean.abs() > 2.0 {
-            recommendations.push(PidRecommendation {
-                axis: axis.clone(),
-                term: PidTerm::I,
-                current_value: current_pid.i,
-                recommended_value: current_pid.i * 1.3, // Increase I-term more
-                reason: format!(
-                    "Increase I-term to eliminate error bias (bias: {:.2})",
-                    error_mean
-                ),
-                priority: Priority::High,
-            });
+        if error_mean.abs() > 2.0 && current_pid.i < i_headroom_floor {
+            let proposed = (current_pid.i * I_TERM_BUMP).min(limits.i_max);
+            if proposed - current_pid.i >= 1.0 {
+                recommendations.push(PidRecommendation {
+                    axis: axis.clone(),
+                    term: PidTerm::I,
+                    current_value: current_pid.i,
+                    recommended_value: proposed,
+                    reason: format!(
+                        "Increase I-term to eliminate error bias (bias: {:.2})",
+                        error_mean
+                    ),
+                    priority: Priority::High,
+                });
+            }
         }
 
-        // High RMS error suggests need for more aggressive PID terms
-        if rms_error > 5.0 {
-            // Adjustable threshold
-            recommendations.push(PidRecommendation {
-                axis: axis.clone(),
-                term: PidTerm::I,
-                current_value: current_pid.i,
-                recommended_value: current_pid.i * 1.2, // Increase I-term
-                reason: format!(
-                    "Increase I-term to reduce steady-state error (RMS error: {:.2})",
-                    rms_error
-                ),
-                priority: Priority::Medium,
-            });
+        // RMS error driven I-bump only fires if the bias check above didn't
+        // (otherwise we'd double-recommend the same axis) and only when
+        // there's headroom under the cap.
+        let already_recommended_i = recommendations.iter().any(|r| matches!(r.term, PidTerm::I));
+        if !already_recommended_i && rms_error > 5.0 && current_pid.i < i_headroom_floor {
+            let proposed = (current_pid.i * I_TERM_BUMP).min(limits.i_max);
+            if proposed - current_pid.i >= 1.0 {
+                recommendations.push(PidRecommendation {
+                    axis: axis.clone(),
+                    term: PidTerm::I,
+                    current_value: current_pid.i,
+                    recommended_value: proposed,
+                    reason: format!("Increase I-term: persistent RMS error {:.2}", rms_error),
+                    priority: Priority::Medium,
+                });
+            }
         }
 
         Ok(recommendations)
@@ -636,82 +804,117 @@ impl PidAnalyzer {
             Axis::Yaw => &pid_config.yaw,
         };
 
+        let limits = PidLimits::default();
+        let p_headroom_floor = limits.p_max * (1.0 - limits.headroom_skip_pct);
+        let d_headroom_floor = limits.d_max * (1.0 - limits.headroom_skip_pct);
+
         // Analyze P-term based on overshoot and rise time
         if avg_overshoot > self.config.overshoot_tolerance {
             let reduction_percent = (avg_overshoot - self.config.overshoot_tolerance) / 50.0;
-            recommendations.push(PidRecommendation {
-                axis: axis.clone(),
-                term: PidTerm::P,
-                current_value: current_pid.p,
-                recommended_value: current_pid.p * (1.0 - reduction_percent.min(0.3)), // Max 30% reduction
-                reason: format!(
-                    "Reduce P-term to decrease overshoot from {:.1}% to target {:.1}%",
-                    avg_overshoot, self.config.overshoot_tolerance
-                ),
-                priority: if avg_overshoot > 25.0 {
-                    Priority::High
-                } else {
-                    Priority::Medium
-                },
-            });
-        } else if avg_rise_time > 0.15 && avg_overshoot < 5.0 {
-            // Slow rise time with little overshoot suggests P could be increased
-            recommendations.push(PidRecommendation {
-                axis: axis.clone(),
-                term: PidTerm::P,
-                current_value: current_pid.p,
-                recommended_value: current_pid.p * 1.1, // 10% increase
-                reason: format!(
-                    "Increase P-term to improve responsiveness (rise time: {:.3}s)",
-                    avg_rise_time
-                ),
-                priority: Priority::Low,
-            });
+            let proposed = current_pid.p * (1.0 - reduction_percent.min(0.3)); // Max 30% reduction
+            if current_pid.p - proposed >= 1.0 {
+                recommendations.push(PidRecommendation {
+                    axis: axis.clone(),
+                    term: PidTerm::P,
+                    current_value: current_pid.p,
+                    recommended_value: proposed,
+                    reason: format!(
+                        "Reduce P-term to decrease overshoot from {:.1}% to target {:.1}%",
+                        avg_overshoot, self.config.overshoot_tolerance
+                    ),
+                    priority: if avg_overshoot > 25.0 {
+                        Priority::High
+                    } else {
+                        Priority::Medium
+                    },
+                });
+            }
+        } else if avg_rise_time > 0.15 && avg_overshoot < 5.0 && current_pid.p < p_headroom_floor {
+            // Slow rise time with little overshoot suggests P could be increased.
+            let proposed = (current_pid.p * 1.1).min(limits.p_max); // 10% increase, capped
+            if proposed - current_pid.p >= 1.0 {
+                recommendations.push(PidRecommendation {
+                    axis: axis.clone(),
+                    term: PidTerm::P,
+                    current_value: current_pid.p,
+                    recommended_value: proposed,
+                    reason: format!(
+                        "Increase P-term to improve responsiveness (rise time: {:.3}s)",
+                        avg_rise_time
+                    ),
+                    priority: Priority::Low,
+                });
+            }
         }
 
-        // Analyze I-term based on steady-state error
-        let avg_ss_error =
-            responses.iter().map(|r| r.steady_state_error).sum::<f32>() / responses.len() as f32;
-        if avg_ss_error > 0.05 {
-            recommendations.push(PidRecommendation {
-                axis: axis.clone(),
-                term: PidTerm::I,
-                current_value: current_pid.i,
-                recommended_value: current_pid.i * 1.2, // 20% increase
-                reason: format!(
-                    "Increase I-term to reduce steady-state error ({:.1}%)",
-                    avg_ss_error * 100.0
-                ),
-                priority: Priority::Medium,
-            });
+        // Analyze I-term based on steady-state error.
+        //
+        // We average only the responses that were large enough and held
+        // steady enough to give a meaningful steady-state reading. If we
+        // don't have at least SS_MIN_VALID_RESPONSES of those, we say
+        // nothing — the previous behaviour of recommending I-bumps from
+        // small stick movements gave a false signal that compounded across
+        // tuning iterations.
+        let ss_capable: Vec<f32> = responses
+            .iter()
+            .filter_map(|r| r.steady_state_error_dps)
+            .collect();
+        if ss_capable.len() >= SS_MIN_VALID_RESPONSES {
+            let avg_ss_error_dps = ss_capable.iter().sum::<f32>() / ss_capable.len() as f32;
+            let i_headroom_floor = limits.i_max * (1.0 - limits.headroom_skip_pct);
+            if avg_ss_error_dps > SS_ERROR_RECOMMEND_DPS && current_pid.i < i_headroom_floor {
+                let proposed = (current_pid.i * I_TERM_BUMP).min(limits.i_max);
+                // Only emit if the change is at least one integer FC unit;
+                // otherwise the recommendation is invisible to the FC.
+                if proposed - current_pid.i >= 1.0 {
+                    recommendations.push(PidRecommendation {
+                        axis: axis.clone(),
+                        term: PidTerm::I,
+                        current_value: current_pid.i,
+                        recommended_value: proposed,
+                        reason: format!(
+                            "Increase I-term: {:.0} deg/s steady-state tracking error across {} valid step responses",
+                            avg_ss_error_dps,
+                            ss_capable.len()
+                        ),
+                        priority: Priority::Medium,
+                    });
+                }
+            }
         }
 
         // Analyze D-term based on oscillations and damping
-        if avg_oscillation_freq > 10.0 && avg_damping < 0.5 {
-            recommendations.push(PidRecommendation {
-                axis: axis.clone(),
-                term: PidTerm::D,
-                current_value: current_pid.d,
-                recommended_value: current_pid.d * 1.3, // 30% increase
-                reason: format!(
-                    "Increase D-term to dampen oscillations ({:.1} Hz, damping: {:.2})",
-                    avg_oscillation_freq, avg_damping
-                ),
-                priority: Priority::Medium,
-            });
+        if avg_oscillation_freq > 10.0 && avg_damping < 0.5 && current_pid.d < d_headroom_floor {
+            let proposed = (current_pid.d * 1.3).min(limits.d_max); // 30% increase, capped
+            if proposed - current_pid.d >= 1.0 {
+                recommendations.push(PidRecommendation {
+                    axis: axis.clone(),
+                    term: PidTerm::D,
+                    current_value: current_pid.d,
+                    recommended_value: proposed,
+                    reason: format!(
+                        "Increase D-term to dampen oscillations ({:.1} Hz, damping: {:.2})",
+                        avg_oscillation_freq, avg_damping
+                    ),
+                    priority: Priority::Medium,
+                });
+            }
         } else if avg_settling_time > 0.5 && avg_oscillation_freq < 5.0 {
             // Long settling time might indicate too much D-term
-            recommendations.push(PidRecommendation {
-                axis: axis.clone(),
-                term: PidTerm::D,
-                current_value: current_pid.d,
-                recommended_value: current_pid.d * 0.8, // 20% decrease
-                reason: format!(
-                    "Reduce D-term to improve settling time ({:.3}s)",
-                    avg_settling_time
-                ),
-                priority: Priority::Low,
-            });
+            let proposed = current_pid.d * 0.8; // 20% decrease
+            if current_pid.d - proposed >= 1.0 {
+                recommendations.push(PidRecommendation {
+                    axis: axis.clone(),
+                    term: PidTerm::D,
+                    current_value: current_pid.d,
+                    recommended_value: proposed,
+                    reason: format!(
+                        "Reduce D-term to improve settling time ({:.3}s)",
+                        avg_settling_time
+                    ),
+                    priority: Priority::Low,
+                });
+            }
         }
 
         Ok(recommendations)

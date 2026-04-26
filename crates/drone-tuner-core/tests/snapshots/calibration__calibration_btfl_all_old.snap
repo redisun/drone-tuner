@@ -1,6 +1,6 @@
 ---
 source: crates/drone-tuner-core/tests/calibration.rs
-assertion_line: 170
+assertion_line: 165
 expression: "ReportSummary::from_report(&report)"
 ---
 {
@@ -18,10 +18,7 @@ expression: "ReportSummary::from_report(&report)"
     "adjust_dynamic_notch": 12
   },
   "pid_recommendations_by_axis_term": {
-    "pitch_i": 1,
-    "roll_i": 1,
-    "roll_p": 1,
-    "yaw_i": 1
+    "yaw_p": 1
   },
   "tune_quality_bucket": "very_poor"
 }
