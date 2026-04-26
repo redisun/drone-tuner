@@ -1173,9 +1173,11 @@ mod simulator_tests {
             );
     }
 
-    /// `tune --apply-all` should also write filter settings via the new
-    /// MSP2_COMMON_SET_SETTING path. Verified by checking the staged
-    /// settings line + the per-setting written confirmation.
+    /// `tune --apply-all` should drive the filter writeback path
+    /// (read MSP_FILTER_CONFIG → mutate → write MSP_SET_FILTER_CONFIG)
+    /// when filter recs are non-empty. We accept either the "staged"
+    /// or "written" lines, or — for clean-tune fixtures with no recs
+    /// — the no-PID-recs banner.
     #[test]
     fn test_tune_simulator_apply_all_writes_filter_settings() {
         let blackbox_file = test_blackbox_file();
@@ -1191,13 +1193,12 @@ mod simulator_tests {
             .assert()
             .success()
             .stdout(
-                // The filter recs from the test BBL produce dyn_notch_*
-                // settings; alternatively if a rec set is empty for a
-                // particular fixture, accept the "no PID recommendations"
-                // path.
-                predicate::str::contains("filter setting(s) written")
-                    .or(predicate::str::contains("filter setting(s) staged"))
-                    .or(predicate::str::contains("No PID recommendations matched")),
+                predicate::str::contains("filter byte-mutation(s) written")
+                    .or(predicate::str::contains("filter byte-mutation(s) staged"))
+                    .or(predicate::str::contains(
+                        "no filter recs match priority gating",
+                    ))
+                    .or(predicate::str::contains("No PID recommendations to write")),
             );
     }
 
@@ -1219,7 +1220,7 @@ mod simulator_tests {
             .assert()
             .success()
             .stdout(predicate::str::contains("--skip-filters set"))
-            .stdout(predicate::str::contains("filter setting(s) written").not());
+            .stdout(predicate::str::contains("filter byte-mutation(s) written").not());
     }
 
     /// Without --auto-apply-safe or --apply-all, the writeback step should

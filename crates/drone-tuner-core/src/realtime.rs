@@ -975,16 +975,18 @@ impl FlightControllerConnection {
         let response = self
             .msp2_request(MspCommand::DataflashRead as u16, &payload)
             .await?;
-        Self::decode_dataflash_chunk(&response)
+        Self::decode_dataflash_chunk_v2(&response)
     }
 
-    /// Shared response decoder for both V1 and V2 dataflash read paths:
-    /// `[u32 echoed_offset, ..chunk_bytes]`.
+    /// V1 dataflash response decoder: `[u32 echoed_offset, ..chunk_bytes]`.
+    ///
+    /// Used for the legacy 4-byte-request path. The chunk size is fixed
+    /// at 128 bytes (Betaflight's `useLegacyFormat = true` branch).
     fn decode_dataflash_chunk(payload: &[u8]) -> Result<(u32, Vec<u8>)> {
         if payload.len() < 4 {
             return Err(DronetunerError::parse_error(
                 format!(
-                    "MSP_DATAFLASH_READ payload too short: {} bytes",
+                    "MSP_DATAFLASH_READ V1 payload too short: {} bytes",
                     payload.len()
                 ),
                 None,
@@ -993,6 +995,58 @@ impl FlightControllerConnection {
         let echoed =
             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         Ok((echoed, payload[4..].to_vec()))
+    }
+
+    /// V2 dataflash response decoder.
+    ///
+    /// When the request payload is ≥6 bytes (offset + chunk_size),
+    /// Betaflight's `serializeDataflashReadReply` (msp.c:523) emits the
+    /// "new format" response:
+    /// `[u32 echoed_offset, u16 read_len, u8 compression, ..chunk_bytes]`.
+    /// `compression` is always 0 in current Betaflight (`USE_HUFFMAN`
+    /// is gated and we don't request it in our request payload).
+    ///
+    /// Stripping only the 4-byte echo (the V1 layout) leaks 3 bytes of
+    /// `[read_len_lo, read_len_hi, 0x00]` into every received chunk —
+    /// that bug produced the `00 08 00` garbage at every 2051-byte
+    /// boundary in pulled BBLs and silently corrupted the parser's
+    /// view of session boundaries.
+    fn decode_dataflash_chunk_v2(payload: &[u8]) -> Result<(u32, Vec<u8>)> {
+        if payload.len() < 7 {
+            return Err(DronetunerError::parse_error(
+                format!(
+                    "MSP_DATAFLASH_READ V2 payload too short: {} bytes \
+                     (need ≥7 for echo+readLen+compression prefix)",
+                    payload.len()
+                ),
+                None,
+            ));
+        }
+        let echoed =
+            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let read_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+        // payload[6] is the compression flag; the firmware only uses
+        // it when USE_HUFFMAN is defined AND we requested compression
+        // (we never do). Silently discard it.
+        //
+        // Authoritative chunk length is read_len from the prefix; this
+        // can be less than `chunk_size` we requested when we hit the
+        // end of the flash volume. Use it instead of assuming the rest
+        // of the payload is data, in case the firmware also pads the
+        // tail in some legacy paths.
+        let data_start = 7;
+        let data_end = data_start + read_len;
+        if data_end > payload.len() {
+            return Err(DronetunerError::parse_error(
+                format!(
+                    "MSP_DATAFLASH_READ V2 prefix declared read_len={read_len} \
+                     but only {} bytes of data follow the 7-byte prefix",
+                    payload.len() - data_start
+                ),
+                None,
+            ));
+        }
+        Ok((echoed, payload[data_start..data_end].to_vec()))
     }
 
     /// Best-effort read of the FC's craft / pilot name (`MSP_NAME` / 10).
@@ -1112,8 +1166,23 @@ impl FlightControllerConnection {
                             continue;
                         }
                         if response.direction == MspMessageType::Error as u8 {
+                            // Surface any error payload bytes — Betaflight
+                            // sometimes returns an error code or echoes a
+                            // hint, and an empty payload means "FC rejected
+                            // without elaboration."
+                            let detail = if response.payload.is_empty() {
+                                "no payload (likely: unknown setting name, \
+                                 value out of range, or setting not writable \
+                                 in current FC state)".to_string()
+                            } else {
+                                format!(
+                                    "payload {} bytes: {:02x?}",
+                                    response.payload.len(),
+                                    response.payload
+                                )
+                            };
                             return Err(DronetunerError::communication_error(format!(
-                                "FC returned MSPv2 error for command 0x{expected_cmd:04x}"
+                                "FC returned MSPv2 error for command 0x{expected_cmd:04x} — {detail}"
                             )));
                         }
                         return Ok(response.payload);
@@ -1128,67 +1197,6 @@ impl FlightControllerConnection {
         Err(DronetunerError::communication_error(format!(
             "Timed out waiting for MSPv2 response to command 0x{expected_cmd:04x}"
         )))
-    }
-
-    /// Read a Betaflight setting by name (`MSP2_COMMON_GET_SETTING`).
-    ///
-    /// Returns the raw value bytes, LE-encoded according to the parameter's
-    /// registered type. Use [`Self::get_setting_u16`] / [`Self::get_setting_u8`]
-    /// for typed accessors.
-    pub async fn get_setting(&mut self, name: &str) -> Result<Vec<u8>> {
-        let mut payload = Vec::with_capacity(name.len() + 1);
-        payload.extend_from_slice(name.as_bytes());
-        payload.push(0); // null terminator
-        self.msp2_request(msp2::COMMON_GET_SETTING, &payload).await
-    }
-
-    /// Write a Betaflight setting by name (`MSP2_COMMON_SET_SETTING`).
-    ///
-    /// `value_bytes` must be encoded according to the setting's registered
-    /// type (LE-ordered for multi-byte integers). On unknown setting names
-    /// the FC replies with an error frame which we surface as `Err(...)`.
-    /// RAM-only — call [`Self::save_to_eeprom`] to persist.
-    pub async fn set_setting(&mut self, name: &str, value_bytes: &[u8]) -> Result<()> {
-        let mut payload = Vec::with_capacity(name.len() + 1 + value_bytes.len());
-        payload.extend_from_slice(name.as_bytes());
-        payload.push(0);
-        payload.extend_from_slice(value_bytes);
-        let _ack = self.msp2_request(msp2::COMMON_SET_SETTING, &payload).await?;
-        Ok(())
-    }
-
-    /// Convenience: read a u8 setting.
-    pub async fn get_setting_u8(&mut self, name: &str) -> Result<u8> {
-        let bytes = self.get_setting(name).await?;
-        if bytes.is_empty() {
-            return Err(DronetunerError::parse_error(
-                format!("Setting '{name}': empty response"),
-                None,
-            ));
-        }
-        Ok(bytes[0])
-    }
-
-    /// Convenience: read a u16 setting.
-    pub async fn get_setting_u16(&mut self, name: &str) -> Result<u16> {
-        let bytes = self.get_setting(name).await?;
-        if bytes.len() < 2 {
-            return Err(DronetunerError::parse_error(
-                format!("Setting '{name}': expected ≥2 bytes, got {}", bytes.len()),
-                None,
-            ));
-        }
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    /// Convenience: write a u8 setting.
-    pub async fn set_setting_u8(&mut self, name: &str, value: u8) -> Result<()> {
-        self.set_setting(name, &[value]).await
-    }
-
-    /// Convenience: write a u16 setting.
-    pub async fn set_setting_u16(&mut self, name: &str, value: u16) -> Result<()> {
-        self.set_setting(name, &value.to_le_bytes()).await
     }
 
     /// Stream the entire dataflash to memory.
@@ -1489,11 +1497,48 @@ pub struct FilterSnapshot {
     raw: Vec<u8>,
 }
 
+// Byte offsets for the Betaflight 4.5.x MSP_FILTER_CONFIG payload.
+// Source: src/main/msp/msp.c MSP_FILTER_CONFIG (read, line 1862) and
+// MSP_SET_FILTER_CONFIG (write, line 3035). The two layouts mirror
+// exactly. Total 49 bytes when USE_DYN_LPF + USE_DYN_NOTCH_FILTER +
+// USE_RPM_FILTER are all defined (vanilla 4.5 builds). Older or
+// stripped builds return shorter payloads — Betaflight reads/writes
+// incrementally with `if (sbufBytesRemaining(src) >= N)`, so trailing
+// fields just get dropped on shorter blobs. We mirror that on the
+// client by gating each typed setter on payload length and returning
+// an error when the field's offset is beyond the FC's payload.
+const OFF_GYRO_LPF1_LEGACY_U8: usize = 0;
+const OFF_DTERM_LPF1_HZ: usize = 1;
+const OFF_YAW_LPF_HZ: usize = 3;
+const OFF_DTERM_LPF1_TYPE: usize = 17;
+const OFF_GYRO_LPF1_HZ: usize = 20;
+const OFF_GYRO_LPF2_HZ: usize = 22;
+const OFF_GYRO_LPF1_TYPE: usize = 24;
+const OFF_GYRO_LPF2_TYPE: usize = 25;
+const OFF_DTERM_LPF2_HZ: usize = 26;
+const OFF_DTERM_LPF2_TYPE: usize = 28;
+const OFF_GYRO_LPF1_DYN_MIN_HZ: usize = 29;
+const OFF_GYRO_LPF1_DYN_MAX_HZ: usize = 31;
+const OFF_DTERM_LPF1_DYN_MIN_HZ: usize = 33;
+const OFF_DTERM_LPF1_DYN_MAX_HZ: usize = 35;
+const OFF_DYN_NOTCH_Q: usize = 39;
+const OFF_DYN_NOTCH_MIN_HZ: usize = 41;
+const OFF_RPM_FILTER_HARMONICS: usize = 43;
+const OFF_RPM_FILTER_MIN_HZ: usize = 44;
+const OFF_DYN_NOTCH_MAX_HZ: usize = 45;
+const OFF_DTERM_LPF1_DYN_EXPO: usize = 47;
+const OFF_DYN_NOTCH_COUNT: usize = 48;
+
+/// Length of a complete Betaflight 4.5 filter config payload (all
+/// USE_* features compiled in). Used for diagnostic output.
+pub const FILTER_CONFIG_FULL_LEN: usize = 49;
+
 impl FilterSnapshot {
     /// Parse a payload from an MSP FilterConfig response. Accepts any
-    /// length ≥ 6 bytes (the three u16 fields we read).
+    /// length ≥ 5 bytes (enough to cover the three baseline LPF cutoffs
+    /// at offsets 0..5 — every Betaflight build emits at least these).
     pub fn from_payload(payload: Vec<u8>) -> Result<Self> {
-        if payload.len() < 6 {
+        if payload.len() < 5 {
             return Err(DronetunerError::parse_error(
                 format!(
                     "MSP FilterConfig payload too short: {} bytes",
@@ -1511,37 +1556,182 @@ impl FilterSnapshot {
     }
 
     /// Mutable access to the underlying payload for advanced callers
-    /// that know their firmware's exact layout. The CLI does not use
-    /// this; it's here so the binary downstream of read → mutate → write
-    /// can do the mutate step without an unsafe transmute.
+    /// that know their firmware's exact layout. The typed setters
+    /// below are the supported way to mutate fields; this escape
+    /// hatch is here for forensic / one-off debugging.
     pub fn as_payload_mut(&mut self) -> &mut [u8] {
         &mut self.raw
     }
 
-    /// Gyro stage-1 lowpass cutoff in Hz (0 = disabled).
-    pub fn gyro_lpf1_hz(&self) -> u16 {
-        u16::from_le_bytes([self.raw[0], self.raw[1]])
-    }
-    /// D-term stage-1 lowpass cutoff in Hz (0 = disabled).
-    pub fn dterm_lpf1_hz(&self) -> u16 {
-        u16::from_le_bytes([self.raw[2], self.raw[3]])
-    }
-    /// Yaw lowpass cutoff in Hz (0 = disabled).
-    pub fn yaw_lpf_hz(&self) -> u16 {
-        u16::from_le_bytes([self.raw[4], self.raw[5]])
+    /// Total payload length the FC returned. Used to decide whether
+    /// late fields (dyn_notch_*, rpm_filter_*, etc.) are reachable.
+    pub fn payload_len(&self) -> usize {
+        self.raw.len()
     }
 
-    /// Set the gyro stage-1 lowpass cutoff in Hz.
-    pub fn set_gyro_lpf1_hz(&mut self, hz: u16) {
-        self.raw[0..2].copy_from_slice(&hz.to_le_bytes());
+    /// True when the payload is long enough to contain `dyn_notch_*`
+    /// fields (offsets 39..49). On Betaflight 4.5 vanilla builds this
+    /// is always true; stripped vendor builds may report shorter
+    /// payloads.
+    pub fn supports_dyn_notch(&self) -> bool {
+        self.raw.len() >= FILTER_CONFIG_FULL_LEN
+    }
+
+    fn read_u16(&self, off: usize) -> Option<u16> {
+        if off + 2 > self.raw.len() {
+            return None;
+        }
+        Some(u16::from_le_bytes([self.raw[off], self.raw[off + 1]]))
+    }
+
+    fn read_u8(&self, off: usize) -> Option<u8> {
+        self.raw.get(off).copied()
+    }
+
+    fn write_u16(&mut self, off: usize, v: u16, field: &'static str) -> Result<()> {
+        if off + 2 > self.raw.len() {
+            return Err(DronetunerError::communication_error(format!(
+                "filter field '{field}' requires payload ≥{} bytes, FC returned {}",
+                off + 2,
+                self.raw.len()
+            )));
+        }
+        self.raw[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+
+    fn write_u8(&mut self, off: usize, v: u8, field: &'static str) -> Result<()> {
+        if off >= self.raw.len() {
+            return Err(DronetunerError::communication_error(format!(
+                "filter field '{field}' requires payload ≥{} bytes, FC returned {}",
+                off + 1,
+                self.raw.len()
+            )));
+        }
+        self.raw[off] = v;
+        Ok(())
+    }
+
+    // -------- read accessors (Betaflight 4.5 layout) --------
+    //
+    // Note: byte 0 holds a legacy u8 representation of gyro_lpf1 that
+    // Betaflight 4.3+ overrides with the real u16 at offset 20-21.
+    // We expose the authoritative u16 by reading offset 20 when
+    // available, falling back to byte 0 otherwise.
+
+    /// Gyro stage-1 lowpass cutoff in Hz (0 = disabled).
+    pub fn gyro_lpf1_hz(&self) -> u16 {
+        self.read_u16(OFF_GYRO_LPF1_HZ)
+            .unwrap_or_else(|| self.read_u8(OFF_GYRO_LPF1_LEGACY_U8).unwrap_or(0) as u16)
+    }
+    /// Gyro stage-2 lowpass cutoff in Hz (0 = disabled).
+    pub fn gyro_lpf2_hz(&self) -> Option<u16> { self.read_u16(OFF_GYRO_LPF2_HZ) }
+    /// D-term stage-1 lowpass cutoff in Hz (0 = disabled).
+    pub fn dterm_lpf1_hz(&self) -> u16 { self.read_u16(OFF_DTERM_LPF1_HZ).unwrap_or(0) }
+    /// D-term stage-2 lowpass cutoff in Hz.
+    pub fn dterm_lpf2_hz(&self) -> Option<u16> { self.read_u16(OFF_DTERM_LPF2_HZ) }
+    /// Yaw lowpass cutoff in Hz (0 = disabled).
+    pub fn yaw_lpf_hz(&self) -> u16 { self.read_u16(OFF_YAW_LPF_HZ).unwrap_or(0) }
+    /// Dynamic notch count (number of running notches). `None` when
+    /// the FC's payload is too short to include this field.
+    pub fn dyn_notch_count(&self) -> Option<u8> { self.read_u8(OFF_DYN_NOTCH_COUNT) }
+    /// Dynamic notch Q-factor. `None` when payload too short.
+    pub fn dyn_notch_q(&self) -> Option<u16> { self.read_u16(OFF_DYN_NOTCH_Q) }
+    /// Lower bound of the dynamic-notch tracking range, Hz.
+    pub fn dyn_notch_min_hz(&self) -> Option<u16> { self.read_u16(OFF_DYN_NOTCH_MIN_HZ) }
+    /// Upper bound of the dynamic-notch tracking range, Hz.
+    pub fn dyn_notch_max_hz(&self) -> Option<u16> { self.read_u16(OFF_DYN_NOTCH_MAX_HZ) }
+
+    // -------- typed setters --------
+    //
+    // Every setter is fallible: if the FC returned a payload too
+    // short to cover the field's offset, the setter returns Err
+    // rather than silently writing nothing or panicking on bounds.
+    // The CLI surfaces these as "this field requires a longer
+    // filter config than your firmware exposes" diagnostics.
+
+    /// Set the gyro stage-1 lowpass cutoff. Writes both the legacy
+    /// u8 (offset 0) and the authoritative u16 (offset 20-21) so the
+    /// SET_FILTER_CONFIG decoder lands the right value regardless of
+    /// firmware vintage.
+    pub fn set_gyro_lpf1_hz(&mut self, hz: u16) -> Result<()> {
+        self.write_u8(
+            OFF_GYRO_LPF1_LEGACY_U8,
+            hz.min(255) as u8,
+            "gyro_lpf1_static_hz (legacy u8)",
+        )?;
+        self.write_u16(OFF_GYRO_LPF1_HZ, hz, "gyro_lpf1_static_hz")
+    }
+    /// Set the gyro LPF stage-1 filter type (0=PT1, 1=BIQUAD, ...).
+    pub fn set_gyro_lpf1_type(&mut self, t: u8) -> Result<()> {
+        self.write_u8(OFF_GYRO_LPF1_TYPE, t, "gyro_lpf1_type")
+    }
+    /// Set the gyro stage-2 lowpass cutoff in Hz.
+    pub fn set_gyro_lpf2_hz(&mut self, hz: u16) -> Result<()> {
+        self.write_u16(OFF_GYRO_LPF2_HZ, hz, "gyro_lpf2_static_hz")
+    }
+    /// Set the gyro LPF stage-2 filter type.
+    pub fn set_gyro_lpf2_type(&mut self, t: u8) -> Result<()> {
+        self.write_u8(OFF_GYRO_LPF2_TYPE, t, "gyro_lpf2_type")
+    }
+    /// Set the dynamic gyro LPF stage-1 min/max bounds in Hz.
+    pub fn set_gyro_lpf1_dyn(&mut self, min: u16, max: u16) -> Result<()> {
+        self.write_u16(OFF_GYRO_LPF1_DYN_MIN_HZ, min, "gyro_lpf1_dyn_min_hz")?;
+        self.write_u16(OFF_GYRO_LPF1_DYN_MAX_HZ, max, "gyro_lpf1_dyn_max_hz")
     }
     /// Set the D-term stage-1 lowpass cutoff in Hz.
-    pub fn set_dterm_lpf1_hz(&mut self, hz: u16) {
-        self.raw[2..4].copy_from_slice(&hz.to_le_bytes());
+    pub fn set_dterm_lpf1_hz(&mut self, hz: u16) -> Result<()> {
+        self.write_u16(OFF_DTERM_LPF1_HZ, hz, "dterm_lpf1_static_hz")
     }
-    /// Set the yaw lowpass cutoff in Hz.
-    pub fn set_yaw_lpf_hz(&mut self, hz: u16) {
-        self.raw[4..6].copy_from_slice(&hz.to_le_bytes());
+    /// Set the D-term LPF stage-1 filter type.
+    pub fn set_dterm_lpf1_type(&mut self, t: u8) -> Result<()> {
+        self.write_u8(OFF_DTERM_LPF1_TYPE, t, "dterm_lpf1_type")
+    }
+    /// Set the dynamic D-term LPF stage-1 min/max bounds in Hz.
+    pub fn set_dterm_lpf1_dyn(&mut self, min: u16, max: u16) -> Result<()> {
+        self.write_u16(OFF_DTERM_LPF1_DYN_MIN_HZ, min, "dterm_lpf1_dyn_min_hz")?;
+        self.write_u16(OFF_DTERM_LPF1_DYN_MAX_HZ, max, "dterm_lpf1_dyn_max_hz")
+    }
+    /// Set the dynamic D-term LPF expo curve (0..100).
+    pub fn set_dterm_lpf1_dyn_expo(&mut self, expo: u8) -> Result<()> {
+        self.write_u8(OFF_DTERM_LPF1_DYN_EXPO, expo, "dterm_lpf1_dyn_expo")
+    }
+    /// Set the D-term stage-2 lowpass cutoff in Hz.
+    pub fn set_dterm_lpf2_hz(&mut self, hz: u16) -> Result<()> {
+        self.write_u16(OFF_DTERM_LPF2_HZ, hz, "dterm_lpf2_static_hz")
+    }
+    /// Set the D-term LPF stage-2 filter type.
+    pub fn set_dterm_lpf2_type(&mut self, t: u8) -> Result<()> {
+        self.write_u8(OFF_DTERM_LPF2_TYPE, t, "dterm_lpf2_type")
+    }
+    /// Set the yaw lowpass cutoff in Hz (0 = disabled).
+    pub fn set_yaw_lpf_hz(&mut self, hz: u16) -> Result<()> {
+        self.write_u16(OFF_YAW_LPF_HZ, hz, "yaw_lowpass_hz")
+    }
+    /// Set the dynamic-notch count (0 disables).
+    pub fn set_dyn_notch_count(&mut self, n: u8) -> Result<()> {
+        self.write_u8(OFF_DYN_NOTCH_COUNT, n, "dyn_notch_count")
+    }
+    /// Set the dynamic-notch Q-factor.
+    pub fn set_dyn_notch_q(&mut self, q: u16) -> Result<()> {
+        self.write_u16(OFF_DYN_NOTCH_Q, q, "dyn_notch_q")
+    }
+    /// Set the dynamic-notch lower tracking bound in Hz.
+    pub fn set_dyn_notch_min_hz(&mut self, hz: u16) -> Result<()> {
+        self.write_u16(OFF_DYN_NOTCH_MIN_HZ, hz, "dyn_notch_min_hz")
+    }
+    /// Set the dynamic-notch upper tracking bound in Hz.
+    pub fn set_dyn_notch_max_hz(&mut self, hz: u16) -> Result<()> {
+        self.write_u16(OFF_DYN_NOTCH_MAX_HZ, hz, "dyn_notch_max_hz")
+    }
+    /// Set the RPM-filter harmonic count.
+    pub fn set_rpm_filter_harmonics(&mut self, h: u8) -> Result<()> {
+        self.write_u8(OFF_RPM_FILTER_HARMONICS, h, "rpm_filter_harmonics")
+    }
+    /// Note: `rpm_filter_min_hz` is a u8 in Betaflight 4.5's
+    /// FILTER_CONFIG payload (offset 44), not a u16.
+    pub fn set_rpm_filter_min_hz(&mut self, hz: u8) -> Result<()> {
+        self.write_u8(OFF_RPM_FILTER_MIN_HZ, hz, "rpm_filter_min_hz")
     }
 }
 
@@ -1823,22 +2013,6 @@ impl MspProtocol {
     }
 }
 
-/// Parse a Betaflight setting name out of a `MSP2_COMMON_*_SETTING` payload.
-///
-/// The wire format prefixes the value with a null-terminated ASCII name —
-/// e.g. `b"gyro_lpf1_static_hz\0\xfa\x00"` for "set gyro_lpf1_static_hz =
-/// 250". This finds the NUL byte and returns the leading name.
-fn parse_settings_name(payload: &[u8]) -> Result<String> {
-    let nul = payload
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| DronetunerError::parse_error("setting name missing NUL terminator", None))?;
-    let name = std::str::from_utf8(&payload[..nul]).map_err(|_| {
-        DronetunerError::parse_error("setting name is not valid UTF-8", None)
-    })?;
-    Ok(name.to_string())
-}
-
 /// MSPv2 uses CRC8/DVB-S2 (polynomial 0xD5, init 0, no reflection, no XOR-out)
 /// over the bytes from the flag byte through the end of the payload.
 fn crc8_dvb_s2(data: &[u8]) -> u8 {
@@ -1889,20 +2063,6 @@ pub struct MspV2Response {
     /// Direction byte. `>` = success response, `!` = error response.
     /// Callers should treat `!` as failure.
     pub direction: u8,
-}
-
-/// MSPv2 command codes we use directly.
-///
-/// These exceed u8 range so they can't live in [`MspCommand`]. They're
-/// dispatched via [`FlightControllerConnection::msp2_request`].
-pub mod msp2 {
-    /// `MSP2_COMMON_GET_SETTING`. Request payload: parameter name as a
-    /// null-terminated string. Response payload: value bytes encoded
-    /// according to the parameter's registered type.
-    pub const COMMON_GET_SETTING: u16 = 0x1003;
-    /// `MSP2_COMMON_SET_SETTING`. Request payload: parameter name as
-    /// a null-terminated string followed by the value bytes (LE).
-    pub const COMMON_SET_SETTING: u16 = 0x1004;
 }
 
 impl MspCommand {
@@ -2063,11 +2223,6 @@ pub struct SimulatorState {
     pub dataflash_chunk_size: usize,
     /// How many times DataflashErase has been received.
     pub dataflash_erases: usize,
-    /// Parameter-by-name table backing `MSP2_COMMON_GET/SET_SETTING`.
-    /// Values are stored as the raw LE-encoded bytes the FC's settings
-    /// table would emit. Seeded with sensible defaults for filter
-    /// settings on construction; tests may override per-key.
-    pub settings: std::collections::HashMap<String, Vec<u8>>,
 }
 
 impl SimulatorState {
@@ -2081,62 +2236,54 @@ impl SimulatorState {
     }
 
     fn default_filter_config() -> Vec<u8> {
-        // Plausible-shaped Betaflight 4.5 filter config blob. Real values
-        // would be derived from the firmware's serializer; we just need
-        // *some* bytes to round-trip in tests. First two u16 fields are
-        // gyro_lpf1_static_hz and dterm_lpf1_static_hz (both 0 = off).
-        let mut buf = vec![0u8; 32];
-        buf[0..2].copy_from_slice(&100u16.to_le_bytes()); // gyro lpf cutoff
-        buf[2..4].copy_from_slice(&100u16.to_le_bytes()); // dterm lpf cutoff
-        buf[4..6].copy_from_slice(&100u16.to_le_bytes()); // yaw lpf cutoff
+        // Faithful 49-byte Betaflight 4.5 MSP_FILTER_CONFIG payload.
+        // Offsets and types mirror src/main/msp/msp.c:1862 (read) and
+        // :3035 (write). Values are plausible defaults so round-trip
+        // tests don't have to reason about uninitialised garbage.
+        let mut buf = vec![0u8; FILTER_CONFIG_FULL_LEN];
+        // Offset 0: legacy u8 mirror of gyro_lpf1_static_hz. The
+        // authoritative u16 lives at offset 20-21; older firmware
+        // (<4.3) uses byte 0 instead.
+        buf[0] = 120;
+        // Offset 1-2: dterm_lpf1_static_hz = 150
+        buf[1..3].copy_from_slice(&150u16.to_le_bytes());
+        // Offset 3-4: yaw_lowpass_hz = 100
+        buf[3..5].copy_from_slice(&100u16.to_le_bytes());
+        // Offsets 5-16: static gyro/dterm notches — left zero (disabled)
+        // Offset 17: dterm_lpf1_type (PT1 = 0)
+        buf[17] = 0;
+        // Offset 18: gyro_hardware_lpf — left 0
+        // Offset 19: deprecated — left 0
+        // Offset 20-21: gyro_lpf1_static_hz = 120 (matches byte 0)
+        buf[20..22].copy_from_slice(&120u16.to_le_bytes());
+        // Offset 22-23: gyro_lpf2_static_hz = 0 (disabled)
+        // Offset 24: gyro_lpf1_type = 0 (PT1)
+        // Offset 25: gyro_lpf2_type = 0
+        // Offset 26-27: dterm_lpf2_static_hz = 150
+        buf[26..28].copy_from_slice(&150u16.to_le_bytes());
+        // Offset 28: dterm_lpf2_type = 0 (PT1)
+        // Offset 29-30 / 31-32: gyro_lpf1 dyn min/max (Betaflight default 250/500)
+        buf[29..31].copy_from_slice(&250u16.to_le_bytes());
+        buf[31..33].copy_from_slice(&500u16.to_le_bytes());
+        // Offset 33-34 / 35-36: dterm_lpf1 dyn min/max (defaults 75/150)
+        buf[33..35].copy_from_slice(&75u16.to_le_bytes());
+        buf[35..37].copy_from_slice(&150u16.to_le_bytes());
+        // Offset 37, 38: deprecated dyn_notch_range / width — left 0
+        // Offset 39-40: dyn_notch_q = 300
+        buf[39..41].copy_from_slice(&300u16.to_le_bytes());
+        // Offset 41-42: dyn_notch_min_hz = 100
+        buf[41..43].copy_from_slice(&100u16.to_le_bytes());
+        // Offset 43: rpm_filter_harmonics = 3
+        buf[43] = 3;
+        // Offset 44: rpm_filter_min_hz = 100 (u8 in 4.5)
+        buf[44] = 100;
+        // Offset 45-46: dyn_notch_max_hz = 600
+        buf[45..47].copy_from_slice(&600u16.to_le_bytes());
+        // Offset 47: dterm_lpf1_dyn_expo = 5
+        buf[47] = 5;
+        // Offset 48: dyn_notch_count = 3
+        buf[48] = 3;
         buf
-    }
-}
-
-impl SimulatorState {
-    /// Seed `settings` with plausible Betaflight 4.5 defaults for the filter
-    /// parameters the CLI manipulates. Callers can override per-key
-    /// afterwards.
-    fn default_settings() -> std::collections::HashMap<String, Vec<u8>> {
-        use std::collections::HashMap;
-        let mut s: HashMap<String, Vec<u8>> = HashMap::new();
-        // u16 settings — 2 LE bytes each.
-        let u16s: &[(&str, u16)] = &[
-            ("gyro_lpf1_static_hz", 250),
-            ("gyro_lpf1_dyn_min_hz", 250),
-            ("gyro_lpf1_dyn_max_hz", 500),
-            ("gyro_lpf2_static_hz", 500),
-            ("gyro_notch1_hz", 0),
-            ("gyro_notch1_cutoff", 0),
-            ("gyro_notch2_hz", 0),
-            ("gyro_notch2_cutoff", 0),
-            ("dyn_notch_min_hz", 100),
-            ("dyn_notch_max_hz", 600),
-            ("dterm_lpf1_static_hz", 150),
-            ("dterm_lpf1_dyn_min_hz", 75),
-            ("dterm_lpf1_dyn_max_hz", 150),
-            ("dterm_lpf2_static_hz", 150),
-            ("yaw_lowpass_hz", 100),
-            ("rpm_filter_min_hz", 100),
-            ("rpm_filter_q", 500),
-        ];
-        for (k, v) in u16s {
-            s.insert((*k).to_string(), v.to_le_bytes().to_vec());
-        }
-        // u8 settings — 1 byte each.
-        let u8s: &[(&str, u8)] = &[
-            ("gyro_lpf1_type", 0), // PT1
-            ("gyro_lpf2_type", 0), // PT1
-            ("dterm_lpf1_type", 0),
-            ("dterm_lpf2_type", 0),
-            ("dyn_notch_count", 3),
-            ("dyn_notch_q", 250),
-            ("rpm_filter_harmonics", 3),
-        ];
-        for (k, v) in u8s {
-            s.insert((*k).to_string(), vec![*v]);
-        }
-        s
     }
 }
 
@@ -2157,7 +2304,6 @@ impl Default for SimulatorState {
             // comfortable margin and still makes tests iterate.
             dataflash_chunk_size: 240,
             dataflash_erases: 0,
-            settings: Self::default_settings(),
         }
     }
 }
@@ -2242,9 +2388,10 @@ impl MspSimulator {
         }
     }
 
-    /// Handle an MSPv2 request. Currently routes
-    /// `MSP2_COMMON_GET_SETTING` and `MSP2_COMMON_SET_SETTING` against the
-    /// simulator's in-memory settings table.
+    /// Handle an MSPv2 request. Currently only `MSP_DATAFLASH_READ`
+    /// (cmd 71, encoded under V2 framing for the larger 6-byte request
+    /// shape) is routed here; everything else goes through the V1
+    /// `handle()` path.
     fn handle_v2(&self, req: &MspV2Response) -> Result<Vec<u8>> {
         // Dataflash reads under V2 use the 6-byte request format:
         // u32 offset + u16 chunk_size. Honour the requested size up to
@@ -2265,51 +2412,30 @@ impl MspSimulator {
             ]) as usize;
             let requested = u16::from_le_bytes([req.payload[4], req.payload[5]]) as usize;
             let state = self.state.lock().unwrap();
-            // Honour the client's requested chunk size. Real Betaflight
-            // caps at its firmware-defined maximum; the simulator just
-            // serves up to the remaining blob length.
-            let mut response = Vec::with_capacity(4 + requested);
-            response.extend_from_slice(&(offset as u32).to_le_bytes());
-            if offset < state.dataflash.len() {
+            // Mirror Betaflight's `serializeDataflashReadReply` (msp.c:523)
+            // new-format response when the request payload is ≥6 bytes
+            // (offset + chunk_size). Layout:
+            //   [u32 echoed_offset, u16 read_len, u8 compression, ..data]
+            // The simulator serves the requested chunk size up to the
+            // remaining blob length, with `compression` always 0
+            // (USE_HUFFMAN paths aren't exercised here).
+            let data: &[u8] = if offset < state.dataflash.len() {
                 let end = (offset + requested).min(state.dataflash.len());
-                response.extend_from_slice(&state.dataflash[offset..end]);
-            }
+                &state.dataflash[offset..end]
+            } else {
+                &[]
+            };
+            let mut response = Vec::with_capacity(7 + data.len());
+            response.extend_from_slice(&(offset as u32).to_le_bytes());
+            response.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            response.push(0); // compression flag
+            response.extend_from_slice(data);
             return Ok(response);
         }
-        match req.command {
-            msp2::COMMON_GET_SETTING => {
-                let name = parse_settings_name(&req.payload)?;
-                let state = self.state.lock().unwrap();
-                state.settings.get(&name).cloned().ok_or_else(|| {
-                    DronetunerError::communication_error(format!(
-                        "simulator: unknown setting '{name}'"
-                    ))
-                })
-            }
-            msp2::COMMON_SET_SETTING => {
-                let name = parse_settings_name(&req.payload)?;
-                let value_start = name.len() + 1;
-                if req.payload.len() < value_start {
-                    return Err(DronetunerError::parse_error(
-                        "simulator: SetSetting payload missing value",
-                        None,
-                    ));
-                }
-                let value = req.payload[value_start..].to_vec();
-                let mut state = self.state.lock().unwrap();
-                if !state.settings.contains_key(&name) {
-                    return Err(DronetunerError::communication_error(format!(
-                        "simulator: unknown setting '{name}'"
-                    )));
-                }
-                state.settings.insert(name, value);
-                Ok(Vec::new())
-            }
-            _ => Err(DronetunerError::communication_error(format!(
-                "simulator: unhandled MSPv2 command 0x{:04x}",
-                req.command
-            ))),
-        }
+        Err(DronetunerError::communication_error(format!(
+            "simulator: unhandled MSPv2 command 0x{:04x}",
+            req.command
+        )))
     }
 
     fn handle(&self, req: &MspResponse) -> Result<Vec<u8>> {
@@ -2666,9 +2792,12 @@ mod tests {
         let (mut conn, _state, handle) = pid_test_setup().await;
 
         let snapshot = conn.read_filter_config().await.expect("read_filter_config");
-        assert_eq!(snapshot.gyro_lpf1_hz(), 100);
-        assert_eq!(snapshot.dterm_lpf1_hz(), 100);
+        // Matches the simulator's seeded 4.5 default layout.
+        assert_eq!(snapshot.payload_len(), FILTER_CONFIG_FULL_LEN);
+        assert_eq!(snapshot.gyro_lpf1_hz(), 120);
+        assert_eq!(snapshot.dterm_lpf1_hz(), 150);
         assert_eq!(snapshot.yaw_lpf_hz(), 100);
+        assert_eq!(snapshot.dyn_notch_count(), Some(3));
 
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
@@ -2679,15 +2808,18 @@ mod tests {
         let (mut conn, state, handle) = pid_test_setup().await;
 
         let mut new_filter = conn.read_filter_config().await.unwrap();
-        new_filter.set_gyro_lpf1_hz(150);
-        new_filter.set_dterm_lpf1_hz(125);
+        new_filter.set_gyro_lpf1_hz(150).unwrap();
+        new_filter.set_dterm_lpf1_hz(125).unwrap();
         conn.write_filter_config(&new_filter)
             .await
             .expect("write_filter_config");
 
         let stored = state.lock().unwrap().filter_config.clone();
-        assert_eq!(&stored[0..2], &150u16.to_le_bytes());
-        assert_eq!(&stored[2..4], &125u16.to_le_bytes());
+        // 4.5 layout: gyro_lpf1 at offset 20-21 (legacy mirror at byte 0),
+        // dterm_lpf1 at offset 1-2.
+        assert_eq!(&stored[OFF_GYRO_LPF1_HZ..OFF_GYRO_LPF1_HZ + 2], &150u16.to_le_bytes());
+        assert_eq!(stored[OFF_GYRO_LPF1_LEGACY_U8], 150u8);
+        assert_eq!(&stored[OFF_DTERM_LPF1_HZ..OFF_DTERM_LPF1_HZ + 2], &125u16.to_le_bytes());
 
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
@@ -2700,7 +2832,7 @@ mod tests {
         state.lock().unwrap().fail_next_setfilter = true;
         let original = conn.read_filter_config().await.unwrap();
         let mut new_filter = original.clone();
-        new_filter.set_gyro_lpf1_hz(999);
+        new_filter.set_gyro_lpf1_hz(999).unwrap();
 
         let result = conn.apply_filter_with_rollback(&new_filter).await;
         assert!(result.is_err(), "apply must surface the write failure");
@@ -2897,76 +3029,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_msp2_set_setting_round_trip_via_simulator() {
-        let (client, server) = MockTransport::pair();
-        let sim = MspSimulator::new(Box::new(server));
-        let state = sim.state.clone();
-        let handle = tokio::spawn(sim.run());
-        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+    async fn test_filter_config_round_trip_via_simulator() {
+        // Read → mutate dyn_notch + gyro_lpf1 → apply_filter_with_rollback
+        // → re-read; assert mutated bytes match expected and that bytes
+        // we didn't touch (deprecated padding at 19/37/38) round-trip
+        // verbatim.
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let before = conn.read_filter_config().await.unwrap();
+        assert_eq!(
+            before.payload_len(),
+            FILTER_CONFIG_FULL_LEN,
+            "simulator should expose full 4.5 layout"
+        );
+        assert_eq!(before.dyn_notch_count(), Some(3));
+        assert_eq!(before.dyn_notch_min_hz(), Some(100));
+        assert_eq!(before.gyro_lpf1_hz(), 120);
+
+        let mut new_filter = before.clone();
+        new_filter.set_dyn_notch_count(1).unwrap();
+        new_filter.set_dyn_notch_min_hz(80).unwrap();
+        new_filter.set_dyn_notch_max_hz(550).unwrap();
+        new_filter.set_gyro_lpf1_hz(180).unwrap();
+
+        conn.apply_filter_with_rollback(&new_filter)
             .await
-            .unwrap();
+            .expect("apply succeeds on clean simulator");
 
-        // Default seed value
-        let before = conn.get_setting_u16("gyro_lpf1_static_hz").await.unwrap();
-        assert_eq!(before, 250);
-
-        conn.set_setting_u16("gyro_lpf1_static_hz", 175)
-            .await
-            .expect("set should succeed");
-
-        let after = conn.get_setting_u16("gyro_lpf1_static_hz").await.unwrap();
-        assert_eq!(after, 175);
-
-        // Simulator state mirror.
-        let stored = state
-            .lock()
-            .unwrap()
-            .settings
-            .get("gyro_lpf1_static_hz")
-            .cloned()
-            .unwrap();
-        assert_eq!(stored, 175u16.to_le_bytes());
+        let stored = state.lock().unwrap().filter_config.clone();
+        // Mutated bytes
+        assert_eq!(stored[OFF_DYN_NOTCH_COUNT], 1);
+        assert_eq!(&stored[OFF_DYN_NOTCH_MIN_HZ..OFF_DYN_NOTCH_MIN_HZ + 2], &80u16.to_le_bytes());
+        assert_eq!(&stored[OFF_DYN_NOTCH_MAX_HZ..OFF_DYN_NOTCH_MAX_HZ + 2], &550u16.to_le_bytes());
+        assert_eq!(&stored[OFF_GYRO_LPF1_HZ..OFF_GYRO_LPF1_HZ + 2], &180u16.to_le_bytes());
+        // Legacy mirror at byte 0 follows
+        assert_eq!(stored[OFF_GYRO_LPF1_LEGACY_U8], 180u8);
+        // Deprecated padding round-trips verbatim from the seeded default
+        assert_eq!(stored[19], 0);
+        assert_eq!(stored[37], 0);
+        assert_eq!(stored[38], 0);
+        // Unchanged seed values preserved
+        assert_eq!(&stored[OFF_DTERM_LPF1_HZ..OFF_DTERM_LPF1_HZ + 2], &150u16.to_le_bytes());
+        assert_eq!(&stored[OFF_YAW_LPF_HZ..OFF_YAW_LPF_HZ + 2], &100u16.to_le_bytes());
 
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
 
-    #[tokio::test]
-    async fn test_msp2_set_setting_unknown_name_is_error() {
-        let (client, server) = MockTransport::pair();
-        let sim = MspSimulator::new(Box::new(server));
-        let handle = tokio::spawn(sim.run());
-        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
-            .await
-            .unwrap();
-
-        let err = conn
-            .set_setting_u16("some_setting_that_does_not_exist", 42)
-            .await
-            .expect_err("simulator should error on unknown setting");
-        assert!(matches!(err, DronetunerError::CommunicationError { .. }));
-
-        drop(conn);
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    #[test]
+    fn test_filter_snapshot_short_payload_rejects_late_fields() {
+        // Pre-4.3 firmware returning only the first 21 bytes can't
+        // accommodate dyn_notch_* (which lives at offset 39+). Our
+        // setters must report this cleanly rather than panic on bounds.
+        let short = vec![0u8; 32];
+        let mut snap = FilterSnapshot::from_payload(short).unwrap();
+        // dyn_notch_min_hz needs offset 41 → 32 bytes too short.
+        assert!(snap.set_dyn_notch_min_hz(80).is_err());
+        assert!(snap.set_dyn_notch_count(1).is_err());
+        assert!(snap.set_rpm_filter_min_hz(50).is_err());
+        // dterm_lpf1 lives at offsets 1-2 → fits in 32 bytes.
+        assert!(snap.set_dterm_lpf1_hz(120).is_ok());
+        // yaw_lpf at offsets 3-4 → fits.
+        assert!(snap.set_yaw_lpf_hz(100).is_ok());
     }
 
-    #[tokio::test]
-    async fn test_msp2_get_setting_after_set_persists_through_handshake() {
-        // Tests that pre-existing V1 traffic (the handshake) doesn't
-        // confuse the V2 read path.
-        let (client, server) = MockTransport::pair();
-        let sim = MspSimulator::new(Box::new(server));
-        let handle = tokio::spawn(sim.run());
-        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
-            .await
-            .unwrap();
+    #[test]
+    fn test_filter_snapshot_preserves_unknown_bytes() {
+        // Marker bytes at every "preserve" offset round-trip after we
+        // mutate one known field — proves we don't accidentally clobber
+        // deprecated padding or fields the optimiser doesn't manage.
+        let mut buf = vec![0u8; FILTER_CONFIG_FULL_LEN];
+        for off in [18, 19, 37, 38] {
+            buf[off] = 0xAB;
+        }
+        // Mark one of the static notch slots too (we never mutate these).
+        buf[5..7].copy_from_slice(&123u16.to_le_bytes());
+        let mut snap = FilterSnapshot::from_payload(buf).unwrap();
+        snap.set_dyn_notch_count(2).unwrap();
 
-        conn.set_setting_u8("dyn_notch_count", 5).await.unwrap();
-        let v = conn.get_setting_u8("dyn_notch_count").await.unwrap();
-        assert_eq!(v, 5);
-
-        drop(conn);
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        let raw = snap.as_payload();
+        for off in [18, 19, 37, 38] {
+            assert_eq!(raw[off], 0xAB, "byte {off} must round-trip verbatim");
+        }
+        assert_eq!(&raw[5..7], &123u16.to_le_bytes(), "static notch hz preserved");
+        assert_eq!(raw[OFF_DYN_NOTCH_COUNT], 2, "intended mutation lands");
     }
 
     #[tokio::test]

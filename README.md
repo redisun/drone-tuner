@@ -17,8 +17,10 @@ power cycles.
 | PID and filter recommendations | Working, calibrated against real flights |
 | Step-response analysis | Working |
 | MSP read/write (PID, filter config, EEPROM) | Working on hardware (Jeno H743, TBS Source One F7) |
-| Filter writeback via MSP2_COMMON_SET_SETTING | Implemented + simulator-tested; real-hardware verification pending |
-| Onboard dataflash pull (`--pull-bbl`) | Implemented + simulator-tested; real-hardware verification pending |
+| Filter writeback via `MSP_FILTER_CONFIG` blob round-trip (cmd 92 + 93) | Validated against Betaflight 4.5.x source; simulator round-trip tests |
+| Onboard dataflash pull (`--pull-bbl`) | Validated on TBS Source One; ~50 KiB/s @ 115200 baud, V2 1 KB chunks |
+| Post-success dataflash erase (`--erase-after-pull`) | Erase only fires after pull + parse + apply all succeed |
+| Robust session selection across partially corrupt BBLs | Implemented (positional → raw idx mapping) |
 | Desktop GUI (Tauri) | Not started |
 | ML pattern recognition | Not started |
 | Tune marketplace | Not started |
@@ -41,60 +43,109 @@ Two sources are supported:
 With `--pull-bbl`, the tool issues `MSP_DATAFLASH_SUMMARY` (cmd 70) to
 get the chip's used/total bytes, then loops `MSP_DATAFLASH_READ` (cmd 71)
 until the whole blob is in memory. A live progress bar shows
-bytes/sec and ETA. The pulled bytes are written to a tempdir
-(`/tmp/drone-tuner-pull-<ts>.bbl`) — pass `--keep-bbl <PATH>` to land
-them somewhere persistent.
+bytes/sec and ETA.
 
-V1 framing caps each chunk at ~240 bytes, so a 4 MB log is ~17 000
-roundtrips. On real serial at 115 200 baud this is the slow part of the
-pipeline (tens of seconds).
+The default chunk size is **1024 bytes over MSPv2 framing** — proven
+across our test fleet without overrunning the FC's USB CDC TX buffer.
+`--pull-chunk-size 2048` (or up to 32768) experiments with larger
+chunks; `256` falls back to the V1-cap behaviour. On firmware that
+only speaks V1, the pull silently degrades to ~240-byte chunks.
+
+The pulled bytes are written to `/tmp/drone-tuner-pull-<craft>-<ts>.bbl`
+by default — the craft slug comes from `MSP_NAME` (cmd 10), so
+multi-quad logs don't collide. `--keep-bbl <PATH>` overrides the
+destination (file path is used verbatim; an existing directory gets a
+generated filename inside it).
+
+`--erase-after-pull` queues `MSP_DATAFLASH_ERASE` (cmd 72) **only after
+the entire tune flow succeeds** (pull + parse + analyse + apply). If
+anything downstream fails, the chip is left intact so you can re-pull.
 
 ### 2. Parse
 
 `SimpleBlackboxParser` walks the BBL header, picks the requested session
 (default: most recent; override with `--session N` or
 `--session-strategy {first,last,longest}`), and decodes the I/P frame
-stream into a `FlightSession`. Sample rate is derived from the looptime
-header.
+stream into a `FlightSession`.
 
-A spinner shows "parsing …" and the final line reports `parsed N samples
-(M ms)`.
+**Robust session selection.** A real BBL pulled from a chip that
+crashed mid-flush typically has a mix of clean and unparseable
+sessions. The detector enumerates *all* raw sessions, keeps the ones
+whose headers parse, and the strategy chooses among those. The chosen
+positional index is then translated back to its raw `file.iter()` idx
+before reading frames — earlier versions conflated those two index
+spaces and would happily try to parse session #4 when session #4 was
+exactly the corrupted one.
+
+**Sample-rate detection** has three fallbacks, in order:
+
+1. Frame-interval headers (`I_interval`, `P_interval`, `pid_process_denom`)
+   — the cheap and accurate path.
+2. `pid_rate` header directly.
+3. Frame timestamps: `frame_count / (max_time_raw - min_time_raw)`.
+   This rescues logs whose interval headers are truncated, which is
+   common on crashed-mid-flush dumps.
+
+If all three fail, a final `WARN` flags that frequency analysis may be
+inaccurate. A clean log produces no warnings.
 
 ### 3. Analyse
 
-`AnalysisEngine::analyze` runs three things in parallel-conceptually:
+`AnalysisEngine::analyze` runs two independent tracks; their outputs
+combine into a single `AnalysisReport`:
 
-1. **FFT (Welch's method)** on each gyro axis, 1024-sample windows with
-   50% overlap, hanning-windowed. Peaks are extracted from the resulting
-   PSD.
-2. **Oscillation classification.** Each peak is bucketed by frequency
-   band: < ~30 Hz is treated as flight dynamics, 30–80 Hz as P-term,
-   80–250 Hz as D-term, 250–500 Hz as mechanical/motor resonance.
-3. **Step-response detector** scans `rcCommand` for sticks crossing 30%
-   of full deflection within 50 ms. For each step it captures the
-   pre/post window, computes rise time, overshoot, settling time, and
-   steady-state error in deg/s.
+- **FFT track** answers *"is the quad resonating at any specific
+  frequency?"* → produces filter recommendations + the tune quality
+  score.
+- **Step-response track** answers *"how does the closed loop respond
+  to pilot input?"* → produces PID recommendations.
 
-The output is an `AnalysisReport` with PID and filter recommendations,
-each tagged with a priority (`Critical`/`High`/`Medium`/`Low`) and a
-plain-language reason. PID recs are derived from the step-response data
-when available, falling back to oscillation heuristics otherwise.
+Each peak/recommendation is tagged with a priority
+(`Critical`/`High`/`Medium`/`Low`) and a plain-language reason. See
+[How the algorithm works](#how-the-algorithm-works) below for the math.
 
-### 4. Display recommendations
+### 4. Display recommendations + findings
 
 The report is printed regardless of whether you intend to apply
 anything. Each rec has an icon, a "current → recommended" line, and a
 reason:
 
 ```
-🎛️ PID Adjustments:
-    🔴 Yaw P: 76.0 → 53.2
+PID Adjustments:
+    [H] Yaw P: 76.0 → 53.2
       Reason: Reduce P-term to decrease overshoot from 32.5% to target 15.0%
 
-🔧 Filter Adjustments:
-    🟡 Dynamic Notch: 1 notches, 16-500 Hz (Q: 10)
+Filter Adjustments:
+    [M] Dynamic Notch: 1 notches, 16-500 Hz (Q: 10)
       Expected 15.0% reduction in frame resonance by expanding dynamic notch range
 ```
+
+Priority tags: `[C]` Critical, `[H]` High, `[M]` Medium, `[L]` Low.
+
+**Even when no recs fire**, the analyser's findings are surfaced — so
+"no changes needed" reads as *measured silence* rather than ambiguous
+emptiness:
+
+```
+Tuning Recommendations:
+
+  ok  Tune quality: 100.0/100 — no changes needed
+
+  Step responses analyzed: 12 (5 roll, 5 pitch, 2 yaw)
+  Gyro spectrum (noise floor 0.0001):
+    Roll : no peaks above threshold
+    Pitch: no peaks above threshold
+    Yaw  : no peaks above threshold
+    measured silence — no oscillation peaks above noise floor
+  Active filters at log time:
+    Gyro LPF:    250 Hz (LowPass, order 2)
+    D-term LPF:  100 Hz (LowPass, order 2)
+    Dyn Notch:   150-600 Hz (Q=120)
+```
+
+Top-3 gyro peaks per axis, the noise floor, and the filter cutoffs
+that were active during the analysed log all show up here even when
+recs are non-empty — they're context for the recommendations above.
 
 ### 5. Apply (only with explicit opt-in)
 
@@ -130,49 +181,67 @@ see exactly where you are even when run under CI or with output piped
 to a file:
 
 ```
-✏️ ── Apply ──
-  ✓ connected: BTFL 4.5.1 (api 1.46.0, target STM32H743)
-  ✓ current: roll=(42, 85, 35) pitch=(46, 90, 38) yaw=(45, 90, 0)
-  📝 1 PID change(s) staged:
+== Apply ==
+  ok  connected: BTFL 4.5.1 (api 1.46.0, target STM32H743)
+  ok  current: roll=(42, 85, 35) pitch=(46, 90, 38) yaw=(45, 90, 0)
+  1 PID change(s) staged:
     Yaw   P/I/D: (45, 90, 0) → (53, 90, 0)
-  ✓ PIDs written; backup retained in memory
-  💾 backup → tune-backup-20260426-130045.json
-  ✓ changes persisted across power cycles
-📒 Tune logged to ~/.local/share/drone-tuner/history.jsonl
-  ✅ Tune complete.
+  ok  PIDs written; backup retained in memory
+  backup written to tune-backup-20260426-130045.json
+  ok  changes persisted across power cycles
+Tune logged to ~/.local/share/drone-tuner/history.jsonl
+  ok  Tune complete.
 ```
 
-### 6. Filter writeback (parameter-by-name)
+### 6. Filter writeback (binary blob round-trip)
 
-After PIDs are written, filter recommendations are also applied — but
-not via the binary `MSP_SET_FILTER_CONFIG` (cmd 93) blob, whose payload
-layout shifts between Betaflight 4.x versions. Instead, the CLI
-translates each `FilterRecommendation` into one or more
-`(setting_name, value_bytes)` writes and dispatches them via
-**`MSP2_COMMON_SET_SETTING`** (cmd `0x1004`) — the same name-based
-parameter interface Configurator's CLI uses. The FC resolves the name
-through its own settings table, so we don't have to track binary
-offsets per firmware version.
+After PIDs are written, filter recommendations are applied via
+**`MSP_FILTER_CONFIG`** (cmd 92, read) → mutate → **`MSP_SET_FILTER_CONFIG`**
+(cmd 93, write). The FC's authoritative filter blob is fetched first,
+the CLI mutates only the bytes the recommendations target, then writes
+the whole mutated blob back. `apply_filter_with_rollback` restores the
+pre-write snapshot if the FC nacks the write.
 
-Coverage:
+Why not parameter-by-name? Earlier versions tried `MSP2_COMMON_SET_SETTING`
+(cmd 0x1004) and failed every time on real hardware. **That command is
+not implemented in Betaflight 4.5.x** — verified at
+`/home/flo/workspace/github/betaflight` tag `4.5.1`: grepping
+`src/main/msp/` for `0x1003` / `0x1004` / `MSP2_COMMON_*_SETTING`
+returns zero hits. Configurator's CLI works because the CLI is a
+separate REPL on the FC, not an MSP path. The binary blob via cmd 92/93
+is the path Configurator uses for the Filters tab and is what the
+firmware actually accepts.
 
-- `gyro_lpf{1,2}_static_hz` + `gyro_lpf{1,2}_type`
-- `dterm_lpf{1,2}_static_hz`, `dterm_lpf1_dyn_min_hz`,
-  `dterm_lpf1_dyn_max_hz`, `dterm_lpf{1,2}_type`
+Fields the CLI knows how to mutate (Betaflight 4.5 layout, 49-byte
+payload):
+
+- `gyro_lpf{1,2}_static_hz`, `gyro_lpf{1,2}_type`, `gyro_lpf1_dyn_{min,max}_hz`
+- `dterm_lpf{1,2}_static_hz`, `dterm_lpf{1,2}_type`,
+  `dterm_lpf1_dyn_{min,max}_hz`, `dterm_lpf1_dyn_expo`
 - `yaw_lowpass_hz`
-- `dyn_notch_count`, `dyn_notch_min_hz`, `dyn_notch_max_hz`
-- `rpm_filter_harmonics`, `rpm_filter_min_hz`
+- `dyn_notch_count`, `dyn_notch_q`, `dyn_notch_min_hz`, `dyn_notch_max_hz`
+- `rpm_filter_harmonics`, `rpm_filter_min_hz` (u8 in 4.5)
 
-Skipped (encoding shifts too much across firmware versions):
+Bytes the CLI does *not* touch (deprecated padding, fields whose
+encoding shifts between firmware versions, static notch slots) round-
+trip verbatim from read → write. That's how the binary path stays
+version-safe for fields outside the known-stable set.
 
-- Notch Q-factor (`dyn_notch_q`, `rpm_filter_q`) — scale changes 4.x → 4.x
-- Static gyro notches (`gyro_notch{1,2}_hz`/`_cutoff`) — Hz/cutoff
-  derivation changes
+Stripped or older firmware: every setter is gated on payload length.
+A FC returning, say, 32 bytes of filter config (no dyn-notch / RPM
+filter section) gets the prefix mutations applied and the unsupported
+fields surfaced as a "FC's filter config payload too short" note. No
+brick risk. Pass `--skip-filters` to disable filter writeback entirely.
 
-Per-setting failures (e.g. an older firmware that doesn't recognise a
-name) are logged and the batch continues — one stale name doesn't take
-out the rest. Pass `--skip-filters` to opt out entirely and write only
-PIDs.
+### 7. Cleanup (only on full success, only if requested)
+
+When `--erase-after-pull` is set and the entire flow above completed
+without error, the tool reconnects briefly and queues
+`MSP_DATAFLASH_ERASE` (cmd 72). The chip acks immediately and finishes
+the wipe in the background. Skipped on `--dry-run`; skipped silently
+if the apply step never ran (e.g. analysis-only mode). The point is
+that a parse failure, an apply rollback, or any other downstream error
+will *not* destroy the BBL on the chip.
 
 ## Connection schemes
 
@@ -182,10 +251,11 @@ The `--connection` argument supports several forms:
   STM32 VCP (vid `0x0483`, what every Betaflight board enumerates as);
   falls back to any USB serial. Errors with the candidate list if more
   than one device is plugged in.
-- *(omitted)* with `--pull-bbl` / `--apply-all` / `--auto-apply-safe` →
-  same auto-discovery as `auto`. `--pull-bbl` hard-fails if no FC is
-  found (it has no fallback); apply flags soft-fail to analysis-only
-  mode so existing workflows aren't broken.
+- *(omit `--connection` entirely)* — when `--pull-bbl` /
+  `--apply-all` / `--auto-apply-safe` is set, the same auto-discovery
+  as `auto` runs implicitly. `--pull-bbl` hard-fails if no FC is found
+  (it has no fallback); apply flags soft-fail to analysis-only mode so
+  existing workflows aren't broken.
 - `/dev/ttyACM0`, `/dev/ttyUSB0`, `COM3` — bare device path → USB serial.
 - `serial:///dev/ttyACM0` — same thing, explicit scheme.
 - `simulator://` — in-process MSP simulator. Handshake works, PID
@@ -241,27 +311,141 @@ are deliberately paranoid:
 The history JSONL log gives you a paper trail per FC across every tune
 iteration, keyed on `board_id` + `target_name`.
 
+## How the algorithm works
+
+Two independent tracks feed the report. The FFT track scores
+oscillation severity and proposes filter changes; the step-response
+track grades closed-loop dynamics and proposes PID changes.
+
+```mermaid
+flowchart LR
+    BBL[Blackbox file] --> P[Parser]
+    P --> G[Gyro time-series]
+    P --> RC[rcCommand + setpoint]
+    G --> FFT[Welch PSD per axis]
+    FFT --> Peaks[Peak picking + Q-factor]
+    Peaks --> Class[Oscillation classification]
+    Class --> Filt[Filter recommendations]
+    Class --> Score[Tune quality score]
+    RC --> Step[Step detector]
+    Step --> Metrics[Rise / overshoot / settling / damping]
+    Metrics --> PID[PID recommendations]
+    Filt --> Report[AnalysisReport]
+    PID --> Report
+    Score --> Report
+```
+
+### FFT track
+
+**Welch's PSD** (`analysis.rs`):
+
+- 2048-sample windows, 50 % overlap, **Hann** windowing
+- Per window: `rustfft` forward FFT → `|X[k]|²` → accumulate → average
+- Bin resolution = `sample_rate / 2048` (≈2 Hz at 4 kHz logging)
+- Output: single-sided PSD over `0..N/2`
+
+Caveat: the current PSD lacks `Σw²` window-energy correction, so its
+magnitudes aren't strictly V²/Hz. Thresholds are calibrated against
+real flights rather than absolute units.
+
+**Peak detection:**
+
+- 3-point local maxima within 10–1000 Hz, amplitude > `0.1`
+- **Q-factor** = `f_peak / Δf_3dB`, where Δf is the bandwidth at
+  half-power (walk left/right from the peak)
+- **Noise floor** = **median** of the PSD vector — robust against the
+  peaks themselves
+
+**Filter optimiser** (`filters.rs`):
+
+- Peak with `Q > 10` → biquad notch at `f_peak`,
+  `Q_filter = max(Q_peak / 2, 5)` — a slightly broader notch than the
+  resonance, to absorb thermal/load drift
+- Existing gyro LPF cutoff *above* the highest problematic peak →
+  drop cutoff to `max(f_peak × 0.8, 50 Hz)`
+- Notch design uses RBJ biquad form; LPF uses bilinear-transformed
+  Butterworth (2-pole branch fully implemented)
+
+### Step-response track
+
+**Step detection** (`analysis/pid.rs`) — windowed, not single-sample
+delta:
+
+- 50 ms pre-window, 100 ms post-window, 300 ms refractory
+- Trigger when `|mean_post − mean_pre| > 0.10` AND
+  `pre_jitter < 0.05` AND `post_jitter < 0.10` (clean step, not noise)
+- RC normalised by 99th-percentile abs value (handles raw
+  Betaflight `[-500, 500]` and pre-normalised inputs uniformly)
+
+**Per step, measured:**
+
+| Metric | Definition |
+|---|---|
+| Rise time | 10 % → 90 % of expected gyro response |
+| Overshoot % | `(peak − baseline − expected) / |expected| × 100` |
+| Settling time | scan backwards; first sample outside ±2 % of expected |
+| Damping ratio | `exp(−π·OS / √(1 + π²·OS²))` (classical 2nd-order) |
+| Oscillation freq | zero-crossing rate of (gyro − mean) |
+| Steady-state error | tail (last 50 ms) on big clean steps only (`|Δstick| ≥ 0.30`, drift ≤ 0.10) |
+
+**PID recommendation rules:**
+
+- **P↓** if `avg_overshoot > 15 %` → reduce `(OS − 15) / 50`, capped 30 %
+- **P↑** if `rise_time > 150 ms AND overshoot < 5 %` → +10 %
+- **I↑** if ≥3 valid SS responses AND `avg_ss_error > 30 deg/s` → +10 %
+  (deliberately conservative; +20 % previously caused runaway recs)
+- **D↑** if `osc_freq > 10 Hz AND damping < 0.5` → +30 %
+- **D↓** if `settling > 500 ms AND osc_freq < 5 Hz` → -20 %
+- Hard caps: `P ≤ 80, I ≤ 180, D ≤ 60`
+
+When no `rcCommand` is available, a gyro-only fallback proposes
+amplitude-based attenuations (D × 0.8, P × 0.9) on the same
+oscillation cues.
+
+### Tune quality score
+
+Starts at **100.0**, subtracts:
+
+- P-term oscillation: `amplitude × 5`
+- D-term oscillation: `amplitude × 3`
+- Mechanical resonance: `amplitude × 10` (heaviest penalty)
+- Motor noise: `amplitude × 2`
+- Plus: if `avg_noise_floor > 1.0`, subtract `(avg_noise − 1.0) × 20`
+
+Clamped to `[0, 100]`. So **100 / 100 = no detected oscillations *and*
+noise floor ≤ 1.0** in PSD units. Step-response metrics are not
+currently part of the score (they only feed PID recs).
+
+### Known sharp edges
+
+- `expected_response = Δstick × 500` is hardcoded and ignores the
+  configured rates / super-rate. Small `Δstick` values can produce
+  apparent overshoots near -100 %. Tracked.
+- PSD lacks window-energy correction, so magnitude thresholds aren't
+  fully portable across logging rates.
+- Bilinear transform fully covers only the 2-pole branch; higher
+  orders silently degrade.
+
+These are flagged in `docs/PROJECT_ASSESSMENT.md` as roadmap items
+rather than active correctness bugs — the calibration-fixture suite
+catches regressions on real flights.
+
 ## Project layout
 
-```
-crates/
-├── drone-tuner-core/         # analysis library
-│   └── src/
-│       ├── analysis.rs       # FFT + oscillation detection + filter optimiser
-│       ├── analysis/pid.rs   # step-response analysis + PID recommendations
-│       ├── blackbox/         # custom Betaflight BBL parser
-│       ├── domain.rs         # FlightSession, AnalysisReport, recommendation types
-│       ├── filters.rs        # Butterworth / notch / biquad design
-│       ├── realtime.rs       # MSP framing, FlightControllerConnection, simulator
-│       └── error.rs
-└── drone-tuner-cli/          # binary `drone-tuner`
-    ├── src/main.rs
-    ├── src/history.rs        # ~/.local/share/drone-tuner/history.jsonl
-    └── tests/                # integration + command-specific suites
-
-test_data/                    # real .bbl fixtures used by calibration tests
-docs/                         # PRD, technical doc, project assessment
-```
+| Path | Purpose |
+|---|---|
+| `crates/drone-tuner-core/src/analysis.rs` | FFT + oscillation detection + filter optimiser |
+| `crates/drone-tuner-core/src/analysis/pid.rs` | Step-response analysis + PID recommendations |
+| `crates/drone-tuner-core/src/blackbox/` | Custom Betaflight BBL parser |
+| `crates/drone-tuner-core/src/domain.rs` | `FlightSession`, `AnalysisReport`, recommendation types |
+| `crates/drone-tuner-core/src/filters.rs` | Butterworth / notch / biquad design |
+| `crates/drone-tuner-core/src/realtime.rs` | MSP framing, `FlightControllerConnection`, simulator |
+| `crates/drone-tuner-core/src/error.rs` | Error types |
+| `crates/drone-tuner-cli/src/main.rs` | CLI entrypoint, all subcommands |
+| `crates/drone-tuner-cli/src/history.rs` | `~/.local/share/drone-tuner/history.jsonl` writer |
+| `crates/drone-tuner-cli/tests/` | Integration + command-specific suites |
+| `test_data/` | Real `.bbl` fixtures used by calibration tests |
+| `docs/` | PRD, technical doc, project assessment |
 
 There are **no Cargo feature flags**. `tune`, `monitor`, MSP serial,
 and the in-process `simulator://` simulator are all default-on.
@@ -316,3 +500,23 @@ cargo fmt
 - RustFFT for the FFT backbone
 - Betaflight for the blackbox format and MSP protocol
 - The FPV community
+
+## License
+
+Dual-licensed under either of:
+
+- [MIT](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in the work by you, as defined in
+the Apache-2.0 license, shall be dual-licensed as above without any
+additional terms or conditions.
+
+## Disclaimer
+
+This tool writes parameters that affect flight safety. Even with the
+read-before-write rollback safety net, every recommendation it produces
+is the output of a heuristic operating on noisy data. **Always inspect
+proposed changes, fly cautiously after a tune, and keep a Configurator
+backup of your known-good config.** No warranty.
