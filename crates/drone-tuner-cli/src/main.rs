@@ -247,6 +247,12 @@ struct TuneArgs {
     #[arg(long)]
     save_eeprom: bool,
 
+    /// Skip filter recommendations even when --auto-apply-safe / --apply-all
+    /// is set. By default filter recs are written via MSP2_COMMON_SET_SETTING
+    /// alongside PID recs; pass this flag to apply only PID changes.
+    #[arg(long)]
+    skip_filters: bool,
+
     /// Session selection strategy when multiple sessions are present.
     /// Options: last (default), first, longest.
     #[arg(long)]
@@ -1404,6 +1410,103 @@ async fn apply_pid_recommendations_via_fc(
         .context("PID writeback failed (any partial write was rolled back)")?;
     finish_step(write_pb, "PIDs written; backup retained in memory");
 
+    // Filter writeback via MSP2_COMMON_SET_SETTING (parameter-by-name).
+    // We translate each FilterRecommendationType into one or more
+    // (setting_name, value_bytes) pairs and apply them individually.
+    // Failures on a single setting (typically "unknown name" on an older
+    // firmware) are logged and we continue — this avoids one stale
+    // setting taking out the whole filter writeback batch.
+    let filter_priority_allows = |p: &drone_tuner_core::domain::Priority| {
+        if args.apply_all {
+            true
+        } else if args.auto_apply_safe {
+            matches!(
+                p,
+                drone_tuner_core::domain::Priority::Low | drone_tuner_core::domain::Priority::Medium
+            )
+        } else {
+            false
+        }
+    };
+    let mut filter_changes_applied = 0usize;
+    let mut filter_changes_failed = 0usize;
+    if !args.skip_filters && !report.filter_recommendations.is_empty() {
+        let mut all_changes: Vec<FilterSettingChange> = Vec::new();
+        let mut skip_notes: Vec<String> = Vec::new();
+        for rec in &report.filter_recommendations {
+            if !filter_priority_allows(&rec.priority) {
+                continue;
+            }
+            let (changes, skip) = filter_rec_to_settings(rec);
+            all_changes.extend(changes);
+            if let Some(note) = skip {
+                skip_notes.push(note);
+            }
+        }
+        // Dedupe by setting name (a later rec for the same setting wins).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        all_changes.reverse();
+        all_changes.retain(|c| seen.insert(c.name.clone()));
+        all_changes.reverse();
+
+        if all_changes.is_empty() {
+            if !skip_notes.is_empty() {
+                println!(
+                    "  {} filter recs surfaced but none auto-applicable on this build: {}",
+                    style("ℹ️").blue(),
+                    skip_notes.join("; ")
+                );
+            }
+        } else {
+            println!(
+                "  {} {} filter setting(s) staged:",
+                style("📝").yellow(),
+                all_changes.len()
+            );
+            for change in &all_changes {
+                println!("    {}", change.description);
+            }
+            let filter_pb = make_spinner(format!(
+                "writing {} filter setting(s) by name",
+                all_changes.len()
+            ));
+            for change in &all_changes {
+                match fc.set_setting(&change.name, &change.bytes).await {
+                    Ok(()) => filter_changes_applied += 1,
+                    Err(e) => {
+                        filter_changes_failed += 1;
+                        warn!(
+                            "Filter setting '{}' failed: {} (continuing with remaining settings)",
+                            change.name, e
+                        );
+                    }
+                }
+            }
+            let summary = if filter_changes_failed == 0 {
+                format!("{filter_changes_applied} filter setting(s) written")
+            } else {
+                format!(
+                    "{filter_changes_applied} written, {filter_changes_failed} failed (see warnings)"
+                )
+            };
+            finish_step(filter_pb, summary);
+        }
+        // Surface skipped variants so the user knows what wasn't covered.
+        if !skip_notes.is_empty() {
+            for note in skip_notes
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+            {
+                println!("  {} {}", style("ℹ️").blue(), note);
+            }
+        }
+    } else if args.skip_filters {
+        println!(
+            "  {} --skip-filters set — filter recs printed but not written.",
+            style("ℹ️").blue()
+        );
+    }
+
     // Persist backup to disk if requested.
     if let Some(maybe_path) = &args.backup {
         let path = maybe_path.clone().unwrap_or_else(|| {
@@ -1494,6 +1597,235 @@ fn record_history(
         info.target_name,
     );
     Ok(())
+}
+
+/// One Betaflight setting we want to write, as a `(name, value-bytes)`
+/// pair plus a human-readable label for stdout.
+///
+/// Built by [`filter_rec_to_settings`] so the apply path can drive
+/// `MSP2_COMMON_SET_SETTING` per-setting without caring about which
+/// `FilterRecommendationType` variant each came from.
+#[derive(Debug, Clone)]
+struct FilterSettingChange {
+    name: String,
+    bytes: Vec<u8>,
+    /// What this change does, in plain English. Printed in the output.
+    description: String,
+}
+
+impl FilterSettingChange {
+    fn u16(name: impl Into<String>, value: u16, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: value.to_le_bytes().to_vec(),
+            description: description.into(),
+        }
+    }
+    fn u8(name: impl Into<String>, value: u8, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: vec![value],
+            description: description.into(),
+        }
+    }
+}
+
+/// Map a Betaflight filter-type string ("PT1", "BIQUAD", "PT2", "PT3") to
+/// its `filterType_e` enum integer. Returns `None` for unknown types so
+/// the caller skips the filter-type setting and only writes the cutoff.
+fn filter_type_to_enum(name: &str) -> Option<u8> {
+    match name.to_ascii_uppercase().as_str() {
+        "PT1" => Some(0),
+        "BIQUAD" => Some(1),
+        "PT2" => Some(2),
+        "PT3" => Some(3),
+        _ => None,
+    }
+}
+
+/// Translate a single filter recommendation into the list of Betaflight
+/// settings writes that implement it. Returns `(changes, skip_reason)`:
+/// - `changes` is non-empty when we know how to encode the change safely.
+/// - `skip_reason` is `Some(...)` when we deliberately skip part or all of
+///   the rec because the encoding varies across firmware versions and we
+///   don't want to brick the FC.
+fn filter_rec_to_settings(
+    rec: &drone_tuner_core::domain::FilterRecommendation,
+) -> (Vec<FilterSettingChange>, Option<String>) {
+    use drone_tuner_core::domain::FilterRecommendationType::*;
+    match &rec.recommendation_type {
+        AdjustGyroLowpass {
+            stage,
+            recommended_cutoff,
+            filter_type,
+            ..
+        } => {
+            let prefix = format!("gyro_lpf{stage}");
+            let mut changes = vec![FilterSettingChange::u16(
+                format!("{prefix}_static_hz"),
+                recommended_cutoff.round().clamp(0.0, 65535.0) as u16,
+                format!(
+                    "{prefix}_static_hz → {:.0} Hz",
+                    recommended_cutoff
+                ),
+            )];
+            if let Some(ft) = filter_type_to_enum(filter_type) {
+                changes.push(FilterSettingChange::u8(
+                    format!("{prefix}_type"),
+                    ft,
+                    format!("{prefix}_type → {filter_type}"),
+                ));
+            }
+            (changes, None)
+        }
+        AdjustDtermLowpass {
+            stage,
+            recommended_cutoff,
+            filter_type,
+            dynamic_settings,
+            ..
+        } => {
+            let prefix = format!("dterm_lpf{stage}");
+            let mut changes = Vec::new();
+            // Static cutoff (only emitted if dynamic isn't being set).
+            if let Some(cutoff) = recommended_cutoff {
+                if dynamic_settings.is_none() {
+                    changes.push(FilterSettingChange::u16(
+                        format!("{prefix}_static_hz"),
+                        cutoff.round().clamp(0.0, 65535.0) as u16,
+                        format!("{prefix}_static_hz → {:.0} Hz", cutoff),
+                    ));
+                    // Disable dynamic by zeroing both bounds.
+                    changes.push(FilterSettingChange::u16(
+                        format!("{prefix}_dyn_min_hz"),
+                        0,
+                        format!("{prefix}_dyn_min_hz → 0 (disable dynamic)"),
+                    ));
+                    changes.push(FilterSettingChange::u16(
+                        format!("{prefix}_dyn_max_hz"),
+                        0,
+                        format!("{prefix}_dyn_max_hz → 0 (disable dynamic)"),
+                    ));
+                }
+            }
+            if let Some(d) = dynamic_settings {
+                changes.push(FilterSettingChange::u16(
+                    format!("{prefix}_dyn_min_hz"),
+                    d.min_cutoff.round().clamp(0.0, 65535.0) as u16,
+                    format!("{prefix}_dyn_min_hz → {:.0} Hz", d.min_cutoff),
+                ));
+                changes.push(FilterSettingChange::u16(
+                    format!("{prefix}_dyn_max_hz"),
+                    d.max_cutoff.round().clamp(0.0, 65535.0) as u16,
+                    format!("{prefix}_dyn_max_hz → {:.0} Hz", d.max_cutoff),
+                ));
+            }
+            if let Some(ft) = filter_type_to_enum(filter_type) {
+                changes.push(FilterSettingChange::u8(
+                    format!("{prefix}_type"),
+                    ft,
+                    format!("{prefix}_type → {filter_type}"),
+                ));
+            }
+            (changes, None)
+        }
+        AdjustYawLowpass {
+            recommended_cutoff, ..
+        } => {
+            let v = recommended_cutoff.round().clamp(0.0, 65535.0) as u16;
+            (
+                vec![FilterSettingChange::u16(
+                    "yaw_lowpass_hz",
+                    v,
+                    format!("yaw_lowpass_hz → {v} Hz"),
+                )],
+                None,
+            )
+        }
+        AdjustDynamicNotch {
+            notch_count,
+            min_freq,
+            max_freq,
+            enabled,
+            ..
+        } => {
+            // Skip dyn_notch_q for now: its encoding (raw vs Q*100) shifts
+            // between Betaflight 4.x versions and we don't yet probe the
+            // FC for its semantics. The min/max/count cover the high-leverage
+            // changes safely.
+            let mut changes = if *enabled {
+                vec![
+                    FilterSettingChange::u8(
+                        "dyn_notch_count",
+                        *notch_count,
+                        format!("dyn_notch_count → {notch_count}"),
+                    ),
+                    FilterSettingChange::u16(
+                        "dyn_notch_min_hz",
+                        min_freq.round().clamp(0.0, 65535.0) as u16,
+                        format!("dyn_notch_min_hz → {:.0} Hz", min_freq),
+                    ),
+                    FilterSettingChange::u16(
+                        "dyn_notch_max_hz",
+                        max_freq.round().clamp(0.0, 65535.0) as u16,
+                        format!("dyn_notch_max_hz → {:.0} Hz", max_freq),
+                    ),
+                ]
+            } else {
+                vec![FilterSettingChange::u8(
+                    "dyn_notch_count",
+                    0,
+                    "dyn_notch_count → 0 (disable)".to_string(),
+                )]
+            };
+            // Sort so the order is deterministic across runs (helps tests
+            // and history diffs).
+            changes.sort_by(|a, b| a.name.cmp(&b.name));
+            (
+                changes,
+                Some("Q-factor unchanged (encoding varies by firmware)".to_string()),
+            )
+        }
+        ConfigureRpmFilter {
+            harmonics,
+            min_freq,
+            enabled,
+            ..
+        } => {
+            let changes = if *enabled {
+                vec![
+                    FilterSettingChange::u8(
+                        "rpm_filter_harmonics",
+                        *harmonics,
+                        format!("rpm_filter_harmonics → {harmonics}"),
+                    ),
+                    FilterSettingChange::u16(
+                        "rpm_filter_min_hz",
+                        min_freq.round().clamp(0.0, 65535.0) as u16,
+                        format!("rpm_filter_min_hz → {:.0} Hz", min_freq),
+                    ),
+                ]
+            } else {
+                vec![FilterSettingChange::u8(
+                    "rpm_filter_harmonics",
+                    0,
+                    "rpm_filter_harmonics → 0 (disable)".to_string(),
+                )]
+            };
+            (
+                changes,
+                Some("Q-factor unchanged (encoding varies by firmware)".to_string()),
+            )
+        }
+        ConfigureGyroNotch { .. } => (
+            Vec::new(),
+            Some(
+                "Static gyro notches use a Hz/cutoff pair whose Q derivation \
+                 changed between firmware versions; not auto-applied yet."
+                    .to_string(),
+            ),
+        ),
+    }
 }
 
 /// Translate a list of [`PidRecommendation`]s onto a [`PidSnapshot`] in
@@ -2753,6 +3085,7 @@ mod tests {
             auto_apply_safe: auto,
             apply_all: all,
             save_eeprom: false,
+            skip_filters: false,
             session_strategy: None,
         }
     }

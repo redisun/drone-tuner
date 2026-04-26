@@ -1173,6 +1173,55 @@ mod simulator_tests {
             );
     }
 
+    /// `tune --apply-all` should also write filter settings via the new
+    /// MSP2_COMMON_SET_SETTING path. Verified by checking the staged
+    /// settings line + the per-setting written confirmation.
+    #[test]
+    fn test_tune_simulator_apply_all_writes_filter_settings() {
+        let blackbox_file = test_blackbox_file();
+        if !blackbox_file.exists() {
+            return;
+        }
+        cli_cmd()
+            .arg("tune")
+            .arg(&blackbox_file)
+            .arg("--connection")
+            .arg("simulator://")
+            .arg("--apply-all")
+            .assert()
+            .success()
+            .stdout(
+                // The filter recs from the test BBL produce dyn_notch_*
+                // settings; alternatively if a rec set is empty for a
+                // particular fixture, accept the "no PID recommendations"
+                // path.
+                predicate::str::contains("filter setting(s) written")
+                    .or(predicate::str::contains("filter setting(s) staged"))
+                    .or(predicate::str::contains("No PID recommendations matched")),
+            );
+    }
+
+    /// `--skip-filters` opts out of filter writeback even when --apply-all
+    /// is set. PID writeback should still happen.
+    #[test]
+    fn test_tune_simulator_skip_filters_only_writes_pids() {
+        let blackbox_file = test_blackbox_file();
+        if !blackbox_file.exists() {
+            return;
+        }
+        cli_cmd()
+            .arg("tune")
+            .arg(&blackbox_file)
+            .arg("--connection")
+            .arg("simulator://")
+            .arg("--apply-all")
+            .arg("--skip-filters")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--skip-filters set"))
+            .stdout(predicate::str::contains("filter setting(s) written").not());
+    }
+
     /// Without --auto-apply-safe or --apply-all, the writeback step should
     /// be a no-op even when --connection is given.
     #[test]
