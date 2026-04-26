@@ -1,6 +1,6 @@
 //! Benchmarks for blackbox parsing performance.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use drone_tuner_core::BlackboxParser;
 
 /// Generate synthetic blackbox data for benchmarking
@@ -116,8 +116,8 @@ fn bench_parsing_file_sizes(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("frames", frame_count), &data, |b, data| {
             b.iter(|| {
                 let mut parser = BlackboxParser::new();
-                let result = parser.parse_file(black_box(data));
-                black_box(result)
+                let result = parser.parse_file(std::hint::black_box(data));
+                std::hint::black_box(result)
             });
         });
     }
@@ -138,16 +138,16 @@ fn bench_compression_impact(c: &mut Criterion) {
     group.bench_function("uncompressed", |b| {
         b.iter(|| {
             let mut parser = BlackboxParser::new();
-            let result = parser.parse_file(black_box(&uncompressed_data));
-            black_box(result)
+            let result = parser.parse_file(std::hint::black_box(&uncompressed_data));
+            std::hint::black_box(result)
         });
     });
 
     group.bench_function("compressed", |b| {
         b.iter(|| {
             let mut parser = BlackboxParser::new();
-            let result = parser.parse_file(black_box(&compressed_data));
-            black_box(result)
+            let result = parser.parse_file(std::hint::black_box(&compressed_data));
+            std::hint::black_box(result)
         });
     });
 
@@ -177,8 +177,8 @@ fn bench_field_count_impact(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("fields", field_count), &data, |b, data| {
             b.iter(|| {
                 let mut parser = BlackboxParser::new();
-                let result = parser.parse_file(black_box(data));
-                black_box(result)
+                let result = parser.parse_file(std::hint::black_box(data));
+                std::hint::black_box(result)
             });
         });
     }
@@ -203,8 +203,8 @@ fn bench_memory_allocation(c: &mut Criterion) {
             |b, data| {
                 b.iter(|| {
                     let mut parser = BlackboxParser::new();
-                    let result = parser.parse_file(black_box(data));
-                    black_box(result)
+                    let result = parser.parse_file(std::hint::black_box(data));
+                    std::hint::black_box(result)
                 });
             },
         );
@@ -250,8 +250,8 @@ fn bench_error_handling(c: &mut Criterion) {
             |b, data| {
                 b.iter(|| {
                     let mut parser = BlackboxParser::new();
-                    let result = parser.parse_file(black_box(data));
-                    black_box(result)
+                    let result = parser.parse_file(std::hint::black_box(data));
+                    std::hint::black_box(result)
                 });
             },
         );
@@ -279,10 +279,10 @@ fn bench_batch_parsing(c: &mut Criterion) {
 
     group.bench_function("sequential_batch", |b| {
         b.iter(|| {
-            for file_data in black_box(&files) {
+            for file_data in std::hint::black_box(&files) {
                 let mut parser = BlackboxParser::new();
                 let result = parser.parse_file(file_data);
-                black_box(result);
+                let _ = std::hint::black_box(result);
             }
         });
     });
@@ -291,9 +291,9 @@ fn bench_batch_parsing(c: &mut Criterion) {
     group.bench_function("reused_parser", |b| {
         b.iter(|| {
             let mut parser = BlackboxParser::new();
-            for file_data in black_box(&files) {
+            for file_data in std::hint::black_box(&files) {
                 let result = parser.parse_file(file_data);
-                black_box(result);
+                let _ = std::hint::black_box(result);
                 // In a real implementation, we'd have parser.reset() here
             }
         });
@@ -333,8 +333,8 @@ fn bench_variable_byte_parsing(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("vb_type", name), &data, |b, data| {
             b.iter(|| {
                 let mut parser = BlackboxParser::new();
-                let result = parser.parse_file(black_box(data));
-                black_box(result)
+                let result = parser.parse_file(std::hint::black_box(data));
+                std::hint::black_box(result)
             });
         });
     }

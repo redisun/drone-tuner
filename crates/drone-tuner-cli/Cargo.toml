@@ -44,3 +44,8 @@ chrono = { workspace = true }
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
+serde_json = { workspace = true }
+
+[features]
+default = []
+realtime = ["drone-tuner-core/realtime"]

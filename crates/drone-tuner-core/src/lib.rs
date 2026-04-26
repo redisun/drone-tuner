@@ -38,7 +38,6 @@
 
 pub mod analysis;
 pub mod blackbox;
-// mod blackbox_old; // Old implementation for reference - disabled to avoid conflicts
 pub mod domain;
 pub mod error;
 pub mod filters;

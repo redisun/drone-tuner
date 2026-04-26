@@ -124,21 +124,35 @@ impl Default for ParsingConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum BlackboxError {
     #[error("Invalid blackbox format: {0}")]
+    /// Invalid or unrecognized blackbox file format
     InvalidFormat(String),
 
     #[error("Unsupported blackbox version: {0}")]
+    /// Blackbox version is not supported by this parser
     UnsupportedVersion(String),
 
     #[error("Missing required fields: {missing_fields:?}")]
-    MissingFields { missing_fields: Vec<String> },
+    /// Required fields are missing from the blackbox data
+    MissingFields {
+        /// List of missing field names
+        missing_fields: Vec<String>
+    },
 
     #[error("Data corruption detected at frame {frame_index}: {details}")]
-    DataCorruption { frame_index: u64, details: String },
+    /// Data corruption detected during parsing
+    DataCorruption {
+        /// Frame index where corruption was detected
+        frame_index: u64,
+        /// Details about the corruption
+        details: String
+    },
 
     #[error("IO error: {0}")]
+    /// I/O error occurred during file operations
     Io(#[from] std::io::Error),
 
     #[error("Parsing error: {0}")]
+    /// Generic parsing error
     Parse(String),
 }
 

@@ -621,22 +621,86 @@ pub struct FilterRecommendation {
     pub priority: Priority,
 }
 
-/// Types of filter recommendations
+/// Types of filter recommendations that match Betaflight's filter configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterRecommendationType {
-    /// Add a notch filter
-    AddNotchFilter,
-    /// Adjust low-pass filter cutoff
-    AdjustLowPassCutoff {
-        /// Current cutoff
-        current: f32,
-        /// Recommended cutoff
-        recommended: f32,
+    /// Adjust gyro lowpass filter settings
+    AdjustGyroLowpass {
+        /// Which stage (1 or 2)
+        stage: u8,
+        /// Current cutoff frequency
+        current_cutoff: f32,
+        /// Recommended cutoff frequency
+        recommended_cutoff: f32,
+        /// Filter type (PT1, BIQUAD, etc.)
+        filter_type: String,
     },
-    /// Enable dynamic notch
-    EnableDynamicNotch,
-    /// Remove unnecessary filtering
-    ReduceFiltering,
+    /// Configure gyro notch filter
+    ConfigureGyroNotch {
+        /// Which notch filter (1 or 2)
+        notch_number: u8,
+        /// Center frequency
+        frequency: f32,
+        /// Q factor
+        q_factor: f32,
+        /// Enable or disable
+        enabled: bool,
+    },
+    /// Adjust dynamic notch filter settings
+    AdjustDynamicNotch {
+        /// Number of notches
+        notch_count: u8,
+        /// Q factor
+        q_factor: f32,
+        /// Minimum frequency
+        min_freq: f32,
+        /// Maximum frequency
+        max_freq: f32,
+        /// Enable or disable
+        enabled: bool,
+    },
+    /// Configure RPM filter
+    ConfigureRpmFilter {
+        /// Number of harmonics (0-3)
+        harmonics: u8,
+        /// Q factor
+        q_factor: f32,
+        /// Minimum frequency
+        min_freq: f32,
+        /// Enable or disable
+        enabled: bool,
+    },
+    /// Adjust D-term lowpass filter
+    AdjustDtermLowpass {
+        /// Which stage (1 or 2)
+        stage: u8,
+        /// Current cutoff (None if dynamic)
+        current_cutoff: Option<f32>,
+        /// Recommended cutoff (None if should be dynamic)
+        recommended_cutoff: Option<f32>,
+        /// Filter type (PT1, BIQUAD)
+        filter_type: String,
+        /// Dynamic mode settings
+        dynamic_settings: Option<DynamicFilterSettings>,
+    },
+    /// Adjust yaw lowpass filter
+    AdjustYawLowpass {
+        /// Current cutoff
+        current_cutoff: f32,
+        /// Recommended cutoff
+        recommended_cutoff: f32,
+    },
+}
+
+/// Dynamic filter settings for D-term filters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicFilterSettings {
+    /// Minimum cutoff frequency
+    pub min_cutoff: f32,
+    /// Maximum cutoff frequency
+    pub max_cutoff: f32,
+    /// Dynamic curve expo value
+    pub expo: f32,
 }
 
 /// PID configuration recommendations

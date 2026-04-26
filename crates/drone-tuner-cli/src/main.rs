@@ -4,9 +4,11 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use console::{style, Term};
 use drone_tuner_core::{AnalysisEngine, BlackboxParser, FlightSession};
+use drone_tuner_core::domain::{Priority, FilterRecommendationType};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::time::Instant;
+
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
@@ -25,8 +27,8 @@ struct Cli {
     detailed_info: bool,
 
     /// Output format
-    #[arg(short, long, value_enum, global = true, default_value = "pretty")]
-    output: OutputFormat,
+    #[arg(short = 'f', long = "output-format", value_enum, global = true, default_value = "pretty")]
+    output_format: OutputFormat,
 
     #[command(subcommand)]
     command: Commands,
@@ -52,6 +54,12 @@ enum Commands {
     Compare(CompareArgs),
     /// Validate blackbox file format
     Validate(ValidateArgs),
+    /// Connect to flight controller for real-time monitoring
+    Monitor(MonitorArgs),
+    /// Auto-tune PID parameters based on analysis
+    Tune(TuneArgs),
+    /// Export analysis results in various formats
+    Export(ExportArgs),
     /// Show version and system information
     Info,
 }
@@ -125,6 +133,78 @@ struct ValidateArgs {
     check_issues: bool,
 }
 
+/// Arguments for the monitor command
+#[derive(Args)]
+struct MonitorArgs {
+    /// Connection string (e.g., /dev/ttyUSB0 or COM3)
+    #[arg(value_name = "CONNECTION")]
+    connection: String,
+
+    /// Update rate in Hz
+    #[arg(long, default_value = "100")]
+    rate: u32,
+
+    /// Duration to monitor in seconds (0 = infinite)
+    #[arg(long, default_value = "0")]
+    duration: u64,
+
+    /// Fields to monitor (comma-separated: gyro,accel,motors,pid_error,rc,battery,cpu,loop_time)
+    #[arg(long, default_value = "gyro,pid_error")]
+    fields: String,
+
+    /// Log telemetry to file
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+}
+
+/// Arguments for the tune command
+#[derive(Args)]
+struct TuneArgs {
+    /// Path to blackbox file to analyze for tuning
+    #[arg(value_name = "FILE")]
+    input: PathBuf,
+
+    /// Connection string for applying changes
+    #[arg(long, value_name = "CONNECTION")]
+    connection: Option<String>,
+
+    /// Only show recommendations without applying
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Backup current settings before applying changes
+    #[arg(long)]
+    backup: bool,
+
+    /// Automatically apply low-risk recommendations
+    #[arg(long)]
+    auto_apply_safe: bool,
+}
+
+/// Arguments for the export command
+#[derive(Args)]
+struct ExportArgs {
+    /// Path to blackbox file or analysis results
+    #[arg(value_name = "FILE")]
+    input: PathBuf,
+
+    /// Output file path
+    #[arg(short, long, value_name = "FILE")]
+    output: PathBuf,
+
+    /// Export format (matlab, python, csv, json)
+    #[arg(long, default_value = "csv")]
+    format: String,
+
+    /// Include raw telemetry data
+    #[arg(long)]
+    include_raw: bool,
+
+    /// Include frequency analysis results
+    #[arg(long)]
+    include_fft: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -134,9 +214,12 @@ async fn main() -> Result<()> {
 
     // Execute the command
     match cli.command {
-        Commands::Analyze(args) => analyze_command(args, cli.output, cli.detailed_info).await,
-        Commands::Compare(args) => compare_command(args, cli.output).await,
-        Commands::Validate(args) => validate_command(args, cli.output).await,
+        Commands::Analyze(args) => analyze_command(args, cli.output_format, cli.detailed_info).await,
+        Commands::Compare(args) => compare_command(args, cli.output_format).await,
+        Commands::Validate(args) => validate_command(args, cli.output_format).await,
+        Commands::Monitor(args) => monitor_command(args, cli.output_format).await,
+        Commands::Tune(args) => tune_command(args, cli.output_format).await,
+        Commands::Export(args) => export_command(args, cli.output_format).await,
         Commands::Info => info_command().await,
     }
 }
@@ -500,6 +583,302 @@ async fn validate_single_file(file_path: &PathBuf, check_issues: bool) -> Result
     Ok(issues)
 }
 
+/// Handle the monitor command
+async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Result<()> {
+    #[cfg(feature = "realtime")]
+    {
+        use drone_tuner_core::realtime::*;
+        use std::time::Duration;
+
+        println!("🔗 Connecting to flight controller at {}", _args.connection);
+
+        // Parse fields to monitor
+        let fields: Vec<&str> = _args.fields.split(',').map(|s| s.trim()).collect();
+        let mut telemetry_fields = Vec::new();
+
+        for field in &fields {
+            match *field {
+                "gyro" => telemetry_fields.push(TelemetryField::Gyro),
+                "accel" => telemetry_fields.push(TelemetryField::Accelerometer),
+                "motors" => telemetry_fields.push(TelemetryField::Motors),
+                "pid_error" => telemetry_fields.push(TelemetryField::PidError),
+                "rc" => telemetry_fields.push(TelemetryField::RcCommands),
+                "battery" => telemetry_fields.push(TelemetryField::Battery),
+                "cpu" => telemetry_fields.push(TelemetryField::CpuLoad),
+                "loop_time" => telemetry_fields.push(TelemetryField::LoopTime),
+                _ => {
+                    println!("{} Unknown telemetry field: {}", style("⚠").yellow(), field);
+                }
+            }
+        }
+
+        // Create telemetry configuration
+        let telemetry_config = TelemetryConfig {
+            rate_hz: _args.rate,
+            enabled_fields: telemetry_fields,
+            buffer_size: 1000,
+        };
+
+        // Connect to flight controller
+        let mut fc = FlightControllerConnection::connect(&_args.connection).await
+            .context("Failed to connect to flight controller")?;
+
+        println!("{} Connected successfully", style("✓").green());
+
+        // Start telemetry streaming
+        let mut telemetry_rx = fc.start_telemetry_streaming(telemetry_config).await
+            .context("Failed to start telemetry streaming")?;
+
+        println!("{} Monitoring telemetry at {}Hz...", style("📡").blue(), _args.rate);
+        println!("Press Ctrl+C to stop\n");
+
+        // Monitor telemetry
+        let start_time = std::time::Instant::now();
+        let mut sample_count = 0;
+
+        while let Ok(frame) = telemetry_rx.recv().await {
+            sample_count += 1;
+
+            // Check duration limit
+            if _args.duration > 0 && start_time.elapsed().as_secs() >= _args.duration {
+                break;
+            }
+
+            // Display telemetry based on output format
+            match _output_format {
+                OutputFormat::Pretty => {
+                    if sample_count % (_args.rate / 4).max(1) == 0 {
+                        // Display at ~4Hz for readability
+                        print!("\r{}", format_telemetry_frame(&frame));
+                        use std::io::{self, Write};
+                        io::stdout().flush().unwrap();
+                    }
+                }
+                OutputFormat::Json => {
+                    let json = serde_json::to_string(&format_telemetry_json(&frame))?;
+                    println!("{}", json);
+                }
+                OutputFormat::Csv => {
+                    if sample_count == 1 {
+                        println!("{}", telemetry_csv_header(&fields));
+                    }
+                    println!("{}", format_telemetry_csv(&frame));
+                }
+            }
+
+            // Log to file if specified
+            if let Some(ref _log_path) = _args.log_file {
+                // TODO: Implement file logging
+            }
+        }
+
+        println!("\n{} Monitoring stopped. Captured {} samples", style("📊").blue(), sample_count);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "realtime"))]
+    {
+        println!("{} Real-time monitoring is not available in this build", style("⚠").yellow());
+        println!("Rebuild with --features realtime to enable this feature");
+        Ok(())
+    }
+}
+
+/// Handle the tune command
+async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()> {
+    println!("{} Analyzing blackbox for tuning recommendations", style("🔧").blue());
+
+    // Analyze the blackbox file first
+    let analyze_args = AnalyzeArgs {
+        input: args.input.clone(),
+        output_dir: None,
+        detailed: true,
+        show_details: false,
+        min_confidence: 0.7,
+        max_files: 1,
+        session: None,
+        list_sessions: false,
+        bb_summary: false,
+        session_strategy: None,
+    };
+
+    // Get analysis results
+    let mut engine = AnalysisEngine::new();
+    let analysis = analyze_single_file(&mut engine, &args.input, &analyze_args).await?;
+
+    // Display tuning recommendations
+    println!("\n{} Tuning Recommendations:", style("📋").green());
+
+    if !analysis.report.pid_recommendations.is_empty() {
+        println!("\n  {} PID Adjustments:", style("🎛️").cyan());
+        for rec in &analysis.report.pid_recommendations {
+            let priority_icon = match rec.priority {
+                Priority::Critical => style("🟣").magenta(),
+                Priority::High => style("🔴").red(),
+                Priority::Medium => style("🟡").yellow(),
+                Priority::Low => style("🟢").green(),
+            };
+            println!("    {} {:?} {}: {:.1} → {:.1}",
+                priority_icon, rec.axis, format!("{:?}", rec.term),
+                rec.current_value, rec.recommended_value);
+            println!("      Reason: {}", rec.reason);
+        }
+    }
+
+    if !analysis.report.filter_recommendations.is_empty() {
+        println!("\n  {} Filter Adjustments:", style("🔧").cyan());
+        for rec in &analysis.report.filter_recommendations {
+            let priority_icon = match rec.priority {
+                Priority::Critical => style("🟣").magenta(),
+                Priority::High => style("🔴").red(),
+                Priority::Medium => style("🟡").yellow(),
+                Priority::Low => style("🟢").green(),
+            };
+
+            let description = match &rec.recommendation_type {
+                FilterRecommendationType::AdjustGyroLowpass { stage, current_cutoff, recommended_cutoff, filter_type } => {
+                    format!("Gyro Lowpass {} ({}): {:.0} Hz → {:.0} Hz", stage, filter_type, current_cutoff, recommended_cutoff)
+                },
+                FilterRecommendationType::ConfigureGyroNotch { notch_number, frequency, q_factor, enabled } => {
+                    if *enabled {
+                        format!("Enable Gyro Notch {}: {:.0} Hz (Q: {:.0})", notch_number, frequency, q_factor)
+                    } else {
+                        format!("Disable Gyro Notch {}", notch_number)
+                    }
+                },
+                FilterRecommendationType::AdjustDynamicNotch { notch_count, q_factor, min_freq, max_freq, enabled } => {
+                    if *enabled {
+                        format!("Dynamic Notch: {} notches, {:.0}-{:.0} Hz (Q: {:.0})", notch_count, min_freq, max_freq, q_factor)
+                    } else {
+                        "Disable Dynamic Notch".to_string()
+                    }
+                },
+                FilterRecommendationType::ConfigureRpmFilter { harmonics, q_factor, min_freq, enabled } => {
+                    if *enabled {
+                        format!("Enable RPM Filter: {} harmonics, min {:.0} Hz (Q: {:.0})", harmonics, min_freq, q_factor)
+                    } else {
+                        "Disable RPM Filter".to_string()
+                    }
+                },
+                FilterRecommendationType::AdjustDtermLowpass { stage, current_cutoff, recommended_cutoff, filter_type, dynamic_settings } => {
+                    match (current_cutoff, recommended_cutoff, dynamic_settings) {
+                        (Some(current), Some(_), Some(dynamic)) => {
+                            format!("D-term Lowpass {} ({}): {:.0} Hz → Dynamic {:.0}-{:.0} Hz (expo: {:.0})",
+                                stage, filter_type, current, dynamic.min_cutoff, dynamic.max_cutoff, dynamic.expo)
+                        },
+                        (Some(current), Some(recommended), None) => {
+                            format!("D-term Lowpass {} ({}): {:.0} Hz → {:.0} Hz", stage, filter_type, current, recommended)
+                        },
+                        (None, Some(recommended), _) => {
+                            format!("Set D-term Lowpass {} ({}): {:.0} Hz", stage, filter_type, recommended)
+                        },
+                        _ => format!("Adjust D-term Lowpass {} ({})", stage, filter_type)
+                    }
+                },
+                FilterRecommendationType::AdjustYawLowpass { current_cutoff, recommended_cutoff } => {
+                    format!("Yaw Lowpass: {:.0} Hz → {:.0} Hz", current_cutoff, recommended_cutoff)
+                },
+            };
+
+            println!("    {} {}", priority_icon, description);
+            println!("      {}", rec.expected_improvement);
+        }
+    }
+
+    // Apply changes if connection is provided and not dry run
+    if let Some(_connection) = &args.connection {
+        if !args.dry_run {
+            #[cfg(feature = "realtime")]
+            {
+                println!("\n{} Connecting to flight controller to apply changes...", style("🔗").blue());
+
+                use drone_tuner_core::realtime::*;
+                let mut _fc = FlightControllerConnection::connect(_connection).await
+                    .context("Failed to connect to flight controller")?;
+
+                println!("{} Connected! (Parameter application not yet implemented)", style("✓").green());
+                // TODO: Implement parameter application
+            }
+
+            #[cfg(not(feature = "realtime"))]
+            {
+                println!("{} Real-time tuning is not available in this build", style("⚠").yellow());
+                println!("Rebuild with --features realtime to enable this feature");
+            }
+        } else {
+            println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
+        }
+    } else {
+        println!("\n{} Specify --connection to apply changes to flight controller", style("ℹ️").blue());
+    }
+
+    Ok(())
+}
+
+/// Handle the export command
+async fn export_command(args: ExportArgs, _output_format: OutputFormat) -> Result<()> {
+    println!("{} Exporting analysis data to {}", style("📤").blue(), args.output.display());
+
+    // Analyze the file if it's a blackbox
+    let analysis = if args.input.extension().map_or(false, |ext| ext == "bbl" || ext == "BBL") {
+        let analyze_args = AnalyzeArgs {
+            input: args.input.clone(),
+            output_dir: None,
+            detailed: true,
+            show_details: false,
+            min_confidence: 0.5,
+            max_files: 1,
+            session: None,
+            list_sessions: false,
+            bb_summary: false,
+            session_strategy: None,
+        };
+
+        let mut engine = AnalysisEngine::new();
+        Some(analyze_single_file(&mut engine, &args.input, &analyze_args).await?)
+    } else {
+        None
+    };
+
+    // Export based on format
+    match args.format.as_str() {
+        "csv" => {
+            if let Some(analysis) = analysis {
+                export_to_csv(&analysis, &args.output, args.include_raw, args.include_fft).await?;
+            } else {
+                return Err(anyhow::anyhow!("CSV export requires blackbox analysis"));
+            }
+        }
+        "json" => {
+            if let Some(analysis) = analysis {
+                export_to_json(&analysis, &args.output, args.include_raw, args.include_fft).await?;
+            } else {
+                return Err(anyhow::anyhow!("JSON export requires blackbox analysis"));
+            }
+        }
+        "matlab" => {
+            if let Some(analysis) = analysis {
+                export_to_matlab(&analysis, &args.output, args.include_raw, args.include_fft).await?;
+            } else {
+                return Err(anyhow::anyhow!("MATLAB export requires blackbox analysis"));
+            }
+        }
+        "python" => {
+            if let Some(analysis) = analysis {
+                export_to_python(&analysis, &args.output, args.include_raw, args.include_fft).await?;
+            } else {
+                return Err(anyhow::anyhow!("Python export requires blackbox analysis"));
+            }
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Unsupported export format: {}", args.format));
+        }
+    }
+
+    println!("{} Export completed successfully", style("✓").green());
+    Ok(())
+}
+
 /// Handle the info command
 async fn info_command() -> Result<()> {
     println!("{} FPV Drone Tuner", style("🚁").blue());
@@ -784,11 +1163,35 @@ fn output_pretty(
                 if !analysis.report.filter_recommendations.is_empty() {
                     println!("  {} Filter recommendations:", style("🔧").blue());
                     for rec in &analysis.report.filter_recommendations {
-                        println!(
-                            "    • {} at {:.1} Hz",
-                            format!("{:?}", rec.recommendation_type),
-                            rec.frequency
-                        );
+                        let description = match &rec.recommendation_type {
+                            FilterRecommendationType::AdjustGyroLowpass { stage, current_cutoff, recommended_cutoff, filter_type } => {
+                                format!("Gyro Lowpass {} ({}): {:.0}→{:.0} Hz", stage, filter_type, current_cutoff, recommended_cutoff)
+                            },
+                            FilterRecommendationType::ConfigureGyroNotch { notch_number, frequency, q_factor, enabled } => {
+                                if *enabled {
+                                    format!("Enable Gyro Notch {}: {:.0} Hz (Q: {:.0})", notch_number, frequency, q_factor)
+                                } else {
+                                    format!("Disable Gyro Notch {}", notch_number)
+                                }
+                            },
+                            FilterRecommendationType::AdjustDynamicNotch { notch_count, min_freq, max_freq, .. } => {
+                                format!("Dynamic Notch: {} notches, {:.0}-{:.0} Hz", notch_count, min_freq, max_freq)
+                            },
+                            FilterRecommendationType::ConfigureRpmFilter { harmonics, enabled, .. } => {
+                                if *enabled {
+                                    format!("Enable RPM Filter: {} harmonics", harmonics)
+                                } else {
+                                    "Disable RPM Filter".to_string()
+                                }
+                            },
+                            FilterRecommendationType::AdjustDtermLowpass { stage, filter_type, .. } => {
+                                format!("D-term Lowpass {} ({})", stage, filter_type)
+                            },
+                            FilterRecommendationType::AdjustYawLowpass { current_cutoff, recommended_cutoff } => {
+                                format!("Yaw Lowpass: {:.0}→{:.0} Hz", current_cutoff, recommended_cutoff)
+                            },
+                        };
+                        println!("    • {}", description);
                     }
                 }
 
@@ -1063,4 +1466,296 @@ impl serde::Serialize for ComparisonSummary {
         state.serialize_field("common_issues", &self.common_issues)?;
         state.end()
     }
+}
+
+// Helper functions for new CLI features
+
+/// Format telemetry frame for pretty display
+#[cfg(feature = "realtime")]
+fn format_telemetry_frame(frame: &drone_tuner_core::realtime::TelemetryFrame) -> String {
+    let mut output = String::new();
+
+    if let Some(gyro) = &frame.gyro {
+        output.push_str(&format!("Gyro: [{:6.1}, {:6.1}, {:6.1}] ", gyro.x, gyro.y, gyro.z));
+    }
+
+    if let Some(pid_error) = &frame.pid_error {
+        output.push_str(&format!("PID Err: [{:5.2}, {:5.2}, {:5.2}] ", pid_error.roll, pid_error.pitch, pid_error.yaw));
+    }
+
+    if let Some(motors) = &frame.motors {
+        output.push_str(&format!("Motors: [{:4.0}, {:4.0}, {:4.0}, {:4.0}] ", motors[0], motors[1], motors[2], motors[3]));
+    }
+
+    if let Some(battery) = frame.battery_voltage {
+        output.push_str(&format!("Batt: {:4.2}V ", battery));
+    }
+
+    if let Some(cpu) = frame.cpu_load {
+        output.push_str(&format!("CPU: {:3.0}% ", cpu));
+    }
+
+    output.trim_end().to_string()
+}
+
+/// Format telemetry frame as JSON
+#[cfg(feature = "realtime")]
+fn format_telemetry_json(frame: &drone_tuner_core::realtime::TelemetryFrame) -> serde_json::Value {
+    let mut json = serde_json::Map::new();
+
+    json.insert("timestamp".to_string(), serde_json::Value::Number(
+        serde_json::Number::from_f64(frame.timestamp.elapsed().as_secs_f64()).unwrap()
+    ));
+
+    if let Some(gyro) = &frame.gyro {
+        json.insert("gyro".to_string(), serde_json::json!({
+            "x": gyro.x,
+            "y": gyro.y,
+            "z": gyro.z
+        }));
+    }
+
+    if let Some(pid_error) = &frame.pid_error {
+        json.insert("pid_error".to_string(), serde_json::json!({
+            "roll": pid_error.roll,
+            "pitch": pid_error.pitch,
+            "yaw": pid_error.yaw
+        }));
+    }
+
+    serde_json::Value::Object(json)
+}
+
+/// Generate CSV header for telemetry
+#[cfg(feature = "realtime")]
+fn telemetry_csv_header(fields: &[&str]) -> String {
+    let mut header = vec!["timestamp".to_string()];
+
+    for field in fields {
+        match *field {
+            "gyro" => {
+                header.extend(["gyro_x".to_string(), "gyro_y".to_string(), "gyro_z".to_string()]);
+            }
+            "pid_error" => {
+                header.extend(["pid_roll".to_string(), "pid_pitch".to_string(), "pid_yaw".to_string()]);
+            }
+            "motors" => {
+                header.extend(["motor1".to_string(), "motor2".to_string(), "motor3".to_string(), "motor4".to_string()]);
+            }
+            "battery" => header.push("battery_voltage".to_string()),
+            "cpu" => header.push("cpu_load".to_string()),
+            _ => {}
+        }
+    }
+
+    header.join(",")
+}
+
+/// Format telemetry frame as CSV row
+#[cfg(feature = "realtime")]
+fn format_telemetry_csv(frame: &drone_tuner_core::realtime::TelemetryFrame) -> String {
+    let mut values = vec![frame.timestamp.elapsed().as_secs_f64().to_string()];
+
+    if let Some(gyro) = &frame.gyro {
+        values.extend([gyro.x.to_string(), gyro.y.to_string(), gyro.z.to_string()]);
+    }
+
+    if let Some(pid_error) = &frame.pid_error {
+        values.extend([pid_error.roll.to_string(), pid_error.pitch.to_string(), pid_error.yaw.to_string()]);
+    }
+
+    if let Some(motors) = &frame.motors {
+        values.extend(motors.iter().map(|m| m.to_string()).collect::<Vec<_>>());
+    }
+
+    if let Some(battery) = frame.battery_voltage {
+        values.push(battery.to_string());
+    }
+
+    if let Some(cpu) = frame.cpu_load {
+        values.push(cpu.to_string());
+    }
+
+    values.join(",")
+}
+
+/// Export analysis to CSV format
+async fn export_to_csv(
+    analysis: &AnalysisResult,
+    output_path: &PathBuf,
+    include_raw: bool,
+    _include_fft: bool,
+) -> Result<()> {
+    let mut content = String::new();
+
+    // Header
+    content.push_str("# FPV Drone Tuner Analysis Export\n");
+    content.push_str(&format!("# File: {}\n", analysis.file_path.display()));
+    content.push_str(&format!("# Analysis Time: {:.2}s\n", analysis.analysis_time.as_secs_f32()));
+    content.push_str(&format!("# Tune Quality: {:.1}\n", analysis.report.tune_quality_score));
+    content.push_str("\n");
+
+    // Raw telemetry data if requested
+    if include_raw {
+        content.push_str("# Raw Gyro Data\n");
+        content.push_str("time,gyro_x,gyro_y,gyro_z\n");
+
+        let sample_rate = analysis.session.telemetry.sample_rate;
+        for i in 0..analysis.session.telemetry.gyro.len() {
+            let time = i as f32 / sample_rate;
+            if let Some(gyro) = analysis.session.telemetry.gyro.get(i) {
+                content.push_str(&format!("{:.6},{:.6},{:.6},{:.6}\n", time, gyro.x, gyro.y, gyro.z));
+            }
+        }
+        content.push_str("\n");
+    }
+
+    // Recommendations
+    content.push_str("# PID Recommendations\n");
+    content.push_str("axis,term,current_value,recommended_value,priority,reason\n");
+    for rec in &analysis.report.pid_recommendations {
+        content.push_str(&format!(
+            "{:?},{:?},{},{},{:?},\"{}\"\n",
+            rec.axis, rec.term, rec.current_value, rec.recommended_value, rec.priority, rec.reason
+        ));
+    }
+
+    std::fs::write(output_path, content)?;
+    Ok(())
+}
+
+/// Export analysis to JSON format
+async fn export_to_json(
+    analysis: &AnalysisResult,
+    output_path: &PathBuf,
+    include_raw: bool,
+    _include_fft: bool,
+) -> Result<()> {
+    let mut export_data = serde_json::Map::new();
+
+    export_data.insert("file_path".to_string(), serde_json::Value::String(analysis.file_path.display().to_string()));
+    export_data.insert("analysis_time_s".to_string(), serde_json::Value::Number(
+        serde_json::Number::from_f64(analysis.analysis_time.as_secs_f64()).unwrap()
+    ));
+    export_data.insert("tune_quality".to_string(), serde_json::Value::Number(
+        serde_json::Number::from_f64(analysis.report.tune_quality_score as f64).unwrap()
+    ));
+
+    // PID recommendations
+    let pid_recs: Vec<serde_json::Value> = analysis.report.pid_recommendations.iter()
+        .map(|rec| serde_json::json!({
+            "axis": format!("{:?}", rec.axis),
+            "term": format!("{:?}", rec.term),
+            "current_value": rec.current_value,
+            "recommended_value": rec.recommended_value,
+            "priority": format!("{:?}", rec.priority),
+            "reason": rec.reason
+        }))
+        .collect();
+    export_data.insert("pid_recommendations".to_string(), serde_json::Value::Array(pid_recs));
+
+    // Raw data if requested
+    if include_raw {
+        let gyro_data: Vec<serde_json::Value> = (0..analysis.session.telemetry.gyro.len())
+            .filter_map(|i| {
+                let time = i as f32 / analysis.session.telemetry.sample_rate;
+                analysis.session.telemetry.gyro.get(i).map(|gyro| {
+                    serde_json::json!({ "time": time, "x": gyro.x, "y": gyro.y, "z": gyro.z })
+                })
+            })
+            .collect();
+        export_data.insert("gyro_data".to_string(), serde_json::Value::Array(gyro_data));
+    }
+
+    let json_str = serde_json::to_string_pretty(&serde_json::Value::Object(export_data))?;
+    std::fs::write(output_path, json_str)?;
+    Ok(())
+}
+
+/// Export analysis to MATLAB format
+async fn export_to_matlab(
+    analysis: &AnalysisResult,
+    output_path: &PathBuf,
+    include_raw: bool,
+    _include_fft: bool,
+) -> Result<()> {
+    let mut content = String::new();
+
+    content.push_str("% FPV Drone Tuner Analysis Export\n");
+    content.push_str(&format!("% File: {}\n", analysis.file_path.display()));
+    content.push_str(&format!("% Analysis Time: {:.2}s\n", analysis.analysis_time.as_secs_f32()));
+    content.push_str("\n");
+
+    content.push_str(&format!("tune_quality = {:.1};\n", analysis.report.tune_quality_score));
+    content.push_str(&format!("sample_rate = {:.1};\n", analysis.session.telemetry.sample_rate));
+    content.push_str(&format!("duration_ms = {};\n", analysis.session.metadata.duration_ms));
+    content.push_str("\n");
+
+    if include_raw {
+        content.push_str("% Gyro data\n");
+        content.push_str("gyro_data = [\n");
+        for i in 0..analysis.session.telemetry.gyro.len() {
+            if let Some(gyro) = analysis.session.telemetry.gyro.get(i) {
+                content.push_str(&format!("  {:.6}, {:.6}, {:.6};\n", gyro.x, gyro.y, gyro.z));
+            }
+        }
+        content.push_str("];\n\n");
+
+        content.push_str("% Time vector\n");
+        content.push_str(&format!("t = (0:{})/sample_rate;\n\n", analysis.session.telemetry.gyro.len() - 1));
+    }
+
+    std::fs::write(output_path, content)?;
+    Ok(())
+}
+
+/// Export analysis to Python format
+async fn export_to_python(
+    analysis: &AnalysisResult,
+    output_path: &PathBuf,
+    include_raw: bool,
+    _include_fft: bool,
+) -> Result<()> {
+    let mut content = String::new();
+
+    content.push_str("# FPV Drone Tuner Analysis Export\n");
+    content.push_str(&format!("# File: {}\n", analysis.file_path.display()));
+    content.push_str(&format!("# Analysis Time: {:.2}s\n", analysis.analysis_time.as_secs_f32()));
+    content.push_str("\n");
+    content.push_str("import numpy as np\n");
+    content.push_str("import matplotlib.pyplot as plt\n\n");
+
+    content.push_str(&format!("tune_quality = {:.1}\n", analysis.report.tune_quality_score));
+    content.push_str(&format!("sample_rate = {:.1}\n", analysis.session.telemetry.sample_rate));
+    content.push_str(&format!("duration_ms = {}\n", analysis.session.metadata.duration_ms));
+    content.push_str("\n");
+
+    if include_raw {
+        content.push_str("# Gyro data\n");
+        content.push_str("gyro_data = np.array([\n");
+        for i in 0..analysis.session.telemetry.gyro.len() {
+            if let Some(gyro) = analysis.session.telemetry.gyro.get(i) {
+                content.push_str(&format!("    [{:.6}, {:.6}, {:.6}],\n", gyro.x, gyro.y, gyro.z));
+            }
+        }
+        content.push_str("])\n\n");
+
+        content.push_str("# Time vector\n");
+        content.push_str(&format!("t = np.arange({}) / sample_rate\n\n", analysis.session.telemetry.gyro.len()));
+
+        content.push_str("# Example plot\n");
+        content.push_str("plt.figure(figsize=(12, 4))\n");
+        content.push_str("plt.plot(t, gyro_data[:, 0], label='Roll')\n");
+        content.push_str("plt.plot(t, gyro_data[:, 1], label='Pitch')\n");
+        content.push_str("plt.plot(t, gyro_data[:, 2], label='Yaw')\n");
+        content.push_str("plt.xlabel('Time (s)')\n");
+        content.push_str("plt.ylabel('Gyro (deg/s)')\n");
+        content.push_str("plt.legend()\n");
+        content.push_str("plt.title('Gyro Data')\n");
+        content.push_str("plt.grid(True)\n");
+        content.push_str("plt.show()\n");
+    }
+
+    std::fs::write(output_path, content)?;
+    Ok(())
 }

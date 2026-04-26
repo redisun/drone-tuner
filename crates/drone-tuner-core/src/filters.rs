@@ -51,10 +51,13 @@ pub struct BiquadSection {
 pub struct BiquadCoefficients {
     /// Forward coefficients
     pub b0: f32,
+    /// Forward coefficient b1
     pub b1: f32,
+    /// Forward coefficient b2
     pub b2: f32,
     /// Feedback coefficients
     pub a1: f32,
+    /// Feedback coefficient a2
     pub a2: f32,
 }
 

@@ -1,7 +1,7 @@
 //! Benchmarks for FFT analysis performance.
 
 use chrono::Utc;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use drone_tuner_core::{
     domain::{
         EnvironmentalConditions, FlightMetadata, FlightSession, FlyingStyle, HardwareConfiguration,
@@ -81,7 +81,7 @@ fn create_benchmark_session(sample_count: usize, sample_rate: f32) -> FlightSess
             session_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             duration_ms: (sample_count as f32 / sample_rate * 1000.0) as u64,
-            hardware: HardwareConfiguration::default(),
+            hardware: BenchmarkHardwareConfiguration::default().into(),
             environment: EnvironmentalConditions {
                 temperature_c: Some(25.0),
                 wind_speed_ms: None,
@@ -120,8 +120,8 @@ fn bench_fft_analysis_scaling(c: &mut Criterion) {
             |b, session| {
                 let mut engine = AnalysisEngine::new();
                 b.iter(|| {
-                    let result = engine.analyze(black_box(session));
-                    black_box(result)
+                    let result = engine.analyze(std::hint::black_box(session));
+                    std::hint::black_box(result)
                 });
             },
         );
@@ -149,8 +149,8 @@ fn bench_fft_analysis_sample_rates(c: &mut Criterion) {
             |b, session| {
                 let mut engine = AnalysisEngine::new();
                 b.iter(|| {
-                    let result = engine.analyze(black_box(session));
-                    black_box(result)
+                    let result = engine.analyze(std::hint::black_box(session));
+                    std::hint::black_box(result)
                 });
             },
         );
@@ -179,8 +179,8 @@ fn bench_fft_window_sizes(c: &mut Criterion) {
                         ..Default::default()
                     });
                 b.iter(|| {
-                    let result = engine.analyze(black_box(&session));
-                    black_box(result)
+                    let result = engine.analyze(std::hint::black_box(&session));
+                    std::hint::black_box(result)
                 });
             },
         );
@@ -214,8 +214,8 @@ fn bench_memory_efficiency(c: &mut Criterion) {
             |b, session| {
                 b.iter(|| {
                     let mut engine = AnalysisEngine::new();
-                    let result = engine.analyze(black_box(session));
-                    black_box(result)
+                    let result = engine.analyze(std::hint::black_box(session));
+                    std::hint::black_box(result)
                 });
             },
         );
@@ -235,8 +235,8 @@ fn bench_peak_detection(c: &mut Criterion) {
 
     group.bench_function("peak_detection", |b| {
         b.iter(|| {
-            let result = engine.analyze(black_box(&session));
-            black_box(result)
+            let result = engine.analyze(std::hint::black_box(&session));
+            std::hint::black_box(result)
         });
     });
 
@@ -255,10 +255,10 @@ fn bench_concurrent_analysis(c: &mut Criterion) {
 
     group.bench_function("sequential", |b| {
         b.iter(|| {
-            for session in black_box(&sessions) {
+            for session in std::hint::black_box(&sessions) {
                 let mut engine = AnalysisEngine::new();
                 let result = engine.analyze(session);
-                black_box(result);
+                let _ = std::hint::black_box(result);
             }
         });
     });
@@ -268,10 +268,10 @@ fn bench_concurrent_analysis(c: &mut Criterion) {
         b.iter(|| {
             // This would be implemented if we add parallel processing
             // For now, it's the same as sequential to establish baseline
-            for session in black_box(&sessions) {
+            for session in std::hint::black_box(&sessions) {
                 let mut engine = AnalysisEngine::new();
                 let result = engine.analyze(session);
-                black_box(result);
+                let _ = std::hint::black_box(result);
             }
         });
     });
@@ -288,20 +288,22 @@ fn bench_filter_optimization(c: &mut Criterion) {
     group.bench_function("full_analysis", |b| {
         b.iter(|| {
             let mut engine = AnalysisEngine::new();
-            let result = engine.analyze(black_box(&session));
-            black_box(result)
+            let result = engine.analyze(std::hint::black_box(&session));
+            std::hint::black_box(result)
         });
     });
 
     group.finish();
 }
 
-// Default implementations for benchmarking (these would be in the actual domain module)
-impl Default for HardwareConfiguration {
+// Benchmark-specific implementation to avoid orphan rule violation
+struct BenchmarkHardwareConfiguration(HardwareConfiguration);
+
+impl Default for BenchmarkHardwareConfiguration {
     fn default() -> Self {
         use drone_tuner_core::domain::*;
 
-        Self {
+        Self(HardwareConfiguration {
             flight_controller: FlightController {
                 firmware: "Betaflight".to_string(),
                 version: "4.4.0".to_string(),
@@ -393,7 +395,13 @@ impl Default for HardwareConfiguration {
                     enabled: true,
                 }),
             },
-        }
+        })
+    }
+}
+
+impl From<BenchmarkHardwareConfiguration> for HardwareConfiguration {
+    fn from(bench_config: BenchmarkHardwareConfiguration) -> Self {
+        bench_config.0
     }
 }
 
