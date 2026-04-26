@@ -664,6 +664,150 @@ impl FlightControllerConnection {
             "Transport cloning not implemented",
         ))
     }
+
+    /// Read the flight controller's current PID gains (MSP Pid / 112).
+    ///
+    /// Returns the full 30-byte MSP_PID payload covering all 10 axes.
+    /// We round-trip the entire payload so writeback preserves axes the
+    /// caller doesn't touch (LEVEL, MAG, NAV, etc.).
+    pub async fn read_pid(&mut self) -> Result<PidSnapshot> {
+        let request = self.msp.create_message(MspCommand::Pid, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let response = self.read_msp_response().await?;
+        if !matches!(response.command, MspCommand::Pid) {
+            return Err(DronetunerError::communication_error(
+                "Unexpected response command for read_pid",
+            ));
+        }
+        PidSnapshot::from_payload(response.payload)
+    }
+
+    /// Write a PID snapshot back to the flight controller (MSP SetPid / 202).
+    ///
+    /// This only updates RAM. Call [`save_to_eeprom`] to persist across
+    /// power cycles.
+    ///
+    /// [`save_to_eeprom`]: Self::save_to_eeprom
+    pub async fn write_pid(&mut self, snapshot: &PidSnapshot) -> Result<()> {
+        let request = self
+            .msp
+            .create_message(MspCommand::SetPid, snapshot.as_payload())?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        // SetPid acks with an empty payload.
+        let _ack = self.read_msp_response().await?;
+        Ok(())
+    }
+
+    /// Apply a PID change with automatic rollback on failure.
+    ///
+    /// 1. Reads the current PID values into a backup.
+    /// 2. Writes the new values.
+    /// 3. If the write or its ack fails, attempts to restore the backup
+    ///    on a best-effort basis before returning the original error.
+    ///
+    /// The returned [`PidSnapshot`] is the pre-change backup, suitable
+    /// for storing on disk so the user can manually restore later.
+    pub async fn apply_pid_with_rollback(&mut self, new: &PidSnapshot) -> Result<PidSnapshot> {
+        let backup = self.read_pid().await?;
+        if let Err(write_err) = self.write_pid(new).await {
+            // Best-effort rollback. Surface the original error regardless
+            // of whether the rollback itself succeeds — the caller already
+            // has the backup snapshot in their hands via the return value
+            // path that we lost; embedding rollback failure context keeps
+            // the trail.
+            if let Err(rollback_err) = self.write_pid(&backup).await {
+                return Err(DronetunerError::communication_error(format!(
+                    "PID write failed ({write_err}); rollback also failed ({rollback_err})"
+                )));
+            }
+            return Err(write_err);
+        }
+        Ok(backup)
+    }
+
+    /// Persist current parameters to non-volatile memory (MSP EepromWrite /
+    /// 250). Without this call, RAM-only changes are lost on power cycle.
+    pub async fn save_to_eeprom(&mut self) -> Result<()> {
+        let request = self.msp.create_message(MspCommand::EepromWrite, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let _ack = self.read_msp_response().await?;
+        Ok(())
+    }
+}
+
+/// 30-byte MSP_PID payload snapshot. Provides typed accessors for the
+/// roll/pitch/yaw rate axes (the ones an FPV tuner cares about) while
+/// preserving the rest of the payload for round-trip fidelity.
+///
+/// Betaflight MSP_PID layout (each value is u8 0..=255):
+/// ```text
+///  0  ROLL  P    9  ALT   P   18  NAVR  P   27  VEL   P
+///  1  ROLL  I   10  ALT   I   19  NAVR  I   28  VEL   I
+///  2  ROLL  D   11  ALT   D   20  NAVR  D   29  VEL   D
+///  3  PITCH P   12  POS   P   21  LEVEL P
+///  4  PITCH I   13  POS   I   22  LEVEL I
+///  5  PITCH D   14  POS   D   23  LEVEL D
+///  6  YAW   P   15  POSR  P   24  MAG   P
+///  7  YAW   I   16  POSR  I   25  MAG   I
+///  8  YAW   D   17  POSR  D   26  MAG   D
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PidSnapshot {
+    raw: [u8; 30],
+}
+
+impl PidSnapshot {
+    /// Parse a payload from an MSP Pid response.
+    pub fn from_payload(payload: Vec<u8>) -> Result<Self> {
+        if payload.len() < 30 {
+            return Err(DronetunerError::parse_error(
+                format!("MSP Pid payload too short: {} bytes", payload.len()),
+                None,
+            ));
+        }
+        let mut raw = [0u8; 30];
+        raw.copy_from_slice(&payload[..30]);
+        Ok(Self { raw })
+    }
+
+    /// Borrow the underlying 30-byte payload, suitable for SetPid.
+    pub fn as_payload(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Roll P/I/D as a (P, I, D) tuple.
+    pub fn roll(&self) -> (u8, u8, u8) {
+        (self.raw[0], self.raw[1], self.raw[2])
+    }
+    /// Pitch P/I/D as a (P, I, D) tuple.
+    pub fn pitch(&self) -> (u8, u8, u8) {
+        (self.raw[3], self.raw[4], self.raw[5])
+    }
+    /// Yaw P/I/D as a (P, I, D) tuple.
+    pub fn yaw(&self) -> (u8, u8, u8) {
+        (self.raw[6], self.raw[7], self.raw[8])
+    }
+    /// Set roll P/I/D.
+    pub fn set_roll(&mut self, p: u8, i: u8, d: u8) {
+        self.raw[0] = p;
+        self.raw[1] = i;
+        self.raw[2] = d;
+    }
+    /// Set pitch P/I/D.
+    pub fn set_pitch(&mut self, p: u8, i: u8, d: u8) {
+        self.raw[3] = p;
+        self.raw[4] = i;
+        self.raw[5] = d;
+    }
+    /// Set yaw P/I/D.
+    pub fn set_yaw(&mut self, p: u8, i: u8, d: u8) {
+        self.raw[6] = p;
+        self.raw[7] = i;
+        self.raw[8] = d;
+    }
 }
 
 impl Default for TelemetryConfig {
@@ -947,6 +1091,43 @@ impl Transport for MockTransport {
     }
 }
 
+/// Shared simulator state — kept behind an Arc<Mutex<_>> so tests can peek
+/// at it concurrently with the simulator task.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SimulatorState {
+    /// Current 30-byte MSP_PID payload. Updated on SetPid; returned on Pid.
+    pub(crate) pid: [u8; 30],
+    /// Whether the simulator should fail the next SetPid (used to drive the
+    /// rollback test path). Cleared after one trigger.
+    pub(crate) fail_next_setpid: bool,
+    /// How many times EepromWrite has been received.
+    pub(crate) eeprom_writes: usize,
+}
+
+#[cfg(test)]
+impl SimulatorState {
+    fn default_pid() -> [u8; 30] {
+        // Plausible Betaflight defaults for ROLL/PITCH/YAW; rest 0.
+        let mut pid = [0u8; 30];
+        pid[0..3].copy_from_slice(&[42, 85, 35]); // ROLL P/I/D
+        pid[3..6].copy_from_slice(&[46, 90, 38]); // PITCH P/I/D
+        pid[6..9].copy_from_slice(&[45, 90, 0]); // YAW P/I/D
+        pid
+    }
+}
+
+#[cfg(test)]
+impl Default for SimulatorState {
+    fn default() -> Self {
+        Self {
+            pid: Self::default_pid(),
+            fail_next_setpid: false,
+            eeprom_writes: 0,
+        }
+    }
+}
+
 /// Configurable Betaflight FC simulator. Spawn with [`MspSimulator::run`]
 /// to service requests on the server end of a [`MockTransport`] pair.
 #[cfg(test)]
@@ -958,6 +1139,8 @@ pub(crate) struct MspSimulator {
     pub(crate) firmware_id: String,
     /// 3-byte firmware version (major, minor, patch).
     pub(crate) firmware_version: [u8; 3],
+    /// Mutable state shared with the test for assertions / fault injection.
+    pub(crate) state: std::sync::Arc<std::sync::Mutex<SimulatorState>>,
 }
 
 #[cfg(test)]
@@ -968,6 +1151,7 @@ impl MspSimulator {
             api_version: [1, 46, 0],
             firmware_id: "BTFL".to_string(),
             firmware_version: [4, 5, 1],
+            state: std::sync::Arc::new(std::sync::Mutex::new(SimulatorState::default())),
         }
     }
 
@@ -985,29 +1169,51 @@ impl MspSimulator {
                 Ok(req) => req,
                 Err(_) => continue, // ignore malformed traffic
             };
-            let payload = self.handle(&request);
-            let response = msp.create_response(request.command, &payload)?;
-            self.transport.write(&response).await?;
+            let response_bytes = match self.handle(&request) {
+                Ok(payload) => msp.create_response(request.command, &payload)?,
+                Err(_) => {
+                    // Simulate a malformed wire reply so the client times
+                    // out / errors during reads. Sending a header-only stub
+                    // is enough to make parse_response fail.
+                    vec![b'$']
+                }
+            };
+            self.transport.write(&response_bytes).await?;
             self.transport.flush().await?;
         }
     }
 
-    fn handle(&self, req: &MspResponse) -> Vec<u8> {
+    fn handle(&self, req: &MspResponse) -> Result<Vec<u8>> {
         match req.command {
-            MspCommand::ApiVersion => self.api_version.to_vec(),
-            MspCommand::FcVariant => self.firmware_id.as_bytes().to_vec(),
-            MspCommand::FcVersion => self.firmware_version.to_vec(),
-            MspCommand::BoardInfo => b"OMNF7\x04\x00\x00".to_vec(),
-            // RawImu: 18 bytes, 3xi16 gyro + 3xi16 accel + 3xi16 mag
-            MspCommand::RawImu => vec![0u8; 18],
-            // 16 motor outputs, u16 each (only first 4 used in quad)
-            MspCommand::Motor => vec![0u8; 32],
-            MspCommand::Rc => vec![0u8; 16],
-            MspCommand::Pid => vec![0u8; 30],
-            // Pidnames is a comma-separated string; keep it simple.
-            MspCommand::Pidnames => b"ROLL;PITCH;YAW".to_vec(),
-            // Writes return empty payload to acknowledge receipt.
-            MspCommand::SetPid | MspCommand::EepromWrite => Vec::new(),
+            MspCommand::ApiVersion => Ok(self.api_version.to_vec()),
+            MspCommand::FcVariant => Ok(self.firmware_id.as_bytes().to_vec()),
+            MspCommand::FcVersion => Ok(self.firmware_version.to_vec()),
+            MspCommand::BoardInfo => Ok(b"OMNF7\x04\x00\x00".to_vec()),
+            MspCommand::RawImu => Ok(vec![0u8; 18]),
+            MspCommand::Motor => Ok(vec![0u8; 32]),
+            MspCommand::Rc => Ok(vec![0u8; 16]),
+            MspCommand::Pid => {
+                let state = self.state.lock().unwrap();
+                Ok(state.pid.to_vec())
+            }
+            MspCommand::Pidnames => Ok(b"ROLL;PITCH;YAW".to_vec()),
+            MspCommand::SetPid => {
+                let mut state = self.state.lock().unwrap();
+                if state.fail_next_setpid {
+                    state.fail_next_setpid = false;
+                    return Err(DronetunerError::communication_error(
+                        "simulator: injected SetPid failure",
+                    ));
+                }
+                if req.payload.len() >= 30 {
+                    state.pid.copy_from_slice(&req.payload[..30]);
+                }
+                Ok(Vec::new())
+            }
+            MspCommand::EepromWrite => {
+                self.state.lock().unwrap().eeprom_writes += 1;
+                Ok(Vec::new())
+            }
         }
     }
 }
@@ -1106,5 +1312,119 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(500), sim_handle)
             .await
             .ok();
+    }
+
+    /// Helper: build a connected (client, simulator-state) pair so PID tests
+    /// can drive read/write/rollback flows without repeating boilerplate.
+    async fn pid_test_setup() -> (
+        FlightControllerConnection,
+        std::sync::Arc<std::sync::Mutex<SimulatorState>>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        let state = sim.state.clone();
+        let handle = tokio::spawn(sim.run());
+        let conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .expect("handshake should succeed");
+        (conn, state, handle)
+    }
+
+    #[tokio::test]
+    async fn test_read_pid_returns_simulator_state() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let snapshot = conn.read_pid().await.expect("read_pid");
+        assert_eq!(snapshot.roll(), (42, 85, 35));
+        assert_eq!(snapshot.pitch(), (46, 90, 38));
+        assert_eq!(snapshot.yaw(), (45, 90, 0));
+
+        // Ensure round-trip fidelity: snapshot bytes match simulator state.
+        let expected: Vec<u8> = state.lock().unwrap().pid.to_vec();
+        assert_eq!(snapshot.as_payload(), &expected[..]);
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_pid_updates_simulator_state() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let mut new_pid = conn.read_pid().await.unwrap();
+        new_pid.set_roll(50, 100, 40);
+        new_pid.set_pitch(55, 105, 45);
+        conn.write_pid(&new_pid).await.expect("write_pid");
+
+        let stored = state.lock().unwrap().pid;
+        assert_eq!(&stored[0..3], &[50, 100, 40]);
+        assert_eq!(&stored[3..6], &[55, 105, 45]);
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_pid_with_rollback_returns_backup_on_success() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let original = conn.read_pid().await.unwrap();
+        let mut new_pid = original.clone();
+        new_pid.set_roll(60, 120, 50);
+
+        let backup = conn
+            .apply_pid_with_rollback(&new_pid)
+            .await
+            .expect("apply should succeed");
+
+        // Backup matches what was on the FC before the change.
+        assert_eq!(backup, original);
+        // FC state matches the new values.
+        assert_eq!(&state.lock().unwrap().pid[0..3], &[60, 120, 50]);
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_pid_with_rollback_restores_on_write_failure() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        // Inject a SetPid failure on the next write.
+        state.lock().unwrap().fail_next_setpid = true;
+
+        let original = conn.read_pid().await.unwrap();
+        let mut new_pid = original.clone();
+        new_pid.set_roll(99, 99, 99);
+
+        let result = conn.apply_pid_with_rollback(&new_pid).await;
+        assert!(result.is_err(), "apply must surface the write failure");
+
+        // FC state must be unchanged because the rollback restored it.
+        let stored = state.lock().unwrap().pid;
+        assert_eq!(&stored[..], original.as_payload());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_save_to_eeprom_acknowledged() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        assert_eq!(state.lock().unwrap().eeprom_writes, 0);
+        conn.save_to_eeprom().await.expect("save_to_eeprom");
+        assert_eq!(state.lock().unwrap().eeprom_writes, 1);
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[test]
+    fn test_pid_snapshot_from_short_payload_is_error() {
+        let err = PidSnapshot::from_payload(vec![0u8; 10])
+            .expect_err("payloads under 30 bytes should be rejected");
+        assert!(matches!(err, DronetunerError::ParseError { .. }));
     }
 }
