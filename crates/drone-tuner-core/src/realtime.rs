@@ -274,6 +274,12 @@ pub enum MspCommand {
     Pidnames = 117,
     /// Filter configuration (gyro/D-term lowpass cutoffs, notches, etc.)
     FilterConfig = 92,
+    /// Onboard dataflash summary (ready flag, sector count, used/total bytes)
+    DataflashSummary = 70,
+    /// Read a chunk of onboard dataflash starting at a given byte offset
+    DataflashRead = 71,
+    /// Erase the entire onboard dataflash
+    DataflashErase = 72,
     /// Set PID values
     SetPid = 202,
     /// Set filter configuration. Payload mirrors what FilterConfig
@@ -866,6 +872,188 @@ impl FlightControllerConnection {
         }
         Ok(backup)
     }
+
+    /// Read the onboard dataflash summary (MSP_DATAFLASH_SUMMARY / 70).
+    ///
+    /// Returns whether the FC has a usable dataflash chip, how many bytes
+    /// are currently used by recorded blackbox sessions, and how big the
+    /// chip is. SD-card-only boards return `supported = false`.
+    pub async fn read_dataflash_summary(&mut self) -> Result<DataflashSummary> {
+        let request = self
+            .msp
+            .create_message(MspCommand::DataflashSummary, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        for _ in 0..8 {
+            let response = self.read_msp_response().await?;
+            if matches!(response.command, MspCommand::DataflashSummary) {
+                return DataflashSummary::from_payload(&response.payload);
+            }
+        }
+        Err(DronetunerError::communication_error(
+            "Did not receive MSP_DATAFLASH_SUMMARY response after 8 frames",
+        ))
+    }
+
+    /// Read a chunk of dataflash starting at `offset`.
+    ///
+    /// Request payload is the u32 LE offset. The response begins with the
+    /// same u32 LE offset (echoed back) followed by the chunk bytes. Returns
+    /// `(offset_echoed, chunk)` so the caller can sanity-check progress.
+    /// Chunk size is FC-decided — typically 1–4 KB per request.
+    pub async fn read_dataflash_chunk(&mut self, offset: u32) -> Result<(u32, Vec<u8>)> {
+        let request = self
+            .msp
+            .create_message(MspCommand::DataflashRead, &offset.to_le_bytes())?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        for _ in 0..8 {
+            let response = self.read_msp_response().await?;
+            if matches!(response.command, MspCommand::DataflashRead) {
+                if response.payload.len() < 4 {
+                    return Err(DronetunerError::parse_error(
+                        format!(
+                            "MSP_DATAFLASH_READ payload too short: {} bytes",
+                            response.payload.len()
+                        ),
+                        None,
+                    ));
+                }
+                let echoed = u32::from_le_bytes([
+                    response.payload[0],
+                    response.payload[1],
+                    response.payload[2],
+                    response.payload[3],
+                ]);
+                let chunk = response.payload[4..].to_vec();
+                return Ok((echoed, chunk));
+            }
+        }
+        Err(DronetunerError::communication_error(
+            "Did not receive MSP_DATAFLASH_READ response after 8 frames",
+        ))
+    }
+
+    /// Stream the entire dataflash to memory.
+    ///
+    /// Calls `progress(bytes_so_far, total_bytes)` after each chunk so callers
+    /// can drive a UI. Stops once `bytes_so_far >= summary.used_size` or the
+    /// FC returns an empty chunk.
+    ///
+    /// Errors if the FC reports `supported = false` or `used_size == 0`.
+    pub async fn pull_dataflash<F: FnMut(u64, u64)>(
+        &mut self,
+        mut progress: F,
+    ) -> Result<Vec<u8>> {
+        let summary = self.read_dataflash_summary().await?;
+        if !summary.supported {
+            return Err(DronetunerError::communication_error(
+                "Flight controller reports no onboard dataflash (likely SD-card or no logger)",
+            ));
+        }
+        if summary.used_size == 0 {
+            return Err(DronetunerError::communication_error(
+                "Onboard dataflash is empty — record a flight first",
+            ));
+        }
+
+        let total = summary.used_size as u64;
+        let mut buf = Vec::with_capacity(total as usize);
+        progress(0, total);
+
+        let mut offset: u32 = 0;
+        // Cap iterations: a 32 MB chip at 256-byte chunks tops out around
+        // 130k iterations. 200k gives a generous ceiling against runaway loops.
+        for _ in 0..200_000 {
+            if (offset as u64) >= total {
+                break;
+            }
+            let (echoed, chunk) = self.read_dataflash_chunk(offset).await?;
+            if echoed != offset {
+                return Err(DronetunerError::communication_error(format!(
+                    "FC echoed dataflash offset {echoed}, expected {offset} — sync lost"
+                )));
+            }
+            if chunk.is_empty() {
+                // FC tells us we've hit the end early. Honour it.
+                break;
+            }
+            offset = offset.saturating_add(chunk.len() as u32);
+            buf.extend_from_slice(&chunk);
+            progress(buf.len() as u64, total);
+        }
+        Ok(buf)
+    }
+}
+
+/// Onboard-dataflash summary (MSP_DATAFLASH_SUMMARY / 70).
+///
+/// Betaflight payload layout:
+/// ```text
+///   0       u8    flags: bit 0 = ready, bit 1 = supported
+///   1..=4   u32   sector count (LE)
+///   5..=8   u32   total size in bytes (LE)
+///   9..=12  u32   used size in bytes (LE)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataflashSummary {
+    /// `ready` bit — chip is initialised and accepting reads.
+    pub ready: bool,
+    /// `supported` bit — board has a dataflash chip at all (false on
+    /// SD-card-only or no-logger boards).
+    pub supported: bool,
+    /// Sector count.
+    pub sectors: u32,
+    /// Total chip size in bytes.
+    pub total_size: u32,
+    /// Bytes currently consumed by recorded sessions. The dataflash is a
+    /// raw concatenation of frames, so this is also "how much to read".
+    pub used_size: u32,
+}
+
+impl DataflashSummary {
+    /// Parse the 13-byte payload. Tolerates trailing bytes (some firmware
+    /// variants append extra fields; we stop after the canonical layout).
+    pub fn from_payload(payload: &[u8]) -> Result<Self> {
+        if payload.len() < 13 {
+            return Err(DronetunerError::parse_error(
+                format!(
+                    "MSP_DATAFLASH_SUMMARY payload too short: {} bytes",
+                    payload.len()
+                ),
+                None,
+            ));
+        }
+        let flags = payload[0];
+        let sectors = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        let total_size =
+            u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+        let used_size = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
+        Ok(Self {
+            ready: flags & 0x01 != 0,
+            supported: flags & 0x02 != 0,
+            sectors,
+            total_size,
+            used_size,
+        })
+    }
+
+    /// Render as the 13-byte payload. Used by the simulator.
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(13);
+        let mut flags = 0u8;
+        if self.ready {
+            flags |= 0x01;
+        }
+        if self.supported {
+            flags |= 0x02;
+        }
+        buf.push(flags);
+        buf.extend_from_slice(&self.sectors.to_le_bytes());
+        buf.extend_from_slice(&self.total_size.to_le_bytes());
+        buf.extend_from_slice(&self.used_size.to_le_bytes());
+        buf
+    }
 }
 
 /// 30-byte MSP_PID payload snapshot. Provides typed accessors for the
@@ -1268,6 +1456,9 @@ impl MspCommand {
             117 => Ok(MspCommand::Pidnames),
             92 => Ok(MspCommand::FilterConfig),
             93 => Ok(MspCommand::SetFilterConfig),
+            70 => Ok(MspCommand::DataflashSummary),
+            71 => Ok(MspCommand::DataflashRead),
+            72 => Ok(MspCommand::DataflashErase),
             202 => Ok(MspCommand::SetPid),
             250 => Ok(MspCommand::EepromWrite),
             _ => Err(DronetunerError::parse_error("Unknown MSP command", None)),
@@ -1394,6 +1585,19 @@ pub struct SimulatorState {
     pub fail_next_setfilter: bool,
     /// How many times EepromWrite has been received.
     pub eeprom_writes: usize,
+    /// In-memory representation of the FC's onboard dataflash. Tests and the
+    /// CLI's `simulator://` scheme load real BBL bytes here so the pull
+    /// flow can be exercised end-to-end.
+    pub dataflash: Vec<u8>,
+    /// Whether the simulator should report a dataflash chip at all.
+    pub dataflash_supported: bool,
+    /// Total chip capacity advertised in the summary (≥ `dataflash.len()`).
+    pub dataflash_total: u32,
+    /// Max bytes the simulator returns per dataflash read. Set small in
+    /// tests to force the pull loop to iterate.
+    pub dataflash_chunk_size: usize,
+    /// How many times DataflashErase has been received.
+    pub dataflash_erases: usize,
 }
 
 impl SimulatorState {
@@ -1427,6 +1631,15 @@ impl Default for SimulatorState {
             fail_next_setpid: false,
             fail_next_setfilter: false,
             eeprom_writes: 0,
+            dataflash: Vec::new(),
+            dataflash_supported: true,
+            // 16 MB default chip — generic but plausible for a modern FC.
+            dataflash_total: 16 * 1024 * 1024,
+            // V1 framing caps payload at 255 bytes; the chunk response is
+            // 4 bytes of echoed offset + chunk bytes, so 240 leaves
+            // comfortable margin and still makes tests iterate.
+            dataflash_chunk_size: 240,
+            dataflash_erases: 0,
         }
     }
 }
@@ -1532,6 +1745,45 @@ impl MspSimulator {
             }
             MspCommand::EepromWrite => {
                 self.state.lock().unwrap().eeprom_writes += 1;
+                Ok(Vec::new())
+            }
+            MspCommand::DataflashSummary => {
+                let state = self.state.lock().unwrap();
+                let summary = DataflashSummary {
+                    ready: state.dataflash_supported,
+                    supported: state.dataflash_supported,
+                    sectors: (state.dataflash_total / 4096).max(1),
+                    total_size: state.dataflash_total,
+                    used_size: state.dataflash.len() as u32,
+                };
+                Ok(summary.to_payload())
+            }
+            MspCommand::DataflashRead => {
+                if req.payload.len() < 4 {
+                    return Err(DronetunerError::parse_error(
+                        "MSP_DATAFLASH_READ request missing offset",
+                        None,
+                    ));
+                }
+                let offset = u32::from_le_bytes([
+                    req.payload[0],
+                    req.payload[1],
+                    req.payload[2],
+                    req.payload[3],
+                ]) as usize;
+                let state = self.state.lock().unwrap();
+                let mut response = Vec::with_capacity(4 + state.dataflash_chunk_size);
+                response.extend_from_slice(&(offset as u32).to_le_bytes());
+                if offset < state.dataflash.len() {
+                    let end = (offset + state.dataflash_chunk_size).min(state.dataflash.len());
+                    response.extend_from_slice(&state.dataflash[offset..end]);
+                }
+                Ok(response)
+            }
+            MspCommand::DataflashErase => {
+                let mut state = self.state.lock().unwrap();
+                state.dataflash.clear();
+                state.dataflash_erases += 1;
                 Ok(Vec::new())
             }
         }
@@ -1855,5 +2107,120 @@ mod tests {
         let err = FilterSnapshot::from_payload(vec![0u8; 4])
             .expect_err("payloads under 6 bytes should be rejected");
         assert!(matches!(err, DronetunerError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_dataflash_summary_round_trip() {
+        let s = DataflashSummary {
+            ready: true,
+            supported: true,
+            sectors: 4096,
+            total_size: 16 * 1024 * 1024,
+            used_size: 12_345,
+        };
+        let bytes = s.to_payload();
+        let back = DataflashSummary::from_payload(&bytes).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn test_dataflash_summary_short_payload_is_error() {
+        let err = DataflashSummary::from_payload(&[0u8; 8])
+            .expect_err("payloads under 13 bytes should be rejected");
+        assert!(matches!(err, DronetunerError::ParseError { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_read_dataflash_summary_returns_simulator_state() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        {
+            let mut s = sim.state.lock().unwrap();
+            s.dataflash = b"hello world".to_vec();
+            s.dataflash_total = 1_048_576;
+            s.dataflash_supported = true;
+        }
+        let state = sim.state.clone();
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        let summary = conn.read_dataflash_summary().await.expect("summary");
+        assert!(summary.supported);
+        assert!(summary.ready);
+        assert_eq!(summary.used_size, 11);
+        assert_eq!(summary.total_size, 1_048_576);
+
+        let _ = state; // keep alive
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_pull_dataflash_streams_full_blob_across_chunks() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        // Construct a deterministic blob bigger than one chunk so the loop
+        // has to iterate. 1000 bytes at 240/chunk → ~5 reads.
+        let blob: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        {
+            let mut s = sim.state.lock().unwrap();
+            s.dataflash = blob.clone();
+            s.dataflash_chunk_size = 240;
+        }
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        let mut last_progress = (0u64, 0u64);
+        let pulled = conn
+            .pull_dataflash(|done, total| last_progress = (done, total))
+            .await
+            .expect("pull_dataflash");
+        assert_eq!(pulled, blob);
+        assert_eq!(last_progress, (blob.len() as u64, blob.len() as u64));
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_pull_dataflash_errors_on_unsupported_chip() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        sim.state.lock().unwrap().dataflash_supported = false;
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        let err = conn
+            .pull_dataflash(|_, _| {})
+            .await
+            .expect_err("should error on unsupported chip");
+        assert!(matches!(err, DronetunerError::CommunicationError { .. }));
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_pull_dataflash_errors_on_empty_chip() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        // dataflash defaults to empty
+        let handle = tokio::spawn(sim.run());
+        let mut conn = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .unwrap();
+
+        let err = conn
+            .pull_dataflash(|_, _| {})
+            .await
+            .expect_err("should error on empty chip");
+        assert!(matches!(err, DronetunerError::CommunicationError { .. }));
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
 }
