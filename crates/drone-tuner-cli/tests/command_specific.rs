@@ -616,9 +616,6 @@ mod validate_scenarios {
 }
 
 /// Test tune command scenarios.
-/// `tune` is gated behind the `experimental` feature in the CLI; these tests
-/// only run when that feature is enabled.
-#[cfg(feature = "experimental")]
 mod tune_scenarios {
     use super::*;
 
@@ -641,15 +638,15 @@ mod tune_scenarios {
         assert!(output_str.contains("Analyzing blackbox for tuning recommendations"));
     }
 
+    /// Without `--connection`, `--dry-run` short-circuits to "no changes
+    /// applied" and never tries to open a port.
     #[test]
-    fn test_tune_dry_run_behavior() {
+    fn test_tune_dry_run_without_connection() {
         let test_files = TestFiles::new();
 
         create_test_command()
             .arg("tune")
             .arg(&test_files.valid_file)
-            .arg("--connection")
-            .arg("/dev/ttyUSB0")
             .arg("--dry-run")
             .assert()
             .success()
@@ -668,20 +665,21 @@ mod tune_scenarios {
             .stdout(predicate::str::contains("Specify --connection"));
     }
 
+    /// `simulator://` spins up an in-process MSP simulator so we can
+    /// exercise the full dry-connect-and-diff path without serial hardware.
     #[test]
-    fn test_tune_with_realtime_disabled() {
+    fn test_tune_dry_run_with_simulator() {
         let test_files = TestFiles::new();
 
         create_test_command()
             .arg("tune")
             .arg(&test_files.valid_file)
             .arg("--connection")
-            .arg("/dev/ttyUSB0")
+            .arg("simulator://")
+            .arg("--dry-run")
             .assert()
             .success()
-            .stdout(predicate::str::contains(
-                "Real-time tuning is not available",
-            ));
+            .stdout(predicate::str::contains("Tuning Recommendations"));
     }
 }
 

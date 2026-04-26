@@ -9,7 +9,7 @@
 //! - **FFT Analysis**: High-performance frequency domain analysis using Welch's method
 //! - **Oscillation Detection**: Automated detection of P-term, D-term, and mechanical oscillations
 //! - **Filter Optimization**: Intelligent filter configuration recommendations
-//! - **Real-time Communication**: Live flight controller connectivity (with `realtime` feature)
+//! - **Real-time Communication**: Live flight controller connectivity over MSP
 //!
 //! ## Quick Start
 //!
@@ -41,8 +41,6 @@ pub mod blackbox;
 pub mod domain;
 pub mod error;
 pub mod filters;
-
-#[cfg(feature = "realtime")]
 pub mod realtime;
 
 // Re-export main types for convenience

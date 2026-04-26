@@ -3,9 +3,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use console::{style, Term};
-use drone_tuner_core::domain::FilterRecommendationType;
-#[cfg(feature = "experimental")]
-use drone_tuner_core::domain::Priority;
+use drone_tuner_core::domain::{FilterRecommendationType, Priority};
 use drone_tuner_core::{AnalysisEngine, BlackboxParser, FlightSession};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -86,11 +84,9 @@ enum Commands {
     Compare(CompareArgs),
     /// Validate blackbox file format
     Validate(ValidateArgs),
-    /// [experimental] Connect to flight controller for real-time monitoring
-    #[cfg(feature = "experimental")]
+    /// Connect to flight controller for real-time monitoring
     Monitor(MonitorArgs),
-    /// [experimental] Auto-tune PID parameters based on analysis
-    #[cfg(feature = "experimental")]
+    /// Auto-tune PID parameters based on analysis
     Tune(TuneArgs),
     /// Export analysis results in various formats
     Export(ExportArgs),
@@ -168,7 +164,6 @@ struct ValidateArgs {
 }
 
 /// Arguments for the monitor command
-#[cfg(feature = "experimental")]
 #[derive(Args)]
 struct MonitorArgs {
     /// Connection string (e.g., /dev/ttyUSB0 or COM3)
@@ -193,7 +188,6 @@ struct MonitorArgs {
 }
 
 /// Arguments for the tune command
-#[cfg(feature = "experimental")]
 #[derive(Args)]
 struct TuneArgs {
     /// Path to blackbox file to analyze for tuning
@@ -274,9 +268,7 @@ async fn main() -> Result<()> {
         }
         Commands::Compare(args) => compare_command(args, cli.output_format).await,
         Commands::Validate(args) => validate_command(args, cli.output_format).await,
-        #[cfg(feature = "experimental")]
         Commands::Monitor(args) => monitor_command(args, cli.output_format).await,
-        #[cfg(feature = "experimental")]
         Commands::Tune(args) => tune_command(args, cli.output_format).await,
         Commands::Export(args) => export_command(args, cli.output_format).await,
         Commands::Info => info_command().await,
@@ -658,13 +650,11 @@ async fn validate_single_file(file_path: &PathBuf, check_issues: bool) -> Result
 }
 
 /// Handle the monitor command
-#[cfg(feature = "experimental")]
 async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Result<()> {
     eprintln!(
         "{} `monitor` is EXPERIMENTAL — the MSP transport has never been validated against a real FC. Behaviour is not stable.",
         style("⚠").yellow().bold()
     );
-    #[cfg(feature = "realtime")]
     {
         use drone_tuner_core::realtime::*;
 
@@ -764,25 +754,10 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
         );
         Ok(())
     }
-
-    #[cfg(not(feature = "realtime"))]
-    {
-        println!(
-            "{} Real-time monitoring is not available in this build",
-            style("⚠").yellow()
-        );
-        println!("Rebuild with --features realtime to enable this feature");
-        Ok(())
-    }
 }
 
 /// Handle the tune command
-#[cfg(feature = "experimental")]
 async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()> {
-    eprintln!(
-        "{} `tune` is EXPERIMENTAL — recommendations are produced but parameter writeback is stubbed. Use `analyze` for stable analysis.",
-        style("⚠").yellow().bold()
-    );
     println!(
         "{} Analyzing blackbox for tuning recommendations",
         style("🔧").blue()
@@ -937,10 +912,10 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
 
     // Decide whether/how to apply.
     match (&args.connection, args.dry_run) {
-        (None, true) | (None, false) if args.dry_run => {
+        (None, true) => {
             println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
         }
-        (None, _) => {
+        (None, false) => {
             println!(
                 "\n{} Specify --connection to apply changes to flight controller",
                 style("ℹ️").blue()
@@ -950,34 +925,10 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
             // Dry-run + connection: actually open the FC, read current state,
             // show what WOULD change, but don't write. Useful for verifying
             // hardware connectivity before committing to a tune.
-            #[cfg(feature = "realtime")]
-            {
-                dry_connect_and_diff(connection, &args, &analysis.report).await?;
-            }
-            #[cfg(not(feature = "realtime"))]
-            {
-                let _ = connection;
-                println!("\n{} Dry run mode - no changes applied", style("ℹ️").blue());
-                println!(
-                    "{} Real-time tuning is not available in this build",
-                    style("⚠").yellow()
-                );
-            }
+            dry_connect_and_diff(connection, &args, &analysis.report).await?;
         }
         (Some(connection), false) => {
-            #[cfg(feature = "realtime")]
-            {
-                apply_pid_recommendations_via_fc(connection, &args, &analysis.report).await?;
-            }
-            #[cfg(not(feature = "realtime"))]
-            {
-                let _ = connection;
-                println!(
-                    "{} Real-time tuning is not available in this build",
-                    style("⚠").yellow()
-                );
-                println!("Rebuild with --features realtime to enable this feature");
-            }
+            apply_pid_recommendations_via_fc(connection, &args, &analysis.report).await?;
         }
     }
 
@@ -986,35 +937,24 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
 
 /// Open an [`FlightControllerConnection`] from a connection string.
 ///
-/// Supports the `simulator://` scheme when built with the `test-support`
-/// feature, which spawns an in-process [`MspSimulator`] so the rest of the
-/// realtime path can be exercised without serial hardware.
-#[cfg(feature = "realtime")]
+/// Supports the `simulator://` scheme, which spawns an in-process
+/// [`MspSimulator`] so the rest of the MSP path can be exercised without
+/// serial hardware.
 async fn open_fc_connection(
     connection: &str,
 ) -> Result<drone_tuner_core::realtime::FlightControllerConnection> {
     use drone_tuner_core::realtime::FlightControllerConnection;
 
     if connection == "simulator://" {
-        #[cfg(feature = "test-support")]
-        {
-            use drone_tuner_core::realtime::{MockTransport, MspSimulator};
-            let (client, server) = MockTransport::pair();
-            let sim = MspSimulator::new(Box::new(server));
-            tokio::spawn(async move {
-                let _ = sim.run().await;
-            });
-            FlightControllerConnection::from_transport(Box::new(client))
-                .await
-                .context("Failed to connect to in-process MSP simulator")
-        }
-        #[cfg(not(feature = "test-support"))]
-        {
-            Err(anyhow::anyhow!(
-                "simulator:// requires the `test-support` Cargo feature. \
-                 Rebuild with --features test-support to use it."
-            ))
-        }
+        use drone_tuner_core::realtime::{MockTransport, MspSimulator};
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        tokio::spawn(async move {
+            let _ = sim.run().await;
+        });
+        FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .context("Failed to connect to in-process MSP simulator")
     } else {
         // Strip a leading `serial://` so callers can use a uniform scheme
         // (`serial:///dev/ttyACM0`) alongside `simulator://`. The core
@@ -1029,7 +969,6 @@ async fn open_fc_connection(
 /// Open the FC, read current PID, show what would change without writing.
 /// Lets users verify their hardware connection works before committing
 /// to a real tune.
-#[cfg(feature = "realtime")]
 async fn dry_connect_and_diff(
     connection: &str,
     args: &TuneArgs,
@@ -1105,7 +1044,6 @@ async fn dry_connect_and_diff(
 /// - With `--save-eeprom`, after a successful write, EEPROM_WRITE is sent
 ///   so changes survive a power cycle. Without it, RAM-only changes
 ///   revert on next reboot — itself a useful safety net.
-#[cfg(feature = "realtime")]
 async fn apply_pid_recommendations_via_fc(
     connection: &str,
     args: &TuneArgs,
@@ -1203,7 +1141,6 @@ async fn apply_pid_recommendations_via_fc(
 ///
 /// `recommended_value` is in Betaflight's internal scale (typically 0..=255),
 /// so we just clamp and round to u8.
-#[cfg(feature = "realtime")]
 fn apply_pid_recs_to_snapshot(
     snapshot: &mut drone_tuner_core::realtime::PidSnapshot,
     recommendations: &[drone_tuner_core::domain::PidRecommendation],
@@ -1963,7 +1900,6 @@ impl serde::Serialize for ComparisonSummary {
 // Helper functions for new CLI features
 
 /// Format telemetry frame for pretty display
-#[cfg(feature = "realtime")]
 fn format_telemetry_frame(frame: &drone_tuner_core::realtime::TelemetryFrame) -> String {
     let mut output = String::new();
 
@@ -2000,7 +1936,6 @@ fn format_telemetry_frame(frame: &drone_tuner_core::realtime::TelemetryFrame) ->
 }
 
 /// Format telemetry frame as JSON
-#[cfg(feature = "realtime")]
 fn format_telemetry_json(frame: &drone_tuner_core::realtime::TelemetryFrame) -> serde_json::Value {
     let mut json = serde_json::Map::new();
 
@@ -2037,7 +1972,6 @@ fn format_telemetry_json(frame: &drone_tuner_core::realtime::TelemetryFrame) -> 
 }
 
 /// Generate CSV header for telemetry
-#[cfg(feature = "realtime")]
 fn telemetry_csv_header(fields: &[&str]) -> String {
     let mut header = vec!["timestamp".to_string()];
 
@@ -2075,7 +2009,6 @@ fn telemetry_csv_header(fields: &[&str]) -> String {
 }
 
 /// Format telemetry frame as CSV row
-#[cfg(feature = "realtime")]
 fn format_telemetry_csv(frame: &drone_tuner_core::realtime::TelemetryFrame) -> String {
     let mut values = vec![frame.timestamp.elapsed().as_secs_f64().to_string()];
 
@@ -2346,7 +2279,7 @@ async fn export_to_python(
     Ok(())
 }
 
-#[cfg(all(test, feature = "realtime"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use drone_tuner_core::domain::{Axis, PidRecommendation, PidTerm, Priority};

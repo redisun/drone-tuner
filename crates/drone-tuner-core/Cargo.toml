@@ -15,22 +15,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true }
 nom = { workspace = true }
 blackbox-log = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 flate2 = { workspace = true }
-serialport = { workspace = true, optional = true }
+serialport = { workspace = true }
 async-trait = { workspace = true }
 
 [features]
 default = []
-realtime = ["tokio", "serialport"]
-# Exposes MockTransport/MspSimulator publicly so CLI tests and demos
-# can drive the realtime path without serial hardware. Implies realtime.
-test-support = ["realtime"]
 
 [dev-dependencies]
 proptest = { workspace = true }

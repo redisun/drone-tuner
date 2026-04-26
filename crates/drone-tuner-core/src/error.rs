@@ -39,8 +39,7 @@ pub enum DronetunerError {
         message: String,
     },
 
-    /// Real-time communication errors (only available with realtime feature)
-    #[cfg(feature = "realtime")]
+    /// Real-time communication errors (MSP / serial transport).
     #[error("Communication error: {message}")]
     CommunicationError {
         /// Description of the communication error
@@ -85,7 +84,6 @@ impl DronetunerError {
         }
     }
 
-    #[cfg(feature = "realtime")]
     /// Creates a new communication error with a message.
     pub fn communication_error(message: impl Into<String>) -> Self {
         Self::CommunicationError {

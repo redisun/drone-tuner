@@ -662,7 +662,22 @@ impl FlightControllerConnection {
         let mut tmp = [0u8; 256];
         // Bound the loop so a chatty FC can't keep us forever.
         for _ in 0..32 {
-            let n = self.transport.read(&mut tmp).await?;
+            // Bound each read too — on a real serial port a stalled FC will
+            // block forever otherwise, and the loop count alone won't save
+            // us. 2s is generous: MSP responses are usually <100ms but USB
+            // CDC stutters happen.
+            let n =
+                match tokio::time::timeout(Duration::from_secs(2), self.transport.read(&mut tmp))
+                    .await
+                {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(DronetunerError::communication_error(
+                            "Timed out waiting for MSP response bytes",
+                        ));
+                    }
+                };
             if n == 0 {
                 if acc.is_empty() {
                     return Err(DronetunerError::communication_error("No response received"));
@@ -898,7 +913,6 @@ impl MspProtocol {
 
     /// Create an MSP response message (direction = `>`). Used by the
     /// in-process MSP simulator to reply to client requests.
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn create_response(&self, command: MspCommand, payload: &[u8]) -> Result<Vec<u8>> {
         self.build_framed(MspMessageType::Response, command, payload)
     }
@@ -955,7 +969,6 @@ impl MspProtocol {
 
     /// Parse an MSP request (direction = `<`). Used by the in-process MSP
     /// simulator to consume client requests.
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn parse_request(&self, data: &[u8]) -> Result<MspResponse> {
         self.parse_framed(MspMessageType::Request, data)
     }
@@ -1153,7 +1166,6 @@ impl Transport for UsbSerialTransport {
 
 /// Mock transport for in-process testing. Pairs with a sibling so anything
 /// one writes the other reads.
-#[cfg(any(test, feature = "test-support"))]
 pub struct MockTransport {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -1161,7 +1173,6 @@ pub struct MockTransport {
     description: String,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl MockTransport {
     /// Build a connected pair: bytes written to `(.0)` arrive at `(.1).read()`,
     /// and vice versa.
@@ -1185,7 +1196,6 @@ impl MockTransport {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 impl Transport for MockTransport {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -1223,7 +1233,6 @@ impl Transport for MockTransport {
 
 /// Shared simulator state — kept behind an Arc<Mutex<_>> so tests can peek
 /// at it concurrently with the simulator task.
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct SimulatorState {
     /// Current 30-byte MSP_PID payload. Updated on SetPid; returned on Pid.
@@ -1235,7 +1244,6 @@ pub struct SimulatorState {
     pub eeprom_writes: usize,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl SimulatorState {
     fn default_pid() -> [u8; 30] {
         // Plausible Betaflight defaults for ROLL/PITCH/YAW; rest 0.
@@ -1247,7 +1255,6 @@ impl SimulatorState {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl Default for SimulatorState {
     fn default() -> Self {
         Self {
@@ -1260,7 +1267,6 @@ impl Default for SimulatorState {
 
 /// Configurable Betaflight FC simulator. Spawn with [`MspSimulator::run`]
 /// to service requests on the server end of a [`MockTransport`] pair.
-#[cfg(any(test, feature = "test-support"))]
 pub struct MspSimulator {
     transport: Box<dyn Transport + Send>,
     /// 3-byte API version (major, minor, patch).
@@ -1273,7 +1279,6 @@ pub struct MspSimulator {
     pub state: std::sync::Arc<std::sync::Mutex<SimulatorState>>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl MspSimulator {
     /// Construct a simulator bound to the given transport.
     ///

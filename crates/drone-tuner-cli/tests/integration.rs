@@ -567,127 +567,6 @@ mod validate_command_tests {
     }
 }
 
-/// `monitor` is gated behind the `experimental` feature; only run these
-/// tests when that feature is enabled.
-#[cfg(feature = "experimental")]
-mod monitor_command_tests {
-    use super::*;
-
-    #[test]
-    fn test_monitor_without_realtime_feature() {
-        cli_cmd()
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-
-    #[test]
-    fn test_monitor_invalid_connection() {
-        cli_cmd()
-            .arg("monitor")
-            .arg("/nonexistent/port")
-            .assert()
-            .success() // Command succeeds but shows feature unavailable message
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-
-    #[test]
-    fn test_monitor_with_rate() {
-        cli_cmd()
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .arg("--rate")
-            .arg("200")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-
-    #[test]
-    fn test_monitor_with_duration() {
-        cli_cmd()
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .arg("--duration")
-            .arg("10")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-
-    #[test]
-    fn test_monitor_with_fields() {
-        cli_cmd()
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .arg("--fields")
-            .arg("gyro,pid_error,motors")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-
-    #[test]
-    fn test_monitor_with_log_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let log_file = temp_dir.path().join("telemetry.log");
-
-        cli_cmd()
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .arg("--log-file")
-            .arg(&log_file)
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-
-    #[test]
-    fn test_monitor_json_output() {
-        cli_cmd()
-            .arg("--output-format")
-            .arg("json")
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-
-    #[test]
-    fn test_monitor_csv_output() {
-        cli_cmd()
-            .arg("--output-format")
-            .arg("csv")
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-    }
-}
-
-/// `tune` is gated behind the `experimental` feature; only run these
-/// tests when that feature is enabled.
-#[cfg(feature = "experimental")]
 mod tune_command_tests {
     use super::*;
 
@@ -722,26 +601,6 @@ mod tune_command_tests {
             .assert()
             .success()
             .stdout(predicate::str::contains("Dry run mode"));
-    }
-
-    #[test]
-    fn test_tune_with_connection() {
-        let blackbox_file = test_blackbox_file();
-        if !blackbox_file.exists() {
-            println!("Skipping test - no test data file found");
-            return;
-        }
-
-        cli_cmd()
-            .arg("tune")
-            .arg(&blackbox_file)
-            .arg("--connection")
-            .arg("/dev/ttyUSB0")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time tuning is not available",
-            ));
     }
 
     #[test]
@@ -786,26 +645,6 @@ mod tune_command_tests {
             .assert()
             .failure()
             .stderr(predicate::str::contains("Failed to read file"));
-    }
-
-    #[test]
-    fn test_tune_invalid_connection() {
-        let blackbox_file = test_blackbox_file();
-        if !blackbox_file.exists() {
-            println!("Skipping test - no test data file found");
-            return;
-        }
-
-        cli_cmd()
-            .arg("tune")
-            .arg(&blackbox_file)
-            .arg("--connection")
-            .arg("invalid_port")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time tuning is not available",
-            ));
     }
 }
 
@@ -1258,9 +1097,7 @@ mod concurrent_execution_tests {
     }
 }
 
-/// End-to-end tests against the in-process MSP simulator. Built only when
-/// the CLI is compiled with `--features test-support`.
-#[cfg(feature = "test-support")]
+/// End-to-end tests against the in-process MSP simulator.
 mod simulator_tests {
     use super::*;
 
@@ -1354,38 +1191,6 @@ mod simulator_tests {
 
 mod feature_flag_tests {
     use super::*;
-
-    /// `monitor`/`tune` are gated behind the `experimental` feature; this
-    /// asserts that with `experimental` enabled but `realtime` not, those
-    /// commands surface a graceful "not available" message rather than
-    /// crashing.
-    #[cfg(feature = "experimental")]
-    #[test]
-    fn test_realtime_features_disabled() {
-        // Test that realtime commands gracefully handle missing features
-        cli_cmd()
-            .arg("monitor")
-            .arg("/dev/ttyUSB0")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains(
-                "Real-time monitoring is not available",
-            ));
-
-        let blackbox_file = test_blackbox_file();
-        if blackbox_file.exists() {
-            cli_cmd()
-                .arg("tune")
-                .arg(&blackbox_file)
-                .arg("--connection")
-                .arg("/dev/ttyUSB0")
-                .assert()
-                .success()
-                .stdout(predicate::str::contains(
-                    "Real-time tuning is not available",
-                ));
-        }
-    }
 
     #[test]
     fn test_core_features_always_available() {

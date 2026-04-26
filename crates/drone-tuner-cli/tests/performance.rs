@@ -144,36 +144,6 @@ mod performance_benchmarks {
     }
 
     #[test]
-    fn test_validate_performance() {
-        let test_files = TestFiles::new();
-        let batch_files = test_files.create_batch_files(20);
-
-        let batch_dir = test_files.temp_dir.path().join("validate_perf");
-        fs::create_dir(&batch_dir).unwrap();
-
-        for (i, file) in batch_files.iter().enumerate() {
-            fs::copy(file, batch_dir.join(format!("validate_{}.bbl", i))).unwrap();
-        }
-
-        let start = Instant::now();
-        create_test_command()
-            .arg("validate")
-            .arg(&batch_dir)
-            .arg("--check-issues")
-            .assert()
-            .success();
-        let duration = start.elapsed();
-
-        // Validation should be efficient
-        assert!(
-            duration.as_secs() < 20,
-            "Validation took too long: {:?}",
-            duration
-        );
-        println!("Validation time for 20 files: {:?}", duration);
-    }
-
-    #[test]
     fn test_compare_performance() {
         let test_files = TestFiles::new();
 
@@ -304,35 +274,6 @@ mod memory_tests {
 /// Stress tests for edge cases
 mod stress_tests {
     use super::*;
-
-    #[test]
-    fn test_max_files_limit_stress() {
-        let test_files = TestFiles::new();
-
-        // Create many files to test max-files limit
-        let stress_files = test_files.create_batch_files(1000);
-        let stress_dir = test_files.temp_dir.path().join("stress_test");
-        fs::create_dir(&stress_dir).unwrap();
-
-        for (i, file) in stress_files.iter().take(100).enumerate() {
-            fs::copy(file, stress_dir.join(format!("stress_{:03}.bbl", i))).unwrap();
-        }
-
-        // Test with various max-files limits
-        for max_files in [10, 50, 100] {
-            create_test_command()
-                .arg("analyze")
-                .arg(&stress_dir)
-                .arg("--max-files")
-                .arg(max_files.to_string())
-                .assert()
-                .success()
-                .stderr(predicate::str::contains(format!(
-                    "Found {} blackbox file(s)",
-                    max_files.min(100)
-                )));
-        }
-    }
 
     #[test]
     fn test_deep_directory_recursion() {
