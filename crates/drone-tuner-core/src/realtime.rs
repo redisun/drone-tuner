@@ -750,6 +750,28 @@ impl FlightControllerConnection {
         ))
     }
 
+    /// Read MSP frames until one matching `expected` arrives.
+    ///
+    /// Discards up to 8 unrelated frames before giving up. This handles
+    /// the realistic case where the FC has late-emitted responses still
+    /// queued from earlier handshake or a previously-aborted command —
+    /// without it, an unrelated frame can be silently consumed as the
+    /// ack for a write, leaving the *real* ack to land on the next
+    /// caller's read and producing a request/response misalignment that
+    /// looks fine until something downstream corrupts.
+    async fn read_msp_response_for(&mut self, expected: MspCommand) -> Result<MspResponse> {
+        for _ in 0..8 {
+            let response = self.read_msp_response().await?;
+            if (response.command as u8) == (expected as u8) {
+                return Ok(response);
+            }
+        }
+        Err(DronetunerError::communication_error(format!(
+            "Did not receive MSP response for command {} after 8 frames",
+            expected as u8
+        )))
+    }
+
     /// Read the flight controller's current PID gains (MSP Pid / 112).
     ///
     /// Returns the full 30-byte MSP_PID payload covering all 10 axes.
@@ -759,17 +781,8 @@ impl FlightControllerConnection {
         let request = self.msp.create_message(MspCommand::Pid, &[])?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
-        // The FC may still be flushing late responses to earlier handshake
-        // commands. Skip frames that don't match what we asked for.
-        for _ in 0..8 {
-            let response = self.read_msp_response().await?;
-            if matches!(response.command, MspCommand::Pid) {
-                return PidSnapshot::from_payload(response.payload);
-            }
-        }
-        Err(DronetunerError::communication_error(
-            "Did not receive MSP_PID response after 8 frames",
-        ))
+        let response = self.read_msp_response_for(MspCommand::Pid).await?;
+        PidSnapshot::from_payload(response.payload)
     }
 
     /// Write a PID snapshot back to the flight controller (MSP SetPid / 202).
@@ -784,8 +797,11 @@ impl FlightControllerConnection {
             .create_message(MspCommand::SetPid, snapshot.as_payload())?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
-        // SetPid acks with an empty payload.
-        let _ack = self.read_msp_response().await?;
+        // SetPid acks with an empty payload but MUST echo command 202.
+        // Accepting any frame here once let stale frames be silently
+        // consumed as the ack, leaving the real ack to misalign the
+        // next request/response pair.
+        let _ack = self.read_msp_response_for(MspCommand::SetPid).await?;
         Ok(())
     }
 
@@ -813,6 +829,26 @@ impl FlightControllerConnection {
             }
             return Err(write_err);
         }
+        // Readback verify: re-read what the FC actually stored and reject
+        // a silent mismatch before persisting. Catches firmware that
+        // accepts a write but mutates fields server-side, transport bit
+        // errors that survive a checksum, and any future layout-skew bug
+        // where the bytes we sent don't land where we think they did.
+        let readback = self.read_pid().await?;
+        if readback.as_payload() != new.as_payload() {
+            let detail = format!(
+                "PID writeback verification failed: wrote {} bytes, FC reports {} bytes back \
+                 with mismatching content",
+                new.as_payload().len(),
+                readback.as_payload().len()
+            );
+            if let Err(rollback_err) = self.write_pid(&backup).await {
+                return Err(DronetunerError::communication_error(format!(
+                    "{detail}; rollback also failed ({rollback_err})"
+                )));
+            }
+            return Err(DronetunerError::communication_error(detail));
+        }
         Ok(backup)
     }
 
@@ -822,7 +858,10 @@ impl FlightControllerConnection {
         let request = self.msp.create_message(MspCommand::EepromWrite, &[])?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
-        let _ack = self.read_msp_response().await?;
+        // EepromWrite acks empty but MUST echo command 250. A stale frame
+        // accepted here would mean we report a successful EEPROM commit
+        // for a save that hasn't actually happened yet.
+        let _ack = self.read_msp_response_for(MspCommand::EepromWrite).await?;
         Ok(())
     }
 
@@ -836,15 +875,8 @@ impl FlightControllerConnection {
         let request = self.msp.create_message(MspCommand::FilterConfig, &[])?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
-        for _ in 0..8 {
-            let response = self.read_msp_response().await?;
-            if matches!(response.command, MspCommand::FilterConfig) {
-                return FilterSnapshot::from_payload(response.payload);
-            }
-        }
-        Err(DronetunerError::communication_error(
-            "Did not receive MSP_FILTER_CONFIG response after 8 frames",
-        ))
+        let response = self.read_msp_response_for(MspCommand::FilterConfig).await?;
+        FilterSnapshot::from_payload(response.payload)
     }
 
     /// Write a filter snapshot back to the flight controller
@@ -859,7 +891,12 @@ impl FlightControllerConnection {
             .create_message(MspCommand::SetFilterConfig, snapshot.as_payload())?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
-        let _ack = self.read_msp_response().await?;
+        // SetFilterConfig acks empty but MUST echo command 93. Without
+        // this guard a stale frame can be silently consumed as the ack
+        // and the real ack misaligns the next request/response pair.
+        let _ack = self
+            .read_msp_response_for(MspCommand::SetFilterConfig)
+            .await?;
         Ok(())
     }
 
@@ -881,6 +918,26 @@ impl FlightControllerConnection {
                 )));
             }
             return Err(write_err);
+        }
+        // Readback verify: re-read what the FC actually stored and reject
+        // a silent mismatch before persisting. Catches firmware that
+        // accepts a write but mutates fields server-side, transport bit
+        // errors that survive a checksum, and any future layout-skew bug
+        // where the bytes we sent don't land where we think they did.
+        let readback = self.read_filter_config().await?;
+        if readback.as_payload() != new.as_payload() {
+            let detail = format!(
+                "filter writeback verification failed: wrote {} bytes, FC reports {} bytes back \
+                 with mismatching content",
+                new.as_payload().len(),
+                readback.as_payload().len()
+            );
+            if let Err(rollback_err) = self.write_filter_config(&backup).await {
+                return Err(DronetunerError::communication_error(format!(
+                    "{detail}; rollback also failed ({rollback_err})"
+                )));
+            }
+            return Err(DronetunerError::communication_error(detail));
         }
         Ok(backup)
     }
@@ -2208,6 +2265,19 @@ pub struct SimulatorState {
     pub fail_next_setpid: bool,
     /// Whether the simulator should fail the next SetFilterConfig.
     pub fail_next_setfilter: bool,
+    /// If set, the simulator emits an extra unrelated response frame BEFORE
+    /// servicing the next request. Used by ack-validation tests to verify
+    /// the client drains stale frames instead of consuming them as the ack.
+    /// Cleared after one trigger.
+    pub prepend_stray_response: Option<MspCommand>,
+    /// If set, the simulator silently STORES this payload instead of the
+    /// one received from SetFilterConfig. Drives the readback-verify
+    /// test: a write that gets acked but lands wrong on the FC. Cleared
+    /// after one trigger.
+    pub corrupt_next_setfilter_storage: Option<Vec<u8>>,
+    /// If set, the simulator silently STORES this 30-byte PID payload
+    /// instead of the one received from SetPid. Cleared after one trigger.
+    pub corrupt_next_setpid_storage: Option<[u8; 30]>,
     /// How many times EepromWrite has been received.
     pub eeprom_writes: usize,
     /// In-memory representation of the FC's onboard dataflash. Tests and the
@@ -2294,6 +2364,9 @@ impl Default for SimulatorState {
             filter_config: Self::default_filter_config(),
             fail_next_setpid: false,
             fail_next_setfilter: false,
+            prepend_stray_response: None,
+            corrupt_next_setfilter_storage: None,
+            corrupt_next_setpid_storage: None,
             eeprom_writes: 0,
             dataflash: Vec::new(),
             dataflash_supported: true,
@@ -2374,6 +2447,19 @@ impl MspSimulator {
                 Ok(req) => req,
                 Err(_) => continue, // ignore malformed traffic
             };
+            // Test-only hook: emit an unrelated frame BEFORE the real
+            // response so ack-validation tests can verify the client
+            // drains stale frames instead of consuming them as the ack.
+            //
+            // Bind to a local first — `if let` extends temporary lifetimes
+            // to the end of the block, which would hold the MutexGuard
+            // across the `.await` and break the `Send` bound on `run()`.
+            let stray_cmd = self.state.lock().unwrap().prepend_stray_response.take();
+            if let Some(cmd) = stray_cmd {
+                let stray = msp.create_response(cmd, &[])?;
+                self.transport.write(&stray).await?;
+                self.transport.flush().await?;
+            }
             let response_bytes = match self.handle(&request) {
                 Ok(payload) => msp.create_response(request.command, &payload)?,
                 Err(_) => {
@@ -2461,7 +2547,9 @@ impl MspSimulator {
                         "simulator: injected SetPid failure",
                     ));
                 }
-                if req.payload.len() >= 30 {
+                if let Some(corrupt) = state.corrupt_next_setpid_storage.take() {
+                    state.pid = corrupt;
+                } else if req.payload.len() >= 30 {
                     state.pid.copy_from_slice(&req.payload[..30]);
                 }
                 Ok(Vec::new())
@@ -2478,7 +2566,11 @@ impl MspSimulator {
                         "simulator: injected SetFilterConfig failure",
                     ));
                 }
-                state.filter_config = req.payload.clone();
+                if let Some(corrupt) = state.corrupt_next_setfilter_storage.take() {
+                    state.filter_config = corrupt;
+                } else {
+                    state.filter_config = req.payload.clone();
+                }
                 Ok(Vec::new())
             }
             MspCommand::EepromWrite => {
@@ -3130,6 +3222,141 @@ mod tests {
             .await
             .expect_err("should error on empty chip");
         assert!(matches!(err, DronetunerError::CommunicationError { .. }));
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    // ---------------------------------------------------------------
+    // Ack-validation + readback-verify tests.
+    //
+    // These tests cover the hardening added after the EEPROM-corruption
+    // incident on a real TBS Source One: an unrelated frame in the
+    // transport buffer used to be silently consumed as a write's ack,
+    // and a successful write was assumed to mean the FC stored the
+    // bytes we sent. Both assumptions can mask serious problems.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_write_filter_config_drains_stray_ack_frame() {
+        // Simulator emits an unrelated frame (BoardInfo) BEFORE the real
+        // SetFilterConfig ack. The client must skip the stray and pick up
+        // the matching ack — otherwise the stray would be silently
+        // consumed and the real ack would misalign the next read.
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let mut new_filter = conn.read_filter_config().await.unwrap();
+        new_filter.set_gyro_lpf1_hz(150).unwrap();
+
+        state.lock().unwrap().prepend_stray_response = Some(MspCommand::BoardInfo);
+        conn.write_filter_config(&new_filter)
+            .await
+            .expect("write must skip stray BoardInfo frame and find SetFilterConfig ack");
+
+        // Storage actually updated (proves we didn't bail out early).
+        let stored = state.lock().unwrap().filter_config.clone();
+        assert_eq!(&stored[..], new_filter.as_payload());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_pid_drains_stray_ack_frame() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let mut new_pid = conn.read_pid().await.unwrap();
+        new_pid.set_roll(60, 120, 50);
+
+        state.lock().unwrap().prepend_stray_response = Some(MspCommand::FcVariant);
+        conn.write_pid(&new_pid)
+            .await
+            .expect("write_pid must skip stray FcVariant frame and find SetPid ack");
+
+        assert_eq!(&state.lock().unwrap().pid[0..3], &[60, 120, 50]);
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_save_to_eeprom_drains_stray_ack_frame() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        state.lock().unwrap().prepend_stray_response = Some(MspCommand::ApiVersion);
+        conn.save_to_eeprom()
+            .await
+            .expect("save_to_eeprom must skip stray ApiVersion frame and find EepromWrite ack");
+
+        assert_eq!(state.lock().unwrap().eeprom_writes, 1);
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_filter_with_rollback_detects_silent_corruption() {
+        // Simulator accepts the SetFilterConfig but stores DIFFERENT
+        // bytes than the client sent. apply_filter_with_rollback's
+        // readback verify must catch the mismatch, return an error, and
+        // restore the pre-write snapshot via rollback.
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let original = conn.read_filter_config().await.unwrap();
+        let mut new_filter = original.clone();
+        new_filter.set_gyro_lpf1_hz(180).unwrap();
+
+        // Inject "FC stores garbage instead of what we sent" — same
+        // length so the simulator path treats it as a valid write.
+        let mut corrupt = original.as_payload().to_vec();
+        corrupt[OFF_DYN_NOTCH_COUNT] = 99; // out-of-spec, mimics the osd_units=9 pattern
+        state.lock().unwrap().corrupt_next_setfilter_storage = Some(corrupt);
+
+        let result = conn.apply_filter_with_rollback(&new_filter).await;
+        assert!(
+            result.is_err(),
+            "readback verify must surface the silent corruption"
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verification failed"),
+            "error message should name the failure mode: {msg}"
+        );
+
+        // After the rollback, the simulator's storage matches the
+        // original snapshot — apply path restored it byte-for-byte.
+        let stored = state.lock().unwrap().filter_config.clone();
+        assert_eq!(&stored[..], original.as_payload());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_pid_with_rollback_detects_silent_corruption() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let original = conn.read_pid().await.unwrap();
+        let mut new_pid = original.clone();
+        new_pid.set_roll(70, 130, 55);
+
+        // Inject corruption: simulator stores a clearly-wrong PID set.
+        let mut corrupt = [0u8; 30];
+        corrupt[0..3].copy_from_slice(&[1, 2, 3]);
+        state.lock().unwrap().corrupt_next_setpid_storage = Some(corrupt);
+
+        let result = conn.apply_pid_with_rollback(&new_pid).await;
+        assert!(result.is_err(), "readback verify must catch silent corruption");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("verification failed"),
+            "error message should name the failure mode: {msg}"
+        );
+
+        // Rollback path restored the original.
+        let stored = state.lock().unwrap().pid;
+        assert_eq!(&stored[..], original.as_payload());
+
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
