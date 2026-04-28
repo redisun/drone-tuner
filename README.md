@@ -305,8 +305,10 @@ are deliberately paranoid:
   returned to the caller so it can be persisted to disk.
 - **EEPROM persistence is opt-in.** Without `--save-eeprom`, changes are
   RAM-only and revert on the next power cycle.
-- **Filter writeback is gated** until per-firmware-version offset
-  detection lands (see step 6).
+- **Filter writeback is length-gated and rollback-safe.** Each setter
+  refuses to touch a field beyond the FC's actual payload length, and
+  `apply_filter_with_rollback` restores the pre-write blob on a nack
+  (see step 6). `--skip-filters` disables it entirely.
 
 The history JSONL log gives you a paper trail per FC across every tune
 iteration, keyed on `board_id` + `target_name`.
@@ -487,9 +489,9 @@ let blob = fc.pull_dataflash(|done, total| {
 ```bash
 cargo build --release                # release binary at target/release/drone-tuner
 
-cargo test -p drone-tuner-core       # 94 unit tests
+cargo test -p drone-tuner-core       # 101 unit tests
 cargo test -p drone-tuner-core --test calibration   # real-flight regression fixtures
-cargo test -p drone-tuner-cli                       # ~70 CLI tests
+cargo test -p drone-tuner-cli                       # ~140 CLI tests across 4 suites
 
 cargo clippy
 cargo fmt

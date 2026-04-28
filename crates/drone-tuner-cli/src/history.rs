@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One row of the tune history log.
 #[derive(Debug, Serialize)]
@@ -62,7 +62,7 @@ pub struct BblIdentity {
 }
 
 /// 3-axis × 3-term PID triple, mirroring `PidSnapshot::{roll,pitch,yaw}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PidTriples {
     pub roll: [u8; 3],
     pub pitch: [u8; 3],
@@ -116,6 +116,71 @@ pub fn history_path() -> Result<PathBuf> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create history dir at {}", dir.display()))?;
     Ok(dir.join("history.jsonl"))
+}
+
+/// Owned, read-side mirror of [`TuneHistoryEntry`]. Used to parse rows
+/// back from `history.jsonl` for the cross-tune convergence detector.
+/// Only the fields the detector cares about are deserialized — everything
+/// else is `#[serde(default)]` so a future schema bump that adds fields
+/// is forward-compatible.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // schema/timestamp are forward-compat; fc subfields ditto.
+pub struct ReadHistoryEntry {
+    #[serde(default)]
+    pub schema: String,
+    #[serde(default)]
+    pub timestamp: Option<DateTime<Utc>>,
+    pub fc: ReadFcIdentity,
+    pub pids_before: PidTriples,
+    pub pids_after: PidTriples,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ReadFcIdentity {
+    #[serde(default)]
+    pub board_id: String,
+    #[serde(default)]
+    pub target_name: String,
+    #[serde(default)]
+    pub firmware_id: String,
+    #[serde(default)]
+    pub firmware_version: String,
+}
+
+// `PidTriples` is shared between write-side `TuneHistoryEntry` and
+// read-side `ReadHistoryEntry` — same on-disk shape, just needs both
+// derives. Add `Deserialize` so the read side compiles.
+
+/// Read all rows from the history file. Returns an empty `Vec` when the
+/// file doesn't exist (first-ever tune, or fresh install). Skips malformed
+/// lines with a warning rather than aborting — a corrupt row mid-file
+/// must never disable convergence detection on the rest.
+pub fn read_all() -> Result<Vec<ReadHistoryEntry>> {
+    let path = history_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read history file {}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ReadHistoryEntry>(line) {
+            Ok(entry) => out.push(entry),
+            Err(e) => {
+                tracing::warn!(
+                    "Skipping malformed history line {} in {}: {}",
+                    i + 1,
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Append `entry` as one JSON line to the history file. Best-effort: a

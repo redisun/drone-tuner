@@ -23,7 +23,8 @@ mod analyze_scenarios {
             .assert()
             .success()
             .stdout(predicate::str::contains("Analysis Summary"))
-            .stdout(predicate::str::contains("Tune Quality:"));
+            // Pretty output shows a quality gauge: "Tune Quality NN.N/100  [bar] LABEL"
+            .stdout(predicate::str::contains("Tune Quality"));
     }
 
     #[test]
@@ -412,9 +413,11 @@ mod compare_scenarios {
             .clone();
 
         let output_str = String::from_utf8(output).unwrap();
-        assert!(output_str.contains("Flight Comparison"));
-        assert!(output_str.contains("Summary:"));
-        assert!(output_str.contains("Individual Flights:"));
+        // Pretty compare output: best/worst/average gauges + a comfy-table
+        // with a "Quality" column.
+        assert!(output_str.contains("Best:"));
+        assert!(output_str.contains("Worst:"));
+        assert!(output_str.contains("Quality"));
     }
 
     #[test]
@@ -562,10 +565,12 @@ mod validate_scenarios {
 
         let output_str = String::from_utf8(output).unwrap();
 
-        assert!(output_str.contains("Validating 3 file(s)"));
-        assert!(output_str.contains("Validation Summary:"));
-        assert!(output_str.contains("Valid files:"));
-        assert!(output_str.contains("Invalid files:"));
+        // Pretty validate output: each file shows up as a table row with a
+        // VALID/ISSUES/INVALID status badge, then a final "Valid: N Invalid: M"
+        // summary line.
+        assert!(output_str.contains("VALID") || output_str.contains("ISSUES"));
+        assert!(output_str.contains("Valid:"));
+        assert!(output_str.contains("Invalid:"));
     }
 
     #[test]
@@ -604,14 +609,16 @@ mod validate_scenarios {
             fs::copy(file, batch_dir.join(format!("file_{}.bbl", i))).unwrap();
         }
 
-        // Should complete validation of 20 files within reasonable time
+        // Should complete validation of 20 files within reasonable time.
+        // The pretty output renders one comfy-table row per file plus a final
+        // "Valid: N Invalid: M" line — the latter is the most stable check.
         {
             let mut cmd = create_test_command();
             cmd.arg("validate").arg(&batch_dir);
             run_with_timeout(cmd, 30)
         }
         .success()
-        .stdout(predicate::str::contains("Validating 20 file(s)"));
+        .stdout(predicate::str::contains("Valid:"));
     }
 }
 
@@ -635,10 +642,9 @@ mod tune_scenarios {
         let output_str = String::from_utf8(output).unwrap();
 
         assert!(output_str.contains("Tuning Recommendations:"));
-        // The tune command prints stage banners (e.g. "== Tune ==",
-        // "== Analyze ==") so a user can see where they are in the flow.
-        assert!(output_str.contains("== drone-tuner Tune =="));
-        assert!(output_str.contains("== Analyze =="));
+        // Stage banners are now decorated boxes printed to stderr (so
+        // pretty output stays clean). The "Tuning Recommendations:" header
+        // on stdout is the stable contract.
     }
 
     /// Without `--connection`, `--dry-run` short-circuits to "no changes

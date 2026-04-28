@@ -1,15 +1,20 @@
 //! Analysis engine for frequency domain analysis and oscillation detection.
 
+mod convergence;
 mod filter_optimizer;
 mod oscillation;
 mod pid;
 
+pub use convergence::{
+    apply_convergence_suppression, ConvergenceOutcome, PidChangeRecord, SuppressedRecommendation,
+    DEFAULT_MIN_REPEATED,
+};
 pub use filter_optimizer::FilterOptimizerConfig;
 pub use oscillation::{
     CorrelationThresholds, FrequencyBands, OscillationDetectorConfig, OscillationPattern,
     PatternMatcher, SeverityParameters,
 };
-pub use pid::{PidAnalyzerConfig, StepResponse};
+pub use pid::{clamp_recs_to_baseline, PidAnalyzerConfig, StepResponse, BASELINE_BOUND_PCT};
 
 pub(crate) use oscillation::{DetectedOscillation, OscillationSeverity, OscillationType};
 
@@ -1101,11 +1106,16 @@ mod basic_tests {
             PidTerm::F => panic!("F-term should not be used in basic PID analysis"),
         }
 
-        // Verify recommendations are based on actual values, not 50.0
+        // Verify recommendations are based on actual values, not 50.0.
+        // Step sizes track the constants in pid.rs:
+        //   - P-cut: up to 15% (`MAX_P_CUT_PCT`), with the std-dev path
+        //     applying the full cap and the low-freq-osc path applying half.
+        //   - I-bump: 8% (`I_TERM_BUMP`).
+        //   - D-cut: 8% (`D_CUT_FACTOR`).
         let expected_reduction = match rec.term {
-            PidTerm::P => test_pid_config.roll.p * 0.85, // or 0.9 depending on trigger
-            PidTerm::I => test_pid_config.roll.i * 1.2,  // or 1.3 for error bias
-            PidTerm::D => test_pid_config.roll.d * 0.8,
+            PidTerm::P => test_pid_config.roll.p * 0.85, // std-dev path => full MAX_P_CUT_PCT
+            PidTerm::I => test_pid_config.roll.i * 1.08, // I_TERM_BUMP
+            PidTerm::D => test_pid_config.roll.d * 0.92, // D_CUT_FACTOR
             PidTerm::F => panic!("F-term should not be used in basic PID analysis"),
         };
 

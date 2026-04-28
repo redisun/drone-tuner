@@ -726,7 +726,7 @@ pub struct PidRecommendation {
 }
 
 /// PID terms
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum PidTerm {
     /// Proportional term
     P,

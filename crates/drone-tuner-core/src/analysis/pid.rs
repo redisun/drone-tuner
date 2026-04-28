@@ -125,11 +125,311 @@ const SS_MIN_VALID_RESPONSES: usize = 3;
 /// is roughly 4-5% of typical full-stick rate (~600-700 deg/s) — small
 /// enough to catch real bias, large enough to ignore measurement noise.
 const SS_ERROR_RECOMMEND_DPS: f32 = 30.0;
-/// Conservative I-term increase per iteration. The previous value of 20%
-/// caused runaway recommendations because the FC's tune quickly lands
-/// near (but not at) the SS-error threshold and the algorithm keeps
-/// nudging. 10% lets each iteration's effect be visible in the next bbl.
-const I_TERM_BUMP: f32 = 1.10;
+// ---------- step-size guardrails (Item 2 of algorithm-improvements.md) ----------
+//
+// Each tune iteration changes a single gain by at most these fractions.
+// The previous values (P-cut up to 30%, D-bump 30%, D-cut 20%, I-bump 10%)
+// compounded into runaway across multiple `tune --apply-all` iterations:
+// MEDIUM FUCKER drifted Roll D 28→58 (+107%) and Pitch P 51→29 (−43%) in
+// four iterations until unflyable. See docs/algorithm-improvements.md for
+// the full incident analysis and the trajectory of pre-runaway backups.
+//
+// Conservative step sizes mean each iteration's effect is visible in the
+// next bbl without overshooting. They also widen the safety margin against
+// the *categorical* failure modes (Item 1, Item 3, Item 5) — even if the
+// router picks the wrong gain, an 8% nudge is recoverable; a 30% nudge is
+// not. Tune cautiously, iterate often.
+
+/// Maximum P-term reduction per recommendation. Cap on the overshoot path,
+/// the std-dev path, and the band-routed P-cut path. Set to 15% — large
+/// enough to make a felt difference in one iteration, small enough that
+/// two consecutive misroutes don't destroy the tune.
+const MAX_P_CUT_PCT: f32 = 0.15;
+
+/// P-term increase per recommendation (slow-rise / under-responsive case).
+const P_BUMP_PCT: f32 = 0.08;
+
+/// D-term step (both bump and cut). The pre-Item-2 30% bump was the load-
+/// bearing arithmetic in the MEDIUM FUCKER runaway: D 28 → 28×1.3 = 36 →
+/// 36×1.3 = 47 → 47×1.3 = 61 (clamped to 60). Held to 8%, the same chain
+/// is 28 → 30 → 33 → 35: still corrective, but recoverable.
+const D_STEP_PCT: f32 = 0.08;
+
+/// I-term increase per recommendation. Previously 10% (was 20% before that).
+const I_BUMP_PCT: f32 = 0.08;
+
+/// Convenience multipliers derived from the percentages above. Kept as
+/// constants so call sites read naturally and tests have a single source
+/// of truth to assert against.
+const P_CUT_MAX_FACTOR: f32 = 1.0 - MAX_P_CUT_PCT; // 0.85
+const P_BUMP_FACTOR: f32 = 1.0 + P_BUMP_PCT; // 1.08
+const D_BUMP_FACTOR: f32 = 1.0 + D_STEP_PCT; // 1.08
+const D_CUT_FACTOR: f32 = 1.0 - D_STEP_PCT; // 0.92
+
+/// Backwards-compat alias for the I-term multiplier. Kept (rather than
+/// replacing every call site) so the diff stays focused on the magnitude
+/// change, not the rename.
+const I_TERM_BUMP: f32 = 1.0 + I_BUMP_PCT;
+
+/// Item 4: maximum drift any single recommendation is allowed to push a
+/// gain *away* from its baseline value. The previous regime bounded
+/// recommendations vs. the *current* PID, which let gains drift across
+/// many iterations because the bound moved with each accepted change.
+/// MEDIUM FUCKER's roll P 47 → 33 was a cumulative −30% from baseline,
+/// but only 30% on the iteration that made it: invisible to the per-step
+/// cap. Anchored at ±15% of *baseline*, the chain stops at 47 → 39.95.
+pub const BASELINE_BOUND_PCT: f32 = 0.15;
+
+/// Oscillation-frequency bands that drive the PID recommendation routing.
+/// The rule of thumb (PIDtoolbox / plasmatree / BetaFlight conventions) is
+/// that the *frequency* of an oscillation tells you which gain to touch:
+///
+/// - 5–15 Hz: P-too-high overshoot ringing — phase margin collapses near
+///   the closed-loop bandwidth and the system rings. Fix: **reduce P**.
+/// - 15–30 Hz: borderline; commonly an I-term or rate-config interaction.
+///   We don't auto-recommend in this band — too many false positives.
+/// - 30–80 Hz: classic D-too-low band. Phase lag from gyro+filter chain
+///   eats the damping margin. Fix: **bump D** (or look at D-LPF cutoff).
+/// - >80 Hz: filter / motor-noise / mechanical territory. Touching PID
+///   here is the bug that caused MEDIUM FUCKER's runaway — the analyzer
+///   used to bump D for *any* sub-Nyquist oscillation with low damping.
+///   The proper fix is a filter recommendation; we suppress here and let
+///   the FilterOptimizer pass handle it.
+///
+/// These boundaries are deliberately conservative: real oscillations
+/// rarely live exactly at a band edge, and false routing is worse than
+/// no recommendation. Tune in tests with the MEDIUM FUCKER 11.9 Hz hover
+/// case as the canonical regression example.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OscillationBand {
+    /// f < 5 Hz — subharmonic / drift / breathing. Ignore.
+    Subharmonic,
+    /// 5 ≤ f < 15 Hz — P-too-high overshoot ringing.
+    PTooHigh,
+    /// 15 ≤ f < 30 Hz — ambiguous (I-term / phase-margin). Suppress.
+    Ambiguous,
+    /// 30 ≤ f < 80 Hz — D-too-low or D-LPF cutoff too low.
+    DTooLow,
+    /// f ≥ 80 Hz — filter / mechanical noise. Not a PID problem.
+    Noise,
+}
+
+const BAND_PTOOHIGH_LOWER_HZ: f32 = 5.0;
+const BAND_PTOOHIGH_UPPER_HZ: f32 = 15.0;
+const BAND_DTOOLOW_LOWER_HZ: f32 = 30.0;
+const BAND_DTOOLOW_UPPER_HZ: f32 = 80.0;
+
+fn classify_oscillation_band(freq_hz: f32) -> OscillationBand {
+    if !freq_hz.is_finite() || freq_hz < BAND_PTOOHIGH_LOWER_HZ {
+        OscillationBand::Subharmonic
+    } else if freq_hz < BAND_PTOOHIGH_UPPER_HZ {
+        OscillationBand::PTooHigh
+    } else if freq_hz < BAND_DTOOLOW_LOWER_HZ {
+        OscillationBand::Ambiguous
+    } else if freq_hz < BAND_DTOOLOW_UPPER_HZ {
+        OscillationBand::DTooLow
+    } else {
+        OscillationBand::Noise
+    }
+}
+
+/// Map [`Priority`] to a numeric rank for sort comparisons. Higher = more
+/// important. The enum's `Ord` derive can't be used directly because the
+/// declaration order (Low → Critical) matches semantic order, but we want
+/// to be explicit about the mapping rather than depend on declaration
+/// order being preserved.
+fn priority_rank(p: &Priority) -> u8 {
+    match p {
+        Priority::Critical => 4,
+        Priority::High => 3,
+        Priority::Medium => 2,
+        Priority::Low => 1,
+    }
+}
+
+/// Map [`PidTerm`] to a tiebreaker rank when two recs on the same axis
+/// share priority *and* direction. P > D > I because P sets the closed-
+/// loop bandwidth — if it's wrong, every other gain is being tuned
+/// against an incorrect response shape. F is highest only because it
+/// shouldn't be appearing here at all (and we want it to dominate so a
+/// stray F-term recommendation is obvious in tests).
+fn term_rank(t: &PidTerm) -> u8 {
+    match t {
+        PidTerm::F => 4,
+        PidTerm::P => 3,
+        PidTerm::D => 2,
+        PidTerm::I => 1,
+    }
+}
+
+/// Item 3: collapse a per-axis multi-term recommendation list to at most
+/// one rec per axis. Selection priority, in order:
+///
+/// 1. Higher [`Priority`] wins (Critical > High > Medium > Low).
+/// 2. Among ties, prefer **cuts** (`recommended < current`) over **bumps**:
+///    a reduction is the safer direction when in doubt — the system can
+///    only get less aggressive, never more.
+/// 3. Among further ties, prefer the term that sets the response shape:
+///    P > D > I.
+///
+/// Reasoning for the cap: applying a P-cut, an I-bump, and a D-bump on
+/// the same axis in a single pass shifts dynamics in three directions
+/// simultaneously, which makes the *next* analysis's diagnosis unreliable
+/// — its model assumes a step-response shape that may not exist anymore.
+/// Better to take the most important fix and re-analyse.
+fn collapse_recs_per_axis(recs: Vec<PidRecommendation>) -> Vec<PidRecommendation> {
+    use std::collections::HashMap;
+    let mut best: HashMap<Axis, PidRecommendation> = HashMap::new();
+    for rec in recs {
+        let key = rec.axis.clone();
+        match best.get(&key) {
+            None => {
+                best.insert(key, rec);
+            }
+            Some(current) if rec_outranks(&rec, current) => {
+                best.insert(key, rec);
+            }
+            Some(_) => {} // existing pick wins
+        }
+    }
+    // Stable axis ordering for downstream consumers (matches
+    // Roll → Pitch → Yaw display convention).
+    let mut out: Vec<PidRecommendation> = best.into_values().collect();
+    out.sort_by_key(|r| match r.axis {
+        Axis::Roll => 0,
+        Axis::Pitch => 1,
+        Axis::Yaw => 2,
+    });
+    out
+}
+
+/// Item 4: clamp recommendations against a baseline PID configuration.
+///
+/// Each rec's `recommended_value` is clamped so it stays within
+/// `baseline ± max(BASELINE_BOUND_PCT * baseline, |current - baseline|)`.
+/// The `max` admits an "anti-drift envelope": once a craft has drifted
+/// outside the baseline bound (because some prior iteration moved it
+/// there, or the user manually set unusual gains), the analyzer can
+/// still recommend further moves, but only *toward* baseline — never
+/// farther away.
+///
+/// When clamping would reverse the rec's intended direction (i.e. the
+/// rec wanted to go down, but the only legal move is up), the rec is
+/// dropped — that signals the model has already overshot the safe
+/// envelope and the right move is to stop, not negate.
+///
+/// Returns the clamped list, with dropped recs removed. Recs whose term
+/// is `F` are passed through unchanged: the analyzer never emits them,
+/// and the schema doesn't carry baseline F values.
+pub fn clamp_recs_to_baseline(
+    recs: Vec<PidRecommendation>,
+    baseline: &PidConfiguration,
+) -> Vec<PidRecommendation> {
+    recs.into_iter()
+        .filter_map(|mut rec| {
+            let baseline_value = match (&rec.axis, &rec.term) {
+                (Axis::Roll, PidTerm::P) => baseline.roll.p,
+                (Axis::Roll, PidTerm::I) => baseline.roll.i,
+                (Axis::Roll, PidTerm::D) => baseline.roll.d,
+                (Axis::Pitch, PidTerm::P) => baseline.pitch.p,
+                (Axis::Pitch, PidTerm::I) => baseline.pitch.i,
+                (Axis::Pitch, PidTerm::D) => baseline.pitch.d,
+                (Axis::Yaw, PidTerm::P) => baseline.yaw.p,
+                (Axis::Yaw, PidTerm::I) => baseline.yaw.i,
+                (Axis::Yaw, PidTerm::D) => baseline.yaw.d,
+                (_, PidTerm::F) => return Some(rec), // F has no baseline anchor
+            };
+
+            // A baseline of 0 (e.g. yaw D, which is conventionally 0)
+            // can't be sensibly clamped — anchoring 0 ± 15% × 0 = 0
+            // would forbid any change. Pass through.
+            if baseline_value <= f32::EPSILON {
+                return Some(rec);
+            }
+
+            match clamp_value_to_baseline(rec.recommended_value, rec.current_value, baseline_value)
+            {
+                ClampOutcome::Allow(v) => {
+                    if (v - rec.recommended_value).abs() > f32::EPSILON {
+                        rec.reason = format!(
+                            "{} (clamped to ±{:.0}% of baseline {:.1})",
+                            rec.reason,
+                            BASELINE_BOUND_PCT * 100.0,
+                            baseline_value
+                        );
+                    }
+                    rec.recommended_value = v;
+                    Some(rec)
+                }
+                ClampOutcome::Drop => {
+                    tracing::info!(
+                        "Dropping {:?} {:?} rec ({}→{}): would push gain outside ±{:.0}% envelope of baseline {}",
+                        rec.axis,
+                        rec.term,
+                        rec.current_value,
+                        rec.recommended_value,
+                        BASELINE_BOUND_PCT * 100.0,
+                        baseline_value
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+enum ClampOutcome {
+    Allow(f32),
+    Drop,
+}
+
+fn clamp_value_to_baseline(recommended: f32, current: f32, baseline: f32) -> ClampOutcome {
+    let bound_radius = baseline * BASELINE_BOUND_PCT;
+    let d_cur = (current - baseline).abs();
+    // Allowed envelope half-width: at least the bound radius, but expand
+    // to enclose `current` if the craft has already drifted outside.
+    let cap = bound_radius.max(d_cur);
+    let d_new = (recommended - baseline).abs();
+    if d_new <= cap {
+        return ClampOutcome::Allow(recommended);
+    }
+    // Recommendation is outside the envelope. Clamp toward baseline.
+    let clamped = if recommended > baseline {
+        baseline + cap
+    } else {
+        baseline - cap
+    };
+    let intended_dir = (recommended - current).signum();
+    let clamped_dir = (clamped - current).signum();
+    // Drop the rec if clamping reverses intent (rec wanted to go up, the
+    // envelope only allows going down) OR if clamping produces a write
+    // that's a no-op once rounded to FC integer units (the rec's intent
+    // was real but the envelope says "you've already gone too far").
+    if intended_dir != 0.0 && clamped_dir != 0.0 && intended_dir != clamped_dir {
+        return ClampOutcome::Drop;
+    }
+    if (clamped - current).abs() < 1.0 {
+        return ClampOutcome::Drop;
+    }
+    ClampOutcome::Allow(clamped)
+}
+
+/// Returns true when `candidate` should replace `incumbent` in the
+/// per-axis collapse. See [`collapse_recs_per_axis`] for the full rule.
+fn rec_outranks(candidate: &PidRecommendation, incumbent: &PidRecommendation) -> bool {
+    let cand_pri = priority_rank(&candidate.priority);
+    let inc_pri = priority_rank(&incumbent.priority);
+    if cand_pri != inc_pri {
+        return cand_pri > inc_pri;
+    }
+    let cand_is_cut = candidate.recommended_value < candidate.current_value;
+    let inc_is_cut = incumbent.recommended_value < incumbent.current_value;
+    if cand_is_cut != inc_is_cut {
+        return cand_is_cut; // cut beats bump
+    }
+    term_rank(&candidate.term) > term_rank(&incumbent.term)
+}
+
 /// Minimum absolute scale at which we treat an `rc_commands` axis as
 /// having meaningful range. Below this we assume the pilot didn't touch
 /// the stick during the log and skip step analysis for that axis.
@@ -263,6 +563,15 @@ impl PidAnalyzer {
             tracing::info!("PID error data available, performing error analysis");
             recommendations.extend(self.analyze_pid_errors(telemetry, pid_config)?);
         }
+
+        // Item 3: collapse to at most one recommendation per axis. The
+        // pre-collapse list can carry P, I, *and* D recs for the same axis
+        // (overshoot path → P-cut, SS-error path → I-bump, band-routed
+        // path → D-bump), and applying all three in one pass invalidates
+        // the next analysis's model — the FC's dynamics shifted in three
+        // independent directions at once. Take the highest-priority single
+        // change per axis and let the next iteration handle the rest.
+        let recommendations = collapse_recs_per_axis(recommendations);
 
         Ok(PidAnalysisOutcome {
             recommendations,
@@ -622,7 +931,7 @@ impl PidAnalyzer {
                 axis: axis.clone(),
                 term: PidTerm::D,
                 current_value: current_pid.d,
-                recommended_value: current_pid.d * 0.8, // Reduce D-term
+                recommended_value: current_pid.d * D_CUT_FACTOR,
                 reason: format!(
                     "Reduce D-term to decrease gyro noise (noise level: {:.1})",
                     noise_level
@@ -635,12 +944,15 @@ impl PidAnalyzer {
         let oscillation_amplitude =
             self.detect_low_frequency_oscillations(gyro_data, sample_rate)?;
         if oscillation_amplitude > 5.0 {
-            // Adjustable threshold (lowered to trigger more often)
+            // Adjustable threshold (lowered to trigger more often).
+            // Mild low-freq oscillation: a softer cut than the std-dev-driven
+            // path below — half the conservative cap so we don't fight the
+            // overshoot path on the same iteration.
             recommendations.push(PidRecommendation {
                 axis: axis.clone(),
                 term: PidTerm::P,
                 current_value: current_pid.p,
-                recommended_value: current_pid.p * 0.9, // Reduce P-term
+                recommended_value: current_pid.p * (1.0 - MAX_P_CUT_PCT * 0.5),
                 reason: format!(
                     "Reduce P-term to decrease low-frequency oscillations (amplitude: {:.1})",
                     oscillation_amplitude
@@ -651,12 +963,12 @@ impl PidAnalyzer {
 
         // Check for very high standard deviation (general instability)
         if std_dev > 20.0 {
-            // Lowered threshold to trigger more often
+            // Severe instability — apply the full conservative cap.
             recommendations.push(PidRecommendation {
                 axis: axis.clone(),
                 term: PidTerm::P,
                 current_value: current_pid.p,
-                recommended_value: current_pid.p * 0.85, // Reduce P-term more aggressively
+                recommended_value: current_pid.p * P_CUT_MAX_FACTOR,
                 reason: format!(
                     "Reduce P-term to improve general stability (std dev: {:.1})",
                     std_dev
@@ -845,8 +1157,13 @@ impl PidAnalyzer {
 
         // Analyze P-term based on overshoot and rise time
         if avg_overshoot > self.config.overshoot_tolerance {
+            // Scale the cut by how much overshoot exceeds tolerance, capped
+            // at MAX_P_CUT_PCT. The 50.0 divisor keeps the slope gentle:
+            // 30% overshoot above tolerance ⇒ 30/50 = 0.6 raw, clamped to
+            // MAX_P_CUT_PCT (0.15). The pre-Item-2 cap was 0.30, which is
+            // what drove pitch P from 51 to 41 to 29 in three iterations.
             let reduction_percent = (avg_overshoot - self.config.overshoot_tolerance) / 50.0;
-            let proposed = current_pid.p * (1.0 - reduction_percent.min(0.3)); // Max 30% reduction
+            let proposed = current_pid.p * (1.0 - reduction_percent.min(MAX_P_CUT_PCT));
             if current_pid.p - proposed >= 1.0 {
                 recommendations.push(PidRecommendation {
                     axis: axis.clone(),
@@ -866,7 +1183,7 @@ impl PidAnalyzer {
             }
         } else if avg_rise_time > 0.15 && avg_overshoot < 5.0 && current_pid.p < p_headroom_floor {
             // Slow rise time with little overshoot suggests P could be increased.
-            let proposed = (current_pid.p * 1.1).min(limits.p_max); // 10% increase, capped
+            let proposed = (current_pid.p * P_BUMP_FACTOR).min(limits.p_max);
             if proposed - current_pid.p >= 1.0 {
                 recommendations.push(PidRecommendation {
                     axis: axis.clone(),
@@ -918,25 +1235,83 @@ impl PidAnalyzer {
             }
         }
 
-        // Analyze D-term based on oscillations and damping
-        if avg_oscillation_freq > 10.0 && avg_damping < 0.5 && current_pid.d < d_headroom_floor {
-            let proposed = (current_pid.d * 1.3).min(limits.d_max); // 30% increase, capped
-            if proposed - current_pid.d >= 1.0 {
-                recommendations.push(PidRecommendation {
-                    axis: axis.clone(),
-                    term: PidTerm::D,
-                    current_value: current_pid.d,
-                    recommended_value: proposed,
-                    reason: format!(
-                        "Increase D-term to dampen oscillations ({:.1} Hz, damping: {:.2})",
-                        avg_oscillation_freq, avg_damping
-                    ),
-                    priority: Priority::Medium,
-                });
+        // Route the detected oscillation to the right gain by *frequency band*,
+        // not just by "any oscillation with low damping → bump D" (which was
+        // the load-bearing bug that drove MEDIUM FUCKER into runaway).
+        // See `OscillationBand` for the band semantics.
+        if avg_damping < 0.5 {
+            match classify_oscillation_band(avg_oscillation_freq) {
+                OscillationBand::PTooHigh => {
+                    // 5–15 Hz overshoot ringing: cut P by half the
+                    // conservative cap. The std-dev path applies the full
+                    // cap for *severe* instability — leave headroom for
+                    // that to dominate when both fire.
+                    let proposed = current_pid.p * (1.0 - MAX_P_CUT_PCT * 0.5);
+                    if current_pid.p - proposed >= 1.0 {
+                        recommendations.push(PidRecommendation {
+                            axis: axis.clone(),
+                            term: PidTerm::P,
+                            current_value: current_pid.p,
+                            recommended_value: proposed,
+                            reason: format!(
+                                "Reduce P-term to suppress {:.1} Hz overshoot ringing (damping: {:.2})",
+                                avg_oscillation_freq, avg_damping
+                            ),
+                            priority: Priority::Medium,
+                        });
+                    }
+                }
+                OscillationBand::DTooLow => {
+                    // 30–80 Hz: classic D-too-low. Bump D by the global
+                    // step. Suppress when D is already at the headroom
+                    // ceiling — the previous 30% bump pegged D at d_max
+                    // in 2-3 iterations and never recovered.
+                    if current_pid.d < d_headroom_floor {
+                        let proposed = (current_pid.d * D_BUMP_FACTOR).min(limits.d_max);
+                        if proposed - current_pid.d >= 1.0 {
+                            recommendations.push(PidRecommendation {
+                                axis: axis.clone(),
+                                term: PidTerm::D,
+                                current_value: current_pid.d,
+                                recommended_value: proposed,
+                                reason: format!(
+                                    "Increase D-term to dampen {:.1} Hz oscillation (damping: {:.2})",
+                                    avg_oscillation_freq, avg_damping
+                                ),
+                                priority: Priority::Medium,
+                            });
+                        }
+                    }
+                }
+                OscillationBand::Noise => {
+                    // >80 Hz: motor / filter / mechanical noise, NOT a PID
+                    // problem. Bumping D here was the bug. Suppress and let
+                    // the FilterOptimizer pass handle it via its own recs.
+                    tracing::info!(
+                        "{:?}: {:.1} Hz oscillation suppressed — frequency suggests filter/noise issue, not a PID problem",
+                        axis,
+                        avg_oscillation_freq
+                    );
+                }
+                OscillationBand::Ambiguous => {
+                    // 15–30 Hz: too many false positives across I-term, rate
+                    // config, and phase-margin issues. Stay quiet.
+                    tracing::debug!(
+                        "{:?}: {:.1} Hz oscillation in ambiguous band — no PID rec",
+                        axis,
+                        avg_oscillation_freq
+                    );
+                }
+                OscillationBand::Subharmonic => {
+                    // <5 Hz drift; the slow-settling branch below catches
+                    // genuine over-damped settling cases.
+                }
             }
-        } else if avg_settling_time > 0.5 && avg_oscillation_freq < 5.0 {
-            // Long settling time might indicate too much D-term
-            let proposed = current_pid.d * 0.8; // 20% decrease
+        }
+        if avg_settling_time > 0.5 && avg_oscillation_freq < 5.0 {
+            // Long settling time with no oscillation: classic over-damped.
+            // Cut D by the global step.
+            let proposed = current_pid.d * D_CUT_FACTOR;
             if current_pid.d - proposed >= 1.0 {
                 recommendations.push(PidRecommendation {
                     axis: axis.clone(),
@@ -963,5 +1338,490 @@ impl Default for PidAnalyzerConfig {
             response_window_s: 1.0,    // Increased to capture full response
             overshoot_tolerance: 15.0, // Reasonable overshoot tolerance
         }
+    }
+}
+
+#[cfg(test)]
+mod band_routing_tests {
+    use super::*;
+    use crate::domain::{PidConfiguration, PidValues};
+
+    #[test]
+    fn classifier_partitions_known_frequencies() {
+        // Sanity-check the band edges so the regression below has a stable foundation.
+        assert_eq!(classify_oscillation_band(2.0), OscillationBand::Subharmonic);
+        assert_eq!(classify_oscillation_band(4.99), OscillationBand::Subharmonic);
+        assert_eq!(classify_oscillation_band(5.0), OscillationBand::PTooHigh);
+        assert_eq!(classify_oscillation_band(11.9), OscillationBand::PTooHigh);
+        assert_eq!(classify_oscillation_band(15.0), OscillationBand::Ambiguous);
+        assert_eq!(classify_oscillation_band(25.0), OscillationBand::Ambiguous);
+        assert_eq!(classify_oscillation_band(30.0), OscillationBand::DTooLow);
+        assert_eq!(classify_oscillation_band(60.0), OscillationBand::DTooLow);
+        assert_eq!(classify_oscillation_band(80.0), OscillationBand::Noise);
+        assert_eq!(classify_oscillation_band(150.0), OscillationBand::Noise);
+        // NaN is treated as subharmonic — we never want a NaN-driven recommendation.
+        assert_eq!(classify_oscillation_band(f32::NAN), OscillationBand::Subharmonic);
+    }
+
+    fn make_response(axis: Axis, freq_hz: f32, damping: f32) -> StepResponse {
+        StepResponse {
+            axis,
+            start_time: 0.0,
+            command_magnitude: 0.5,
+            rise_time: 0.05,
+            settling_time: 0.20,
+            overshoot_percent: 8.0, // below overshoot_tolerance so the P-cut from
+                                    // overshoot path doesn't fire and steal credit
+            oscillation_frequency: freq_hz,
+            damping_ratio: damping,
+            steady_state_error_dps: None,
+            sample_rate: 4000.0,
+            gyro_trace: Vec::new(),
+            command_trace: Vec::new(),
+        }
+    }
+
+    fn pid_cfg(p: f32, i: f32, d: f32) -> PidConfiguration {
+        let mut cfg = PidConfiguration::default();
+        cfg.roll = PidValues { p, i, d, f: None };
+        cfg.pitch = PidValues { p, i, d, f: None };
+        cfg.yaw = PidValues { p, i, d, f: None };
+        cfg
+    }
+
+    /// Regression test for the MEDIUM FUCKER runaway: a 11.9 Hz oscillation
+    /// with poor damping must produce a P-CUT, never a D-BUMP. Before the
+    /// band-routing fix, the analyzer mapped any sub-Nyquist underdamped
+    /// oscillation to D, which compounded into unflyable PIDs across a few
+    /// `tune --apply-all` iterations.
+    #[test]
+    fn low_frequency_oscillation_recommends_p_cut_not_d_bump() {
+        let analyzer = PidAnalyzer::new();
+        // Three roll-axis responses at 11.9 Hz with 0.3 damping (clearly
+        // underdamped) — the same shape as the real failed flight.
+        let responses = vec![
+            make_response(Axis::Roll, 11.9, 0.3),
+            make_response(Axis::Roll, 12.1, 0.28),
+            make_response(Axis::Roll, 11.7, 0.32),
+        ];
+        let cfg = pid_cfg(47.0, 75.0, 28.0); // baseline pre-runaway gains
+        let recs = analyzer
+            .analyze_axis_responses(&responses, Axis::Roll, &cfg)
+            .expect("analysis must succeed on synthetic data");
+
+        let p_cuts: Vec<_> = recs
+            .iter()
+            .filter(|r| matches!(r.term, PidTerm::P) && r.recommended_value < r.current_value)
+            .collect();
+        let d_bumps: Vec<_> = recs
+            .iter()
+            .filter(|r| matches!(r.term, PidTerm::D) && r.recommended_value > r.current_value)
+            .collect();
+
+        assert!(
+            !p_cuts.is_empty(),
+            "11.9 Hz underdamped oscillation must yield a P-cut. Got: {:?}",
+            recs
+        );
+        assert!(
+            d_bumps.is_empty(),
+            "11.9 Hz oscillation must NOT trigger a D-bump (was the runaway bug). Got: {:?}",
+            recs
+        );
+    }
+
+    /// Mid-band oscillation (50 Hz, classic D-too-low) should still bump D.
+    /// Validates the routing didn't lose the legitimate D-recommendation path.
+    #[test]
+    fn mid_band_oscillation_still_recommends_d_bump() {
+        let analyzer = PidAnalyzer::new();
+        let responses = vec![
+            make_response(Axis::Pitch, 50.0, 0.3),
+            make_response(Axis::Pitch, 48.0, 0.28),
+            make_response(Axis::Pitch, 52.0, 0.32),
+        ];
+        let cfg = pid_cfg(50.0, 80.0, 30.0);
+        let recs = analyzer
+            .analyze_axis_responses(&responses, Axis::Pitch, &cfg)
+            .expect("analysis must succeed");
+
+        let d_bumps: Vec<_> = recs
+            .iter()
+            .filter(|r| matches!(r.term, PidTerm::D) && r.recommended_value > r.current_value)
+            .collect();
+        assert!(
+            !d_bumps.is_empty(),
+            "50 Hz underdamped oscillation in classic D-too-low band must yield a D-bump. Got: {:?}",
+            recs
+        );
+    }
+
+    /// High-frequency oscillation (>80 Hz) is filter / motor-noise territory.
+    /// The analyzer must NOT emit any PID recommendation in this band — that
+    /// was the load-bearing failure mode.
+    #[test]
+    fn high_frequency_noise_emits_no_pid_recommendation() {
+        let analyzer = PidAnalyzer::new();
+        let responses = vec![
+            make_response(Axis::Roll, 120.0, 0.3),
+            make_response(Axis::Roll, 130.0, 0.28),
+            make_response(Axis::Roll, 110.0, 0.32),
+        ];
+        let cfg = pid_cfg(50.0, 80.0, 30.0);
+        let recs = analyzer
+            .analyze_axis_responses(&responses, Axis::Roll, &cfg)
+            .expect("analysis must succeed");
+
+        let oscillation_driven: Vec<_> = recs
+            .iter()
+            .filter(|r| !matches!(r.term, PidTerm::I)) // I-term recs are driven by SS error, not freq
+            .collect();
+        assert!(
+            oscillation_driven.is_empty(),
+            ">80 Hz noise must not drive any P/D recommendation. Got: {:?}",
+            recs
+        );
+    }
+
+    // ---------- step-size guardrail tests (Item 2) ----------
+
+    /// Sanity-check the step-size constants. Locks in the post-Item-2
+    /// values; any future loosening should land alongside an explicit
+    /// review of the runaway scenario in docs/algorithm-improvements.md.
+    #[test]
+    fn step_size_constants_are_conservative() {
+        assert!(
+            MAX_P_CUT_PCT <= 0.15,
+            "MAX_P_CUT_PCT must stay ≤15% — looser caps are what drove pitch P 51→29 in MEDIUM FUCKER"
+        );
+        assert!(
+            D_STEP_PCT <= 0.10,
+            "D_STEP_PCT must stay ≤10% — the pre-Item-2 30% bump was the runaway arithmetic"
+        );
+        assert!((P_BUMP_PCT - 0.08).abs() < 1e-6, "P_BUMP_PCT == 8%");
+        assert!((I_BUMP_PCT - 0.08).abs() < 1e-6, "I_BUMP_PCT == 8%");
+        // Derived multipliers stay in sync with their percentages.
+        assert!((P_CUT_MAX_FACTOR - (1.0 - MAX_P_CUT_PCT)).abs() < 1e-6);
+        assert!((P_BUMP_FACTOR - (1.0 + P_BUMP_PCT)).abs() < 1e-6);
+        assert!((D_BUMP_FACTOR - (1.0 + D_STEP_PCT)).abs() < 1e-6);
+        assert!((D_CUT_FACTOR - (1.0 - D_STEP_PCT)).abs() < 1e-6);
+        assert!((I_TERM_BUMP - (1.0 + I_BUMP_PCT)).abs() < 1e-6);
+    }
+
+    /// Mid-band D-bump must respect the 8% step. Pre-Item-2 it was 30%,
+    /// which compounded into the MEDIUM FUCKER D 28→58 jump.
+    #[test]
+    fn d_bump_respects_step_size_cap() {
+        let analyzer = PidAnalyzer::new();
+        let responses = vec![
+            make_response(Axis::Roll, 50.0, 0.3),
+            make_response(Axis::Roll, 50.0, 0.3),
+            make_response(Axis::Roll, 50.0, 0.3),
+        ];
+        let cfg = pid_cfg(40.0, 80.0, 28.0);
+        let recs = analyzer
+            .analyze_axis_responses(&responses, Axis::Roll, &cfg)
+            .expect("analysis must succeed");
+
+        let d_bump = recs
+            .iter()
+            .find(|r| matches!(r.term, PidTerm::D) && r.recommended_value > r.current_value)
+            .expect("a D-bump should fire for 50 Hz / damping 0.3");
+        let pct_increase = (d_bump.recommended_value - d_bump.current_value) / d_bump.current_value;
+        assert!(
+            pct_increase <= D_STEP_PCT + 1e-6,
+            "D-bump exceeded the {:.0}% cap: {} → {} ({:.1}% jump)",
+            D_STEP_PCT * 100.0,
+            d_bump.current_value,
+            d_bump.recommended_value,
+            pct_increase * 100.0
+        );
+    }
+
+    /// Severe overshoot must cap the P-cut at MAX_P_CUT_PCT, never the
+    /// pre-Item-2 30% maximum. Pre-fix, a 65% overshoot would yield a 30%
+    /// P-cut — that's how pitch P collapsed 51 → ~36 in one iteration.
+    #[test]
+    fn overshoot_p_cut_respects_step_size_cap() {
+        let analyzer = PidAnalyzer::new();
+        // 65% overshoot, way above the default 15% tolerance — would have
+        // hit the old 30% cap. Must now clip at MAX_P_CUT_PCT (15%).
+        let make_overshoot_response = |overshoot: f32| StepResponse {
+            axis: Axis::Pitch,
+            start_time: 0.0,
+            command_magnitude: 0.5,
+            rise_time: 0.05,
+            settling_time: 0.20,
+            overshoot_percent: overshoot,
+            oscillation_frequency: 25.0, // ambiguous band — no extra rec from band routing
+            damping_ratio: 0.7,          // damped, no D recs
+            steady_state_error_dps: None,
+            sample_rate: 4000.0,
+            gyro_trace: Vec::new(),
+            command_trace: Vec::new(),
+        };
+        let responses = vec![
+            make_overshoot_response(65.0),
+            make_overshoot_response(65.0),
+            make_overshoot_response(65.0),
+        ];
+        let cfg = pid_cfg(51.0, 82.0, 32.0);
+        let recs = analyzer
+            .analyze_axis_responses(&responses, Axis::Pitch, &cfg)
+            .expect("analysis must succeed");
+
+        let p_cut = recs
+            .iter()
+            .find(|r| matches!(r.term, PidTerm::P) && r.recommended_value < r.current_value)
+            .expect("severe overshoot must yield a P-cut");
+        let pct_cut = (p_cut.current_value - p_cut.recommended_value) / p_cut.current_value;
+        assert!(
+            pct_cut <= MAX_P_CUT_PCT + 1e-6,
+            "P-cut exceeded the {:.0}% cap: {} → {} ({:.1}% drop)",
+            MAX_P_CUT_PCT * 100.0,
+            p_cut.current_value,
+            p_cut.recommended_value,
+            pct_cut * 100.0
+        );
+    }
+
+    /// End-to-end MEDIUM FUCKER scenario: starting from baseline (Roll D=28),
+    /// simulate 3 consecutive tunes recommending the same D-bump direction.
+    /// Pre-Item-2 chain was 28 → 36 → 47 → 61 (capped 60). With the new cap
+    /// it must stay below 36 after three iterations.
+    #[test]
+    fn three_iterations_of_d_bumps_dont_runaway() {
+        let analyzer = PidAnalyzer::new();
+        let mut current_d: f32 = 28.0;
+        for _ in 0..3 {
+            let responses = vec![
+                make_response(Axis::Roll, 50.0, 0.3),
+                make_response(Axis::Roll, 50.0, 0.3),
+                make_response(Axis::Roll, 50.0, 0.3),
+            ];
+            let cfg = pid_cfg(40.0, 80.0, current_d);
+            let recs = analyzer
+                .analyze_axis_responses(&responses, Axis::Roll, &cfg)
+                .expect("analysis must succeed");
+            if let Some(d_bump) = recs
+                .iter()
+                .find(|r| matches!(r.term, PidTerm::D) && r.recommended_value > r.current_value)
+            {
+                current_d = d_bump.recommended_value;
+            }
+        }
+        assert!(
+            current_d < 36.0,
+            "After 3 D-bumps, current_d={current_d} should stay <36 (pre-Item-2 chain reached 47)"
+        );
+    }
+
+    // ---------- per-axis stacking limit tests (Item 3) ----------
+
+    fn make_rec(
+        axis: Axis,
+        term: PidTerm,
+        current: f32,
+        recommended: f32,
+        priority: Priority,
+    ) -> PidRecommendation {
+        PidRecommendation {
+            axis,
+            term,
+            current_value: current,
+            recommended_value: recommended,
+            reason: String::new(),
+            priority,
+        }
+    }
+
+    #[test]
+    fn collapse_keeps_at_most_one_rec_per_axis() {
+        let recs = vec![
+            make_rec(Axis::Roll, PidTerm::P, 50.0, 45.0, Priority::Medium),
+            make_rec(Axis::Roll, PidTerm::I, 80.0, 86.0, Priority::Medium),
+            make_rec(Axis::Roll, PidTerm::D, 30.0, 33.0, Priority::Medium),
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert_eq!(out.len(), 1, "Three same-axis recs must collapse to one");
+        assert_eq!(out[0].axis, Axis::Roll);
+    }
+
+    #[test]
+    fn collapse_per_axis_independent() {
+        let recs = vec![
+            make_rec(Axis::Roll, PidTerm::P, 50.0, 45.0, Priority::Medium),
+            make_rec(Axis::Roll, PidTerm::I, 80.0, 86.0, Priority::Medium),
+            make_rec(Axis::Pitch, PidTerm::D, 30.0, 33.0, Priority::Medium),
+            make_rec(Axis::Yaw, PidTerm::P, 40.0, 38.0, Priority::Medium),
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert_eq!(out.len(), 3, "Each axis collapses independently");
+        let axes: Vec<_> = out.iter().map(|r| r.axis.clone()).collect();
+        assert_eq!(axes, vec![Axis::Roll, Axis::Pitch, Axis::Yaw],
+                   "Output stably ordered Roll → Pitch → Yaw");
+    }
+
+    #[test]
+    fn collapse_higher_priority_wins() {
+        // A High-priority I-bump beats a Medium-priority P-cut even though
+        // the P-cut would otherwise win on direction + term tiebreakers.
+        let recs = vec![
+            make_rec(Axis::Roll, PidTerm::P, 50.0, 45.0, Priority::Medium),
+            make_rec(Axis::Roll, PidTerm::I, 80.0, 88.0, Priority::High),
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].term, PidTerm::I), "High-priority I-bump must win, got {:?}", out[0]);
+    }
+
+    #[test]
+    fn collapse_cut_beats_bump_on_same_priority() {
+        // Both Medium priority: cut wins (safer direction).
+        let recs = vec![
+            make_rec(Axis::Pitch, PidTerm::D, 30.0, 33.0, Priority::Medium), // bump
+            make_rec(Axis::Pitch, PidTerm::I, 80.0, 73.6, Priority::Medium), // cut
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].recommended_value < out[0].current_value,
+                "Cut must beat bump at same priority");
+    }
+
+    #[test]
+    fn collapse_p_beats_d_beats_i_on_full_tie() {
+        // Three Medium-priority cuts, same direction. P should win.
+        let recs = vec![
+            make_rec(Axis::Roll, PidTerm::I, 80.0, 73.0, Priority::Medium),
+            make_rec(Axis::Roll, PidTerm::D, 30.0, 27.0, Priority::Medium),
+            make_rec(Axis::Roll, PidTerm::P, 50.0, 45.0, Priority::Medium),
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].term, PidTerm::P), "P must beat D and I on full tie, got {:?}", out[0]);
+
+        // Without the P entry, D should win over I.
+        let recs = vec![
+            make_rec(Axis::Roll, PidTerm::I, 80.0, 73.0, Priority::Medium),
+            make_rec(Axis::Roll, PidTerm::D, 30.0, 27.0, Priority::Medium),
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert!(matches!(out[0].term, PidTerm::D), "D must beat I on tie, got {:?}", out[0]);
+    }
+
+    #[test]
+    fn collapse_preserves_critical_over_high() {
+        let recs = vec![
+            make_rec(Axis::Yaw, PidTerm::P, 40.0, 36.0, Priority::High),
+            make_rec(Axis::Yaw, PidTerm::D, 20.0, 18.0, Priority::Critical),
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].priority, Priority::Critical), "Critical must beat High");
+    }
+
+    #[test]
+    fn collapse_empty_input_is_empty() {
+        let out = collapse_recs_per_axis(Vec::new());
+        assert!(out.is_empty());
+    }
+
+    /// Realistic end-to-end scenario: an underdamped Roll axis triggers
+    /// both an overshoot-driven P-cut AND an SS-error-driven I-bump in
+    /// the same pass. Pre-Item-3, both would be applied in one tune
+    /// iteration. Post-Item-3, only the P-cut survives the collapse.
+    #[test]
+    fn collapse_drops_i_bump_when_p_cut_also_present() {
+        // Realistic shape of the per-axis output before collapse:
+        // overshoot path emits P-cut, SS-error path emits I-bump.
+        let recs = vec![
+            // Overshoot P-cut (Medium, cut)
+            make_rec(Axis::Roll, PidTerm::P, 50.0, 42.5, Priority::Medium),
+            // SS-error I-bump (Medium, bump)
+            make_rec(Axis::Roll, PidTerm::I, 80.0, 86.4, Priority::Medium),
+        ];
+        let out = collapse_recs_per_axis(recs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].term, PidTerm::P),
+                "P-cut should win over I-bump at same priority (cut > bump)");
+    }
+
+    // ---------- baseline-anchored bound tests (Item 4) ----------
+
+    #[test]
+    fn clamp_passes_through_when_within_bounds() {
+        // Baseline P=50, current=50, recommended=46 (8% cut). Inside ±15%.
+        let recs = vec![make_rec(Axis::Roll, PidTerm::P, 50.0, 46.0, Priority::Medium)];
+        let baseline = pid_cfg(50.0, 80.0, 30.0);
+        let out = clamp_recs_to_baseline(recs, &baseline);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].recommended_value, 46.0);
+    }
+
+    #[test]
+    fn clamp_caps_aggressive_p_cut_at_baseline_envelope() {
+        // Baseline P=47, current=47, recommended=33 (−30%). Must clamp
+        // to baseline*0.85 = 39.95.
+        let recs = vec![make_rec(Axis::Roll, PidTerm::P, 47.0, 33.0, Priority::High)];
+        let baseline = pid_cfg(47.0, 75.0, 28.0);
+        let out = clamp_recs_to_baseline(recs, &baseline);
+        assert_eq!(out.len(), 1);
+        let expected = 47.0 * (1.0 - BASELINE_BOUND_PCT);
+        assert!((out[0].recommended_value - expected).abs() < 1e-3,
+                "expected {expected:.2}, got {}", out[0].recommended_value);
+        assert!(out[0].reason.contains("clamped"), "clamp note must annotate the rec");
+    }
+
+    #[test]
+    fn clamp_allows_movement_toward_baseline_when_already_drifted() {
+        // Real-world MEDIUM FUCKER recovery: baseline P=47, current=33
+        // (already drifted), recommended=37 (moving toward baseline).
+        // The envelope expands to enclose current, so 37 must be allowed.
+        let recs = vec![make_rec(Axis::Roll, PidTerm::P, 33.0, 37.0, Priority::Medium)];
+        let baseline = pid_cfg(47.0, 75.0, 28.0);
+        let out = clamp_recs_to_baseline(recs, &baseline);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].recommended_value, 37.0,
+                   "recovery moves toward baseline must be allowed unchanged");
+    }
+
+    #[test]
+    fn clamp_drops_rec_that_would_drift_further_from_baseline() {
+        // Baseline P=47, current=33 (already low), recommended=28
+        // (further reduction). Clamping toward baseline would reverse
+        // the rec's intent, so the rec must be dropped entirely.
+        let recs = vec![make_rec(Axis::Roll, PidTerm::P, 33.0, 28.0, Priority::Medium)];
+        let baseline = pid_cfg(47.0, 75.0, 28.0);
+        let out = clamp_recs_to_baseline(recs, &baseline);
+        assert!(out.is_empty(),
+                "rec that drifts further from baseline must be dropped, got {:?}", out);
+    }
+
+    #[test]
+    fn clamp_passes_through_yaw_d_with_zero_baseline() {
+        // Yaw D conventionally 0; can't sensibly clamp 0 ± 15% × 0 = 0.
+        // Pass-through avoids forbidding any future yaw-D recommendation.
+        let recs = vec![make_rec(Axis::Yaw, PidTerm::D, 0.0, 5.0, Priority::Low)];
+        let baseline = pid_cfg(47.0, 75.0, 0.0); // baseline yaw D = 0
+        let out = clamp_recs_to_baseline(recs, &baseline);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].recommended_value, 5.0);
+    }
+
+    /// MEDIUM FUCKER regression: at the crisis point (current Roll D=58,
+    /// baseline=28), a fresh tune that recommends bumping D further
+    /// (to ~63) must be either clamped to no more than baseline*1.15=32.2,
+    /// or dropped because the clamp would reverse the rec's "go up" intent.
+    #[test]
+    fn clamp_prevents_d_runaway_at_drifted_state() {
+        let recs = vec![make_rec(Axis::Roll, PidTerm::D, 58.0, 63.0, Priority::Medium)];
+        let baseline = pid_cfg(47.0, 75.0, 28.0);
+        let out = clamp_recs_to_baseline(recs, &baseline);
+        assert!(
+            out.is_empty(),
+            "An out-of-envelope D-bump that would push gain further from baseline \
+             must be dropped (got {:?})",
+            out
+        );
     }
 }

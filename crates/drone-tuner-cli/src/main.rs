@@ -1,11 +1,13 @@
 //! Command-line interface for the FPV drone tuning platform.
 
+mod display;
 mod history;
+mod paths;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use console::{style, Term};
-use drone_tuner_core::domain::{FilterRecommendationType, Priority};
+use drone_tuner_core::domain::FilterRecommendationType;
 use drone_tuner_core::{AnalysisEngine, BlackboxParser, FlightSession};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
@@ -37,6 +39,10 @@ struct Cli {
         default_value = "pretty"
     )]
     output_format: OutputFormat,
+
+    /// Suppress the startup ASCII banner (colours and tables stay)
+    #[arg(long, global = true)]
+    no_banner: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -112,9 +118,11 @@ enum Commands {
 /// Arguments for the analyze command
 #[derive(Args)]
 struct AnalyzeArgs {
-    /// Path to blackbox file or directory
+    /// Path to blackbox file or directory. Optional when `--pull-bbl` is
+    /// set; in that case the file is downloaded from the FC's onboard
+    /// dataflash.
     #[arg(value_name = "FILE_OR_DIR")]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     /// Output directory for results
     #[arg(short = 'd', long)]
@@ -152,6 +160,36 @@ struct AnalyzeArgs {
     /// Options: last, first, longest
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["last","first","longest"]))]
     session_strategy: Option<String>,
+
+    /// Connection string. Accepts a device path (`/dev/ttyACM0`, `COM3`),
+    /// a `serial://` or `simulator://` URI, or the literal `auto` to scan
+    /// USB serial ports and pick the FC automatically. Auto-discover also
+    /// kicks in when this flag is omitted but `--pull-bbl` is set.
+    #[arg(long, value_name = "CONNECTION")]
+    connection: Option<String>,
+
+    /// Download the most recent blackbox session from the FC's onboard
+    /// dataflash before analysis. The pulled bytes are written to a temp
+    /// file (or `--keep-bbl <PATH>` if set) and fed into the same parse →
+    /// analyze flow as a local file.
+    #[arg(long)]
+    pull_bbl: bool,
+
+    /// Where to save the pulled .bbl file. Without this flag the file is
+    /// written to a tempdir and left there. Has no effect without
+    /// `--pull-bbl`.
+    #[arg(long, value_name = "PATH")]
+    keep_bbl: Option<PathBuf>,
+
+    /// Erase the FC's onboard dataflash after a successful pull + analyze.
+    /// Off by default. Has no effect without `--pull-bbl`.
+    #[arg(long)]
+    erase_after_pull: bool,
+
+    /// Chunk size (in bytes) for the V2 dataflash read request. Default
+    /// 1024. Range: 256–32768. Has no effect without `--pull-bbl`.
+    #[arg(long, value_name = "BYTES", value_parser = parse_chunk_size)]
+    pull_chunk_size: Option<u16>,
 }
 
 /// Arguments for the compare command
@@ -283,6 +321,27 @@ struct TuneArgs {
     /// Options: last (default), first, longest.
     #[arg(long)]
     session_strategy: Option<String>,
+
+    /// Restore PID values from a previously saved tune-backup-*.json file.
+    /// Bypasses the pull/analyze flow entirely — connects to the FC, reads
+    /// the current PIDs (for the diff), writes the backup's PIDs with
+    /// rollback safety net, and (with --save-eeprom) persists. Use this
+    /// to recover from a tune iteration that made things worse.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["pull_bbl", "auto_apply_safe", "apply_all", "dry_run", "input"]
+    )]
+    restore: Option<PathBuf>,
+
+    /// Anchor recommendations against a baseline tune. Each rec's
+    /// proposed value is clamped to ±15% of the baseline value (not
+    /// ±15% of current), so gains can't drift unboundedly across
+    /// iterations. Pass a path to a `tune-backup-*.json` file. Pass
+    /// `none` to opt out of the clamp explicitly. When omitted, the
+    /// CLI nudges you to pass one but does not block the tune.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<String>,
 }
 
 /// Arguments for the export command
@@ -315,6 +374,11 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     init_logging(cli.verbose)?;
+
+    // Banner: gated on pretty + TTY + !NO_COLOR + !--no-banner. Goes to
+    // stderr so JSON/CSV consumers piping stdout never see it.
+    display::set_no_banner(cli.no_banner);
+    display::banner(&cli.output_format);
 
     // Execute the command
     match cli.command {
@@ -375,8 +439,58 @@ async fn analyze_command(
 ) -> Result<()> {
     let _term = Term::stdout();
 
-    // Find all blackbox files to process
-    let files = find_blackbox_files(&args.input, args.max_files)?;
+    // Validate flag combos. Pull-only flags are no-ops without `--pull-bbl`,
+    // and an explicit input together with `--pull-bbl` is ambiguous.
+    if args.keep_bbl.is_some() && !args.pull_bbl {
+        return Err(anyhow::anyhow!(
+            "--keep-bbl only makes sense together with --pull-bbl"
+        ));
+    }
+    if args.erase_after_pull && !args.pull_bbl {
+        return Err(anyhow::anyhow!(
+            "--erase-after-pull only makes sense together with --pull-bbl"
+        ));
+    }
+    if args.pull_chunk_size.is_some() && !args.pull_bbl {
+        return Err(anyhow::anyhow!(
+            "--pull-chunk-size only makes sense together with --pull-bbl"
+        ));
+    }
+    if args.input.is_some() && args.pull_bbl {
+        return Err(anyhow::anyhow!(
+            "Pass either a positional FILE/DIR OR --pull-bbl, not both"
+        ));
+    }
+
+    // Resolve the input path: pull from FC, or use the user-provided file/dir.
+    let files = match (&args.input, args.pull_bbl) {
+        (Some(p), false) => find_blackbox_files(p, args.max_files)?,
+        (None, true) => {
+            let resolved = resolve_connection_raw(args.connection.as_deref(), true)?;
+            let connection = resolved
+                .as_deref()
+                .expect("resolve_connection_raw guarantees Some when pull_bbl is true");
+            let was_auto_discovered =
+                !matches!(args.connection.as_deref(), Some(c) if c != "auto");
+            if was_auto_discovered {
+                println!("auto-discovered FC at {}", style(connection).bold());
+            }
+            let pulled = pull_bbl_from_fc(
+                connection,
+                args.keep_bbl.as_deref(),
+                args.pull_chunk_size,
+            )
+            .await
+            .context("Failed to pull BBL from flight controller")?;
+            vec![pulled]
+        }
+        (None, false) => {
+            return Err(anyhow::anyhow!(
+                "No blackbox file given. Pass a path, or --pull-bbl to download from the FC."
+            ));
+        }
+        (Some(_), true) => unreachable!("guarded above"),
+    };
 
     if files.is_empty() {
         eprintln!("{}", style("No blackbox files found").red());
@@ -387,7 +501,7 @@ async fn analyze_command(
     // (CSV, JSON) keep stdout clean and parseable.
     eprintln!(
         "{} Found {} blackbox file(s) to analyze",
-        style("ok").green().bold(),
+        display::glyph_ok(),
         files.len()
     );
 
@@ -451,6 +565,18 @@ async fn analyze_command(
         println!("  Successful: {}", style(successful).green());
         if failed > 0 {
             println!("  Failed: {}", style(failed).red());
+        }
+    }
+
+    // Erase the FC's dataflash only after analysis succeeded — same safety
+    // discipline as the tune flow, so a parse/analyze failure never destroys
+    // log data the user might still want.
+    if args.pull_bbl && args.erase_after_pull {
+        let any_success = results.iter().any(|(_, r)| r.is_ok());
+        if any_success {
+            if let Some(connection) = resolve_connection_raw(args.connection.as_deref(), true)? {
+                erase_dataflash_post_tune(&connection).await?;
+            }
         }
     }
 
@@ -598,7 +724,7 @@ async fn compare_command(args: CompareArgs, output_format: OutputFormat) -> Resu
             &mut engine,
             file,
             &AnalyzeArgs {
-                input: file.clone(),
+                input: Some(file.clone()),
                 output_dir: None,
                 detailed: true,
                 show_details: false,
@@ -608,6 +734,11 @@ async fn compare_command(args: CompareArgs, output_format: OutputFormat) -> Resu
                 list_sessions: false,
                 bb_summary: false,
                 session_strategy: None,
+                connection: None,
+                pull_bbl: false,
+                keep_bbl: None,
+                erase_after_pull: false,
+                pull_chunk_size: None,
             },
         )
         .await
@@ -616,7 +747,7 @@ async fn compare_command(args: CompareArgs, output_format: OutputFormat) -> Resu
             Err(e) => {
                 eprintln!(
                     "{} Failed to analyze {}: {}",
-                    style("✗").red(),
+                    display::glyph_err(),
                     file.display(),
                     e
                 );
@@ -628,7 +759,7 @@ async fn compare_command(args: CompareArgs, output_format: OutputFormat) -> Resu
     if results.len() < 2 {
         eprintln!(
             "{} Need at least 2 successfully analyzed flights to compare",
-            style("!").yellow()
+            display::glyph_warn()
         );
         return Ok(());
     }
@@ -651,46 +782,71 @@ async fn validate_command(args: ValidateArgs, _output_format: OutputFormat) -> R
     let files = find_blackbox_files(&args.input, 1000)?;
 
     if files.is_empty() {
-        println!("{} No blackbox files found", style("!").yellow());
+        display::warn("No blackbox files found");
         return Ok(());
     }
 
-    println!("Validating {} file(s)", files.len());
+    display::section("Validate");
+    println!();
 
-    let mut valid_files = 0;
-    let mut invalid_files = 0;
+    let mut rows: Vec<display::ValidateRow> = Vec::new();
+    let mut valid_files = 0usize;
+    let mut invalid_files = 0usize;
+    let mut issue_lines: Vec<String> = Vec::new();
 
     for file in files {
         match validate_single_file(&file, args.check_issues).await {
             Ok(issues) => {
                 valid_files += 1;
                 if !issues.is_empty() {
-                    println!(
-                        "{} {} - {} issues found",
-                        style("warn").yellow().bold(),
-                        file.display(),
-                        issues.len()
-                    );
-                    for issue in issues {
-                        println!("    {}", issue);
+                    issue_lines.push(format!("{}:", file.display()));
+                    for issue in &issues {
+                        issue_lines.push(format!("    • {}", issue));
                     }
+                    rows.push(display::ValidateRow {
+                        status: display::ValidateStatus::Issues,
+                        file: file.display().to_string(),
+                        note: format!("{} issue(s)", issues.len()),
+                    });
                 } else {
-                    println!("{} {} - valid", style("ok").green().bold(), file.display());
+                    rows.push(display::ValidateRow {
+                        status: display::ValidateStatus::Valid,
+                        file: file.display().to_string(),
+                        note: String::new(),
+                    });
                 }
             }
             Err(e) => {
                 invalid_files += 1;
-                println!("{} {} - {}", style("✗").red(), file.display(), e);
+                rows.push(display::ValidateRow {
+                    status: display::ValidateStatus::Invalid,
+                    file: file.display().to_string(),
+                    note: e.to_string(),
+                });
             }
         }
     }
 
-    println!();
-    println!("Validation Summary:");
-    println!("  Valid files: {}", style(valid_files).green());
-    if invalid_files > 0 {
-        println!("  Invalid files: {}", style(invalid_files).red());
+    display::validate_table(&rows);
+
+    if !issue_lines.is_empty() {
+        println!();
+        println!("Issues:");
+        for l in &issue_lines {
+            println!("  {}", l);
+        }
     }
+
+    println!();
+    display::ok(format!(
+        "Valid: {}   Invalid: {}",
+        style(valid_files).green().bold(),
+        if invalid_files > 0 {
+            style(invalid_files).red().bold().to_string()
+        } else {
+            "0".to_string()
+        }
+    ));
 
     Ok(())
 }
@@ -725,7 +881,7 @@ async fn validate_single_file(file_path: &PathBuf, check_issues: bool) -> Result
 async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Result<()> {
     eprintln!(
         "{} `monitor` is EXPERIMENTAL — the MSP transport has never been validated against a real FC. Behaviour is not stable.",
-        style("warn").yellow().bold().bold()
+        display::glyph_warn()
     );
     {
         use drone_tuner_core::realtime::*;
@@ -747,7 +903,7 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
                 "cpu" => telemetry_fields.push(TelemetryField::CpuLoad),
                 "loop_time" => telemetry_fields.push(TelemetryField::LoopTime),
                 _ => {
-                    println!("{} Unknown telemetry field: {}", style("warn").yellow().bold(), field);
+                    println!("{} Unknown telemetry field: {}", display::glyph_warn(), field);
                 }
             }
         }
@@ -764,7 +920,7 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
             .await
             .context("Failed to connect to flight controller")?;
 
-        println!("{} Connected successfully", style("ok").green().bold());
+        println!("{} Connected successfully", display::glyph_ok());
 
         // Start telemetry streaming
         let mut telemetry_rx = fc
@@ -827,6 +983,17 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
 async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()> {
     print_stage("drone-tuner Tune");
 
+    // --restore short-circuits the entire pull/analyze/apply flow. It only
+    // needs an FC connection (auto-discoverable) and the backup file.
+    if let Some(restore_path) = &args.restore {
+        let connection = match args.connection.as_deref() {
+            Some("auto") => discover_fc_port()?,
+            Some(c) => c.to_string(),
+            None => discover_fc_port()?,
+        };
+        return restore_pid_from_backup(&connection, restore_path, args.save_eeprom).await;
+    }
+
     // Validate flag combos. `--keep-bbl` only makes sense when we actually
     // have a pulled file to keep; an explicit input together with
     // `--pull-bbl` is ambiguous so reject it.
@@ -887,7 +1054,7 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
 
     // Analyze the blackbox file first
     let analyze_args = AnalyzeArgs {
-        input: bbl_path.clone(),
+        input: Some(bbl_path.clone()),
         output_dir: None,
         detailed: true,
         show_details: false,
@@ -897,12 +1064,17 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         list_sessions: false,
         bb_summary: false,
         session_strategy: args.session_strategy.clone(),
+        connection: None,
+        pull_bbl: false,
+        keep_bbl: None,
+        erase_after_pull: false,
+        pull_chunk_size: None,
     };
 
     // Get analysis results
     let mut engine = AnalysisEngine::new();
     let analysis_pb = make_spinner(format!("parsing {}", bbl_path.display()));
-    let analysis = analyze_single_file(&mut engine, &bbl_path, &analyze_args).await?;
+    let mut analysis = analyze_single_file(&mut engine, &bbl_path, &analyze_args).await?;
     finish_step(
         analysis_pb,
         format!(
@@ -912,18 +1084,28 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         ),
     );
 
+    // Item 4: anchor recommendations against a baseline tune. Each rec's
+    // proposed value is clamped to ±15% of the baseline value (not ±15%
+    // of current), so cumulative drift across iterations can't escape
+    // the envelope. Apply before display so what the user sees is what
+    // will actually be written.
+    apply_baseline_clamp(&mut analysis.report.pid_recommendations, args.baseline.as_deref());
+
+    // Item 5: cross-tune convergence detector. Look at recent tune-history
+    // rows for the same FC; if the analyzer is about to push a gain in the
+    // same direction it already pushed it twice before, the underlying
+    // problem isn't a PID issue. Suppress the rec and surface an advisory
+    // pointing at filters / mechanical follow-up. Runs before display so
+    // what the user sees is what will actually be applied.
+    apply_convergence_check(&mut analysis.report.pid_recommendations);
+
     // Display tuning recommendations
     println!("\nTuning Recommendations:");
 
     if !analysis.report.pid_recommendations.is_empty() {
         println!("\n  PID Adjustments:");
         for rec in &analysis.report.pid_recommendations {
-            let priority_icon = match rec.priority {
-                Priority::Critical => style("[C]").magenta().bold(),
-                Priority::High => style("[H]").red().bold(),
-                Priority::Medium => style("[M]").yellow().bold(),
-                Priority::Low => style("[L]").green().bold(),
-            };
+            let priority_icon = display::priority_badge(&rec.priority);
             println!(
                 "    {} {:?} {:?}: {:.1} → {:.1}",
                 priority_icon, rec.axis, rec.term, rec.current_value, rec.recommended_value
@@ -935,12 +1117,7 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
     if !analysis.report.filter_recommendations.is_empty() {
         println!("\n  Filter Adjustments:");
         for rec in &analysis.report.filter_recommendations {
-            let priority_icon = match rec.priority {
-                Priority::Critical => style("[C]").magenta().bold(),
-                Priority::High => style("[H]").red().bold(),
-                Priority::Medium => style("[M]").yellow().bold(),
-                Priority::Low => style("[L]").green().bold(),
-            };
+            let priority_icon = display::priority_badge(&rec.priority);
 
             let description = match &rec.recommendation_type {
                 FilterRecommendationType::AdjustGyroLowpass {
@@ -1051,13 +1228,13 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
     // Decide whether/how to apply.
     match (resolved_connection.as_deref(), args.dry_run) {
         (None, true) => {
-            println!("\n{} Dry run mode - no changes applied", style("note").blue().bold());
+            println!("\n{} Dry run mode - no changes applied", display::glyph_info());
         }
         (None, false) => {
             println!(
                 "\n{} Specify --connection (or --apply-all/--auto-apply-safe to auto-discover) \
                  to apply changes to flight controller",
-                style("note").blue().bold()
+                display::glyph_info()
             );
         }
         (Some(connection), true) => {
@@ -1084,7 +1261,7 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         } else {
             println!(
                 "\n  {} skipping --erase-after-pull (no FC connection at end of run)",
-                style("note").blue().bold()
+                display::glyph_info()
             );
         }
     }
@@ -1106,7 +1283,7 @@ fn print_tune_findings(analysis: &AnalysisResult) {
     if total_recs == 0 {
         println!(
             "\n  {} Tune quality: {:.1}/100 — no changes needed",
-            style("ok").green().bold(),
+            display::glyph_ok(),
             analysis.report.tune_quality_score
         );
     }
@@ -1167,7 +1344,7 @@ fn print_tune_findings(analysis: &AnalysisResult) {
     if total_shown == 0 {
         println!(
             "    {} measured silence — no oscillation peaks above noise floor",
-            style("ok").green().bold()
+            display::glyph_ok()
         );
     }
 
@@ -1207,37 +1384,9 @@ fn print_tune_findings(analysis: &AnalysisResult) {
     }
 }
 
-/// Print a section header. The whole tune flow is broken into named stages
-/// so users can see where they are without scrolling.
-fn print_stage(name: &str) {
-    println!("\n{}", style(format!("== {name} ==")).bold().cyan());
-}
-
-/// Build a small spinner with a stable style. Used for transient
-/// progress feedback during MSP roundtrips that take ≤1s.
-fn make_spinner(msg: impl Into<String>) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.set_message(msg.into());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    pb
-}
-
-/// Tear down a transient spinner and print a final result line on stdout.
-///
-/// Indicatif suppresses output when stderr isn't a TTY (CI, redirected
-/// runs), so a `finish_with_message` alone vanishes in those cases. By
-/// also writing to stdout we keep the result line visible regardless of
-/// where the run is happening.
-fn finish_step(pb: ProgressBar, message: impl Into<String>) {
-    let msg = message.into();
-    pb.finish_and_clear();
-    println!("  {} {}", style("ok").green().bold(), msg);
-}
+// Stage / spinner / step helpers live in `display` now; re-export so the
+// many call sites in this file keep their bare names.
+use display::{finish_step, make_spinner, print_stage};
 
 /// Pull the FC's onboard dataflash to a `.bbl` file with a live progress
 /// bar. Returns the path to the saved file.
@@ -1320,7 +1469,12 @@ async fn pull_bbl_from_fc(
     let path: PathBuf = match keep_path {
         Some(p) if p.is_dir() => p.join(&auto_filename),
         Some(p) => p.to_path_buf(),
-        None => std::env::temp_dir().join(&auto_filename),
+        // Default to the central pulls dir so BBLs survive reboots and
+        // accumulate in one searchable place. Falls through to /tmp only
+        // if the data dir can't be resolved (no $HOME, etc.).
+        None => paths::pulls_dir()
+            .map(|d| d.join(&auto_filename))
+            .unwrap_or_else(|_| std::env::temp_dir().join(&auto_filename)),
     };
 
     let pull_pb = ProgressBar::new(summary.used_size as u64);
@@ -1355,6 +1509,376 @@ async fn pull_bbl_from_fc(
     Ok(path)
 }
 
+/// Restore PID values from a previously saved `tune-backup-*.json` file.
+/// Reads the current PIDs (for diff display), then writes the backup's
+/// PID triplets via [`apply_pid_with_rollback`] (with the FC's own
+/// pre-write snapshot as the rollback target).
+///
+/// We only patch the first 9 bytes (Roll/Pitch/Yaw P/I/D) to avoid blowing
+/// away axes 4/5 if the FC's payload is longer than the backup's — the
+/// backup schema only carries the three flight axes.
+///
+/// [`apply_pid_with_rollback`]: drone_tuner_core::realtime::FlightControllerConnection::apply_pid_with_rollback
+async fn restore_pid_from_backup(
+    connection: &str,
+    backup_path: &Path,
+    save_eeprom: bool,
+) -> Result<()> {
+    print_stage("Restore");
+
+    // Load + validate the backup file.
+    let raw = std::fs::read(backup_path)
+        .with_context(|| format!("Failed to read backup file {}", backup_path.display()))?;
+    let json: serde_json::Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("Backup file {} is not valid JSON", backup_path.display()))?;
+
+    let schema = json.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+    if schema != "drone-tuner-pid-backup-v1" {
+        return Err(anyhow::anyhow!(
+            "Unrecognised backup schema {:?} — expected \"drone-tuner-pid-backup-v1\"",
+            schema
+        ));
+    }
+
+    fn read_triplet(v: &serde_json::Value, key: &str) -> Result<(u8, u8, u8)> {
+        let arr = v
+            .get(key)
+            .and_then(|x| x.as_array())
+            .with_context(|| format!("backup is missing {key} array"))?;
+        if arr.len() != 3 {
+            return Err(anyhow::anyhow!(
+                "backup {key} array has {} entries, expected 3",
+                arr.len()
+            ));
+        }
+        let mut out = [0u8; 3];
+        for (i, item) in arr.iter().enumerate() {
+            let n = item
+                .as_u64()
+                .with_context(|| format!("backup {key}[{i}] is not an integer"))?;
+            if n > 255 {
+                return Err(anyhow::anyhow!(
+                    "backup {key}[{i}]={n} exceeds u8 range — refusing to write"
+                ));
+            }
+            out[i] = n as u8;
+        }
+        Ok((out[0], out[1], out[2]))
+    }
+
+    let roll = read_triplet(&json, "roll")?;
+    let pitch = read_triplet(&json, "pitch")?;
+    let yaw = read_triplet(&json, "yaw")?;
+    let captured_at = json
+        .get("captured_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown time)");
+
+    println!(
+        "  loaded backup ({}): roll={:?} pitch={:?} yaw={:?}",
+        captured_at, roll, pitch, yaw
+    );
+
+    // Connect, read current state for diff.
+    let connect_pb = make_spinner(format!("connecting to {connection}"));
+    let mut fc = open_fc_connection(connection).await?;
+    let info_line = match fc.fc_info() {
+        Some(info) => {
+            let name_suffix = if info.craft_name.is_empty() {
+                String::new()
+            } else {
+                format!(", craft \"{}\"", info.craft_name)
+            };
+            format!(
+                "connected: {} {} (api {}, target {}{})",
+                info.firmware_id,
+                info.firmware_version,
+                info.api_version,
+                info.target_name,
+                name_suffix
+            )
+        }
+        None => "connected".to_string(),
+    };
+    finish_step(connect_pb, info_line);
+
+    let read_pb = make_spinner("reading current PID values");
+    let current = fc
+        .read_pid()
+        .await
+        .context("Failed to read current PID values from FC")?;
+    finish_step(
+        read_pb,
+        format!(
+            "current: roll={:?} pitch={:?} yaw={:?}",
+            current.roll(),
+            current.pitch(),
+            current.yaw()
+        ),
+    );
+
+    // Compose the new snapshot: start from the FC's current payload
+    // (preserving length and any extra-axis bytes), then patch the three
+    // flight axes with the backup values.
+    let mut new_snapshot = current.clone();
+    new_snapshot.set_roll(roll.0, roll.1, roll.2);
+    new_snapshot.set_pitch(pitch.0, pitch.1, pitch.2);
+    new_snapshot.set_yaw(yaw.0, yaw.1, yaw.2);
+
+    if current.roll() == roll && current.pitch() == pitch && current.yaw() == yaw {
+        println!(
+            "  {} FC PIDs already match backup — nothing to write.",
+            display::glyph_info()
+        );
+        return Ok(());
+    }
+
+    println!("  PID changes to apply (restore):");
+    if current.roll() != roll {
+        println!("    Roll  P/I/D: {:?} → {:?}", current.roll(), roll);
+    }
+    if current.pitch() != pitch {
+        println!("    Pitch P/I/D: {:?} → {:?}", current.pitch(), pitch);
+    }
+    if current.yaw() != yaw {
+        println!("    Yaw   P/I/D: {:?} → {:?}", current.yaw(), yaw);
+    }
+
+    let write_pb = make_spinner("writing PIDs (with rollback safety net)");
+    fc.apply_pid_with_rollback(&new_snapshot)
+        .await
+        .context("PID restore failed (any partial write was rolled back)")?;
+    finish_step(write_pb, "PIDs restored");
+
+    if save_eeprom {
+        let save_pb = make_spinner("persisting to EEPROM");
+        match fc.save_to_eeprom().await {
+            Ok(()) => finish_step(save_pb, "EEPROM written — survives power cycle"),
+            Err(e) => {
+                save_pb.finish_and_clear();
+                println!(
+                    "  {} EEPROM write failed: {} (RAM changes still in effect, will revert on power cycle)",
+                    display::glyph_warn(),
+                    e
+                );
+            }
+        }
+    } else {
+        println!(
+            "  {} Restored values are RAM-only and will revert on power cycle. \
+             Pass --save-eeprom to persist.",
+            display::glyph_info()
+        );
+    }
+
+    println!("\n  {} Restore complete.", display::glyph_ok());
+    Ok(())
+}
+
+/// Load a `tune-backup-*.json` file and project it into a
+/// [`PidConfiguration`] for the baseline-anchored clamp (Item 4). The
+/// backup schema only carries the three flight axes' P/I/D triplets; all
+/// other fields of `PidConfiguration` are filled with defaults — the
+/// clamp helper only consults `roll/pitch/yaw {p,i,d}` so they're inert.
+fn load_baseline_pid_config(path: &Path) -> Result<drone_tuner_core::domain::PidConfiguration> {
+    use drone_tuner_core::domain::{PidConfiguration, PidValues};
+
+    let raw = std::fs::read(path)
+        .with_context(|| format!("Failed to read baseline file {}", path.display()))?;
+    let json: serde_json::Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("Baseline file {} is not valid JSON", path.display()))?;
+
+    let schema = json.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+    if schema != "drone-tuner-pid-backup-v1" {
+        return Err(anyhow::anyhow!(
+            "Unrecognised baseline schema {:?} in {} — expected \"drone-tuner-pid-backup-v1\"",
+            schema,
+            path.display()
+        ));
+    }
+
+    fn read_triplet(v: &serde_json::Value, key: &str) -> Result<[f32; 3]> {
+        let arr = v
+            .get(key)
+            .and_then(|x| x.as_array())
+            .with_context(|| format!("baseline missing {key} array"))?;
+        if arr.len() != 3 {
+            return Err(anyhow::anyhow!(
+                "baseline {key} array has {} entries, expected 3",
+                arr.len()
+            ));
+        }
+        Ok([
+            arr[0].as_f64().unwrap_or(0.0) as f32,
+            arr[1].as_f64().unwrap_or(0.0) as f32,
+            arr[2].as_f64().unwrap_or(0.0) as f32,
+        ])
+    }
+
+    let roll = read_triplet(&json, "roll")?;
+    let pitch = read_triplet(&json, "pitch")?;
+    let yaw = read_triplet(&json, "yaw")?;
+
+    let mut cfg = PidConfiguration::default();
+    cfg.roll = PidValues { p: roll[0], i: roll[1], d: roll[2], f: None };
+    cfg.pitch = PidValues { p: pitch[0], i: pitch[1], d: pitch[2], f: None };
+    cfg.yaw = PidValues { p: yaw[0], i: yaw[1], d: yaw[2], f: None };
+    Ok(cfg)
+}
+
+/// Apply Item 4's baseline-anchored clamp in place. `flag` is the raw
+/// `--baseline` value:
+///
+/// - `Some("none")` — explicit opt-out. Recs are not clamped; no output.
+/// - `Some(path)` — load the file as a baseline and clamp.
+/// - `None` — soft note nudging the user to pass a baseline next time;
+///   recs pass through unclamped (preserves existing behaviour).
+///
+/// Auto-detect from craft name in cwd is intentionally not done here:
+/// the bbl's `FlightSession` doesn't carry the craft name (it's on the
+/// FC connection only), and threading FC info into this function adds
+/// more coupling than the convenience earns. Pass the path explicitly.
+fn apply_baseline_clamp(
+    recs: &mut Vec<drone_tuner_core::domain::PidRecommendation>,
+    flag: Option<&str>,
+) {
+    match flag {
+        Some("none") => {
+            // Explicit opt-out: stay silent.
+        }
+        Some(path_str) => {
+            let path = PathBuf::from(path_str);
+            match load_baseline_pid_config(&path) {
+                Ok(baseline_cfg) => {
+                    let pre_count = recs.len();
+                    let taken = std::mem::take(recs);
+                    let clamped = drone_tuner_core::analysis::clamp_recs_to_baseline(
+                        taken,
+                        &baseline_cfg,
+                    );
+                    let dropped = pre_count.saturating_sub(clamped.len());
+                    *recs = clamped;
+                    println!(
+                        "  {} baseline anchor: {} (±{:.0}% bound{})",
+                        display::glyph_ok(),
+                        path.display(),
+                        drone_tuner_core::analysis::BASELINE_BOUND_PCT * 100.0,
+                        if dropped > 0 {
+                            format!(", {dropped} rec(s) dropped as out-of-envelope")
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "  {} baseline file unreadable ({e}); proceeding without anchor",
+                        display::glyph_warn()
+                    );
+                }
+            }
+        }
+        None => {
+            println!(
+                "  {} no --baseline anchor passed; iterative drift can compound. \
+                 Pass --baseline <PATH> for the safest tune flow.",
+                display::glyph_info()
+            );
+        }
+    }
+}
+
+/// Item 5: cross-tune convergence detector entry point. Reads the persisted
+/// `tune-history.jsonl`, filters to the FC most recently tuned (so multi-FC
+/// users don't get cross-contamination), translates rows into core's
+/// [`PidChangeRecord`] schema, and runs [`apply_convergence_suppression`].
+///
+/// Recs that survive are written back into `recs` in place. Suppressed recs
+/// are printed to stdout as advisories with the analyzer's reasoning.
+///
+/// Failure modes are non-fatal: if the history file is missing, malformed,
+/// or unreadable, we log and proceed with no suppression. The detector is
+/// a *safety net*, not a hard gate — losing it must never block a tune.
+fn apply_convergence_check(recs: &mut Vec<drone_tuner_core::domain::PidRecommendation>) {
+    use drone_tuner_core::analysis::{
+        apply_convergence_suppression, PidChangeRecord, DEFAULT_MIN_REPEATED,
+    };
+    use drone_tuner_core::domain::{Axis, PidTerm};
+
+    if recs.is_empty() {
+        return;
+    }
+
+    let history = match history::read_all() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::debug!("Convergence check skipped: {e:#}");
+            return;
+        }
+    };
+
+    if history.is_empty() {
+        return;
+    }
+
+    // Use the *most recent* row's FC identity as the filter. This is the
+    // robust single-FC default (always self-filters correctly) and the
+    // sane multi-FC heuristic (only triggers when the user is iterating
+    // on the same FC the log was last appended to).
+    let last = history.last().unwrap();
+    let (board_id, target_name) = (last.fc.board_id.clone(), last.fc.target_name.clone());
+
+    let mut changes: Vec<PidChangeRecord> = Vec::with_capacity(history.len() * 9);
+    for entry in &history {
+        if entry.fc.board_id != board_id || entry.fc.target_name != target_name {
+            continue;
+        }
+        for (axis, before, after) in [
+            (Axis::Roll, entry.pids_before.roll, entry.pids_after.roll),
+            (Axis::Pitch, entry.pids_before.pitch, entry.pids_after.pitch),
+            (Axis::Yaw, entry.pids_before.yaw, entry.pids_after.yaw),
+        ] {
+            for (term, idx) in [(PidTerm::P, 0usize), (PidTerm::I, 1), (PidTerm::D, 2)] {
+                let delta = after[idx] as i32 - before[idx] as i32;
+                changes.push(PidChangeRecord {
+                    axis: axis.clone(),
+                    term,
+                    delta,
+                });
+            }
+        }
+    }
+
+    let taken = std::mem::take(recs);
+    let outcome = apply_convergence_suppression(taken, &changes, DEFAULT_MIN_REPEATED);
+    *recs = outcome.kept;
+
+    if outcome.suppressed.is_empty() {
+        return;
+    }
+
+    println!(
+        "  {} convergence detector suppressed {} rec(s) for FC {}/{} \
+         (same gain pushed in same direction across {} iterations):",
+        display::glyph_warn(),
+        outcome.suppressed.len(),
+        board_id,
+        target_name,
+        DEFAULT_MIN_REPEATED + 1,
+    );
+    for s in &outcome.suppressed {
+        println!(
+            "    {} {:?} {:?}: would have applied {:.1} → {:.1}",
+            style("[!]").yellow().bold(),
+            s.original.axis,
+            s.original.term,
+            s.original.current_value,
+            s.original.recommended_value,
+        );
+        println!("      Advisory: {}", s.advisory);
+    }
+}
+
 /// Wipe the FC's onboard dataflash. Called from `tune_command` only after
 /// the entire flow (pull → analyze → apply) has succeeded, so a failure
 /// midway never destroys log data the user might want to re-pull.
@@ -1375,7 +1899,7 @@ async fn erase_dataflash_post_tune(connection: &str) -> Result<()> {
             println!(
                 "  {} dataflash erase failed: {} \
                  (your BBL is already saved; tune flow itself completed)",
-                style("warn").yellow().bold(),
+                display::glyph_warn(),
                 e
             );
         }
@@ -1537,10 +2061,19 @@ fn discover_fc_port() -> Result<String> {
 ///   other process owns and surprising users whose intent was just to
 ///   look at recommendations.
 fn resolve_connection(args: &TuneArgs) -> Result<Option<String>> {
-    match args.connection.as_deref() {
+    resolve_connection_raw(args.connection.as_deref(), args.pull_bbl)
+}
+
+/// Same logic as [`resolve_connection`], parameterised for callers that
+/// don't have a `TuneArgs`. Used by the `analyze --pull-bbl` path.
+fn resolve_connection_raw(
+    connection: Option<&str>,
+    pull_bbl: bool,
+) -> Result<Option<String>> {
+    match connection {
         Some("auto") => Ok(Some(discover_fc_port()?)),
         Some(c) => Ok(Some(c.to_string())),
-        None if args.pull_bbl => Ok(Some(discover_fc_port()?)),
+        None if pull_bbl => Ok(Some(discover_fc_port()?)),
         None => Ok(None),
     }
 }
@@ -1604,7 +2137,7 @@ async fn dry_connect_and_diff(
         connection
     );
     let mut fc = open_fc_connection(connection).await?;
-    println!("{} Connected", style("ok").green().bold());
+    println!("{} Connected", display::glyph_ok());
 
     let current = fc
         .read_pid()
@@ -1616,7 +2149,7 @@ async fn dry_connect_and_diff(
     if count == 0 {
         println!(
             "\n{} No PID changes would be applied (need --auto-apply-safe or --apply-all to opt in).",
-            style("note").blue().bold()
+            display::glyph_info()
         );
     } else {
         println!(
@@ -1662,7 +2195,7 @@ async fn dry_connect_and_diff(
                 println!(
                     "    {} {} filter recommendation(s) would be printed but not auto-applied — \
                      payload offsets vary by firmware version.",
-                    style("note").blue().bold(),
+                    display::glyph_info(),
                     report.filter_recommendations.len()
                 );
             }
@@ -1670,7 +2203,7 @@ async fn dry_connect_and_diff(
         Err(e) => {
             println!(
                 "\n{} Could not read filter config: {} (continuing — PIDs are unaffected)",
-                style("warn").yellow().bold(),
+                display::glyph_warn(),
                 e
             );
         }
@@ -1678,7 +2211,7 @@ async fn dry_connect_and_diff(
 
     println!(
         "\n{} Dry run complete — drop --dry-run to actually apply.",
-        style("note").blue().bold()
+        display::glyph_info()
     );
     Ok(())
 }
@@ -1707,7 +2240,7 @@ async fn apply_pid_recommendations_via_fc(
         println!(
             "\n{} No --auto-apply-safe or --apply-all flag — skipping writeback. \
              Re-run with one of those flags to actually apply changes.",
-            style("note").blue().bold()
+            display::glyph_info()
         );
         return Ok(());
     }
@@ -1794,7 +2327,7 @@ async fn apply_pid_recommendations_via_fc(
     } else {
         println!(
             "  {} No PID recommendations to write — proceeding to filter writeback.",
-            style("note").blue().bold()
+            display::glyph_info()
         );
         None
     };
@@ -1821,7 +2354,7 @@ async fn apply_pid_recommendations_via_fc(
                 read_pb.finish_and_clear();
                 println!(
                     "  {} could not read filter config: {} (skipping filter writeback)",
-                    style("warn").yellow().bold(),
+                    display::glyph_warn(),
                     e
                 );
                 // Bail out of the filter section but continue to backup /
@@ -1847,7 +2380,7 @@ async fn apply_pid_recommendations_via_fc(
             if !unsupported.is_empty() {
                 println!(
                     "  {} filter recs surfaced but none auto-applicable on this build:",
-                    style("note").blue().bold(),
+                    display::glyph_info(),
                 );
                 for u in &unsupported {
                     println!("    - {u}");
@@ -1855,7 +2388,7 @@ async fn apply_pid_recommendations_via_fc(
             } else {
                 println!(
                     "  {} no filter recs match priority gating (--apply-all / --auto-apply-safe).",
-                    style("note").blue().bold()
+                    display::glyph_info()
                 );
             }
         } else {
@@ -1875,7 +2408,7 @@ async fn apply_pid_recommendations_via_fc(
                     filter_pb.finish_and_clear();
                     println!(
                         "  {} filter writeback failed: {} (rollback restored pre-change state)",
-                        style("warn").yellow().bold(),
+                        display::glyph_warn(),
                         e
                     );
                     filter_changes_applied = 0;
@@ -1884,7 +2417,7 @@ async fn apply_pid_recommendations_via_fc(
             if !unsupported.is_empty() {
                 println!(
                     "  {} {} filter rec(s) skipped (FC's filter config payload too short):",
-                    style("note").blue().bold(),
+                    display::glyph_info(),
                     unsupported.len()
                 );
                 for u in &unsupported {
@@ -1895,7 +2428,7 @@ async fn apply_pid_recommendations_via_fc(
     } else if args.skip_filters {
         println!(
             "  {} --skip-filters set — filter recs printed but not written.",
-            style("note").blue().bold()
+            display::glyph_info()
         );
     }
     } // 'filters: { ... } block
@@ -1908,10 +2441,16 @@ async fn apply_pid_recommendations_via_fc(
         let path = maybe_path.clone().unwrap_or_else(|| {
             let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
             let slug = fc.fc_info().and_then(craft_name_slug);
-            match slug {
-                Some(name) => PathBuf::from(format!("tune-backup-{name}-{ts}.json")),
-                None => PathBuf::from(format!("tune-backup-{ts}.json")),
-            }
+            let filename = match slug {
+                Some(name) => format!("tune-backup-{name}-{ts}.json"),
+                None => format!("tune-backup-{ts}.json"),
+            };
+            // Default into the central backups dir so they accumulate in
+            // one searchable place across crafts. CWD fallback only if
+            // the data dir is unresolvable (no $HOME etc.).
+            paths::backups_dir()
+                .map(|d| d.join(&filename))
+                .unwrap_or_else(|_| PathBuf::from(filename))
         });
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "schema": "drone-tuner-pid-backup-v1",
@@ -1942,7 +2481,7 @@ async fn apply_pid_recommendations_via_fc(
         println!(
             "  {} Changes are RAM-only and will revert on power cycle. \
              Re-run with --save-eeprom to persist.",
-            style("note").blue().bold()
+            display::glyph_info()
         );
     }
 
@@ -1962,7 +2501,7 @@ async fn apply_pid_recommendations_via_fc(
         }
     }
 
-    println!("\n  {} Tune complete.", style("ok").green().bold());
+    println!("\n  {} Tune complete.", display::glyph_ok());
 
     Ok(())
 }
@@ -2322,7 +2861,7 @@ async fn export_command(args: ExportArgs, _output_format: OutputFormat) -> Resul
         .is_some_and(|ext| ext == "bbl" || ext == "BBL")
     {
         let analyze_args = AnalyzeArgs {
-            input: args.input.clone(),
+            input: Some(args.input.clone()),
             output_dir: None,
             detailed: true,
             show_details: false,
@@ -2332,6 +2871,11 @@ async fn export_command(args: ExportArgs, _output_format: OutputFormat) -> Resul
             list_sessions: false,
             bb_summary: false,
             session_strategy: None,
+            connection: None,
+            pull_bbl: false,
+            keep_bbl: None,
+            erase_after_pull: false,
+            pull_chunk_size: None,
         };
 
         let mut engine = AnalysisEngine::new();
@@ -2380,28 +2924,35 @@ async fn export_command(args: ExportArgs, _output_format: OutputFormat) -> Resul
         }
     }
 
-    println!("{} Export completed successfully", style("ok").green().bold());
+    println!("{} Export completed successfully", display::glyph_ok());
     Ok(())
 }
 
-/// Handle the info command
+/// Handle the info command. Prints a single comfy-table panel below the
+/// banner — version, system, and library readiness in one place.
 async fn info_command() -> Result<()> {
-    println!("FPV Drone Tuner");
-    println!("Version: {}", env!("CARGO_PKG_VERSION"));
-    println!("Core library: {}", drone_tuner_core::VERSION);
-    println!();
-    println!("System Information:");
-    println!("  OS: {}", std::env::consts::OS);
-    println!("  Arch: {}", std::env::consts::ARCH);
-    println!("  Rust version: Unknown"); // Would detect at runtime
+    display::info_panel(
+        env!("CARGO_PKG_VERSION"),
+        drone_tuner_core::VERSION,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        &[
+            ("FFT support", true),
+            ("Scientific computing", true),
+            ("Blackbox parsing", true),
+        ],
+    );
 
-    // Check if we can access required libraries
-    println!();
-    println!("Library Status:");
-    println!("  ✓ FFT support available");
-    println!("  ✓ Scientific computing available");
-    println!("  ✓ Blackbox parsing ready");
-
+    // Surface where the tool keeps its state so the user knows where
+    // backups, baselines, and pulls land.
+    if let Ok(root) = paths::data_root() {
+        println!();
+        println!("  Data directory: {}", root.display());
+        println!("    backups/     tune-backup-*.json (auto-saved snapshots)");
+        println!("    baselines/   pinned per-craft anchors (--baseline)");
+        println!("    pulls/       BBL files pulled from FCs");
+        println!("    history.jsonl  cross-tune history");
+    }
     Ok(())
 }
 
@@ -2631,7 +3182,7 @@ fn output_pretty(
                     if fc.firmware.contains("Unknown") || fc.version.contains("Unknown") {
                         println!(
                             "  {} Firmware info extraction incomplete - check manually",
-                            style("warn").yellow().bold()
+                            display::glyph_warn()
                         );
                     }
                     println!();
@@ -2641,112 +3192,33 @@ fn output_pretty(
                     println!();
                 }
 
-                // Tune quality score
-                let quality = analysis.report.tune_quality_score;
-                let quality_color = if quality >= 80.0 {
-                    style(format!("{:.1}", quality)).green()
-                } else if quality >= 60.0 {
-                    style(format!("{:.1}", quality)).yellow()
-                } else {
-                    style(format!("{:.1}", quality)).red()
-                };
-
+                // Tune quality gauge — score with coloured bar + verdict band.
                 if detailed_info {
                     println!("Analysis Results:");
                 }
-                println!("  Tune Quality: {}/100", quality_color);
+                println!(
+                    "  {}",
+                    display::quality_gauge(analysis.report.tune_quality_score)
+                );
 
                 // Issues
                 if !analysis.report.detected_issues.is_empty() {
-                    println!("  {} Issues found:", style("warn").yellow().bold());
+                    println!(
+                        "  {} Issues found:",
+                        display::glyph_warn()
+                    );
                     for issue in &analysis.report.detected_issues {
                         println!("    • {}", issue.description);
                     }
                 }
 
-                // Recommendations
-                if !analysis.report.filter_recommendations.is_empty() {
-                    println!("  {} Filter recommendations:", "");
-                    for rec in &analysis.report.filter_recommendations {
-                        let description = match &rec.recommendation_type {
-                            FilterRecommendationType::AdjustGyroLowpass {
-                                stage,
-                                current_cutoff,
-                                recommended_cutoff,
-                                filter_type,
-                            } => {
-                                format!(
-                                    "Gyro Lowpass {} ({}): {:.0}→{:.0} Hz",
-                                    stage, filter_type, current_cutoff, recommended_cutoff
-                                )
-                            }
-                            FilterRecommendationType::ConfigureGyroNotch {
-                                notch_number,
-                                frequency,
-                                q_factor,
-                                enabled,
-                            } => {
-                                if *enabled {
-                                    format!(
-                                        "Enable Gyro Notch {}: {:.0} Hz (Q: {:.0})",
-                                        notch_number, frequency, q_factor
-                                    )
-                                } else {
-                                    format!("Disable Gyro Notch {}", notch_number)
-                                }
-                            }
-                            FilterRecommendationType::AdjustDynamicNotch {
-                                notch_count,
-                                min_freq,
-                                max_freq,
-                                ..
-                            } => {
-                                format!(
-                                    "Dynamic Notch: {} notches, {:.0}-{:.0} Hz",
-                                    notch_count, min_freq, max_freq
-                                )
-                            }
-                            FilterRecommendationType::ConfigureRpmFilter {
-                                harmonics,
-                                enabled,
-                                ..
-                            } => {
-                                if *enabled {
-                                    format!("Enable RPM Filter: {} harmonics", harmonics)
-                                } else {
-                                    "Disable RPM Filter".to_string()
-                                }
-                            }
-                            FilterRecommendationType::AdjustDtermLowpass {
-                                stage,
-                                filter_type,
-                                ..
-                            } => {
-                                format!("D-term Lowpass {} ({})", stage, filter_type)
-                            }
-                            FilterRecommendationType::AdjustYawLowpass {
-                                current_cutoff,
-                                recommended_cutoff,
-                            } => {
-                                format!(
-                                    "Yaw Lowpass: {:.0}→{:.0} Hz",
-                                    current_cutoff, recommended_cutoff
-                                )
-                            }
-                        };
-                        println!("    • {}", description);
-                    }
-                }
-
-                if !analysis.report.pid_recommendations.is_empty() {
-                    println!("  {} PID recommendations:", "");
-                    for rec in &analysis.report.pid_recommendations {
-                        println!(
-                            "    • {:?}: {:.1} → {:.1}",
-                            rec.term, rec.current_value, rec.recommended_value
-                        );
-                    }
-                }
+                // Recommendations: rendered as a single combined comfy-table
+                // (PID + filter rows together), priority-coloured per row.
+                println!();
+                display::recommendations_table(
+                    &analysis.report.pid_recommendations,
+                    &analysis.report.filter_recommendations,
+                );
 
                 // Step-response viz, only in --show-details mode. Surface
                 // *what the analyser saw* per axis so the recommendations
@@ -2757,12 +3229,7 @@ fn output_pretty(
             }
             Err(e) => {
                 println!();
-                println!(
-                    "{} {} - Error: {}",
-                    style("✗").red(),
-                    file_path.display(),
-                    e
-                );
+                display::err(format!("{} - Error: {}", file_path.display(), e));
             }
         }
     }
@@ -2808,39 +3275,8 @@ fn render_step_responses(responses: &[drone_tuner_core::analysis::StepResponse])
     }
 }
 
-/// Render a single trace as a unicode-block sparkline. Auto-scales to the
-/// data range so flat traces stay flat instead of getting amplified noise.
-fn print_sparkline(label: &str, samples: &[f32]) {
-    if samples.is_empty() {
-        return;
-    }
-    const COLS: usize = 60;
-    const BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-    // Down-sample to COLS columns by averaging consecutive chunks.
-    let chunk = samples.len().div_ceil(COLS);
-    let downsampled: Vec<f32> = samples
-        .chunks(chunk.max(1))
-        .map(|c| c.iter().sum::<f32>() / c.len() as f32)
-        .collect();
-
-    let (min, max) = downsampled
-        .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
-            (lo.min(v), hi.max(v))
-        });
-    let span = (max - min).max(1e-6);
-
-    let line: String = downsampled
-        .iter()
-        .map(|&v| {
-            let norm = ((v - min) / span).clamp(0.0, 1.0);
-            let idx = (norm * (BLOCKS.len() - 1) as f32).round() as usize;
-            BLOCKS[idx]
-        })
-        .collect();
-    println!("      {} [{:>+6.2} → {:>+6.2}] {}", label, min, max, line);
-}
+// Sparkline rendering moved to `display::print_sparkline`.
+use display::print_sparkline;
 
 /// Output results as JSON
 async fn output_json(
@@ -2980,43 +3416,38 @@ fn generate_comparison(results: &[AnalysisResult]) -> Result<FlightComparison> {
 
 /// Print comparison in pretty format
 fn print_comparison_pretty(comparison: &FlightComparison) {
-    println!("Flight Comparison");
+    display::section("Flight Comparison");
+    println!();
+    println!(
+        "  Best:    {}",
+        display::quality_gauge(comparison.summary.best_tune_quality)
+    );
+    println!(
+        "  Worst:   {}",
+        display::quality_gauge(comparison.summary.worst_tune_quality)
+    );
+    println!(
+        "  Average: {}",
+        display::quality_gauge(comparison.summary.avg_tune_quality)
+    );
+    println!(
+        "  Total issues across flights: {}",
+        comparison.summary.total_issues
+    );
     println!();
 
-    println!("Summary:");
-    println!(
-        "  Best tune quality: {:.1}",
-        comparison.summary.best_tune_quality
-    );
-    println!(
-        "  Worst tune quality: {:.1}",
-        comparison.summary.worst_tune_quality
-    );
-    println!(
-        "  Average tune quality: {:.1}",
-        comparison.summary.avg_tune_quality
-    );
-    println!("  Total issues: {}", comparison.summary.total_issues);
-    println!();
-
-    println!("Individual Flights:");
-    for flight in &comparison.flights {
-        let quality_color = if flight.tune_quality >= 80.0 {
-            style(format!("{:.1}", flight.tune_quality)).green()
-        } else if flight.tune_quality >= 60.0 {
-            style(format!("{:.1}", flight.tune_quality)).yellow()
-        } else {
-            style(format!("{:.1}", flight.tune_quality)).red()
-        };
-
-        println!(
-            "  {} - Quality: {}, Issues: {}, Duration: {:.1}s",
-            flight.name,
-            quality_color,
-            flight.issues_count,
-            flight.duration_ms as f32 / 1000.0
-        );
-    }
+    let rows: Vec<display::ComparisonRow> = comparison
+        .flights
+        .iter()
+        .map(|f| display::ComparisonRow {
+            name: &f.name,
+            quality: f.tune_quality,
+            issues: f.issues_count,
+            recommendations: f.recommendations_count,
+            duration_ms: f.duration_ms,
+        })
+        .collect();
+    display::comparison_table(&rows);
 }
 
 /// Print comparison as JSON
@@ -3644,6 +4075,8 @@ mod tests {
             save_eeprom: false,
             skip_filters: false,
             session_strategy: None,
+            restore: None,
+            baseline: None,
         }
     }
 

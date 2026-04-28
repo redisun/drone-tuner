@@ -382,7 +382,8 @@ mod compare_command_tests {
             .arg(&blackbox_file) // Compare file with itself for testing
             .assert()
             .success()
-            .stdout(predicate::str::contains("Flight Comparison"));
+            // Pretty compare output renders best/worst gauges + a comfy-table.
+            .stdout(predicate::str::contains("Best:"));
     }
 
     #[test]
@@ -485,6 +486,10 @@ mod compare_command_tests {
 mod validate_command_tests {
     use super::*;
 
+    // Pretty validate output: a comfy-table with VALID/ISSUES/INVALID
+    // status badges per file, then a final "Valid: N Invalid: M" summary
+    // line. Tests assert on those stable substrings.
+
     #[test]
     fn test_validate_valid_file() {
         let blackbox_file = test_blackbox_file();
@@ -498,7 +503,7 @@ mod validate_command_tests {
             .arg(&blackbox_file)
             .assert()
             .success()
-            .stdout(predicate::str::contains("Validation Summary"));
+            .stdout(predicate::str::contains("Valid:"));
     }
 
     #[test]
@@ -515,7 +520,7 @@ mod validate_command_tests {
             .arg("--check-issues")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Validation Summary"));
+            .stdout(predicate::str::contains("Valid:"));
     }
 
     #[test]
@@ -528,7 +533,8 @@ mod validate_command_tests {
             .arg(&invalid_file)
             .assert()
             .success()
-            .stdout(predicate::str::contains("Invalid files: 1"));
+            .stdout(predicate::str::contains("INVALID"))
+            .stdout(predicate::str::contains("Invalid:"));
     }
 
     #[test]
@@ -542,7 +548,8 @@ mod validate_command_tests {
             .arg(temp_dir.path())
             .assert()
             .success()
-            .stdout(predicate::str::contains("Validating 2 file(s)"));
+            .stdout(predicate::str::contains("test1.bbl"))
+            .stdout(predicate::str::contains("test2.bbl"));
     }
 
     #[test]
@@ -879,15 +886,19 @@ mod export_command_tests {
 mod info_command_tests {
     use super::*;
 
+    // The pretty `info` output is now a single comfy-table panel: rows for
+    // CLI / Core library / OS / Arch / FFT support / Scientific computing /
+    // Blackbox parsing. The banner above it goes to stderr, so stdout-only
+    // assertions key off the table cells.
+
     #[test]
     fn test_info_basic() {
         cli_cmd()
             .arg("info")
             .assert()
             .success()
-            .stdout(predicate::str::contains("FPV Drone Tuner"))
-            .stdout(predicate::str::contains("Version:"))
-            .stdout(predicate::str::contains("System Information:"));
+            .stdout(predicate::str::contains("CLI"))
+            .stdout(predicate::str::contains("Component"));
     }
 
     #[test]
@@ -896,7 +907,7 @@ mod info_command_tests {
             .arg("info")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Version: 0.1.0"));
+            .stdout(predicate::str::contains("v0.1.0"));
     }
 
     #[test]
@@ -905,9 +916,9 @@ mod info_command_tests {
             .arg("info")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Library Status:"))
-            .stdout(predicate::str::contains("FFT support available"))
-            .stdout(predicate::str::contains("Blackbox parsing ready"));
+            .stdout(predicate::str::contains("FFT support"))
+            .stdout(predicate::str::contains("Blackbox parsing"))
+            .stdout(predicate::str::contains("READY"));
     }
 
     #[test]
@@ -916,8 +927,8 @@ mod info_command_tests {
             .arg("info")
             .assert()
             .success()
-            .stdout(predicate::str::contains("OS:"))
-            .stdout(predicate::str::contains("Arch:"));
+            .stdout(predicate::str::contains("OS"))
+            .stdout(predicate::str::contains("Arch"));
     }
 }
 
@@ -1422,6 +1433,7 @@ mod output_format_validation_tests {
             .assert()
             .success()
             .stdout(predicate::str::contains("Analysis Summary"))
-            .stdout(predicate::str::contains("Tune Quality:"));
+            // Quality gauge format: "Tune Quality NN.N/100  [bar] LABEL"
+            .stdout(predicate::str::contains("Tune Quality"));
     }
 }
