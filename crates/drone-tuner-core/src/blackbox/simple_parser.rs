@@ -10,6 +10,7 @@ use blackbox_log::units::si::{
     acceleration::standard_gravity, angular_velocity::radian_per_second,
 };
 use blackbox_log::{prelude::*, File, ParserEvent};
+use std::borrow::Cow;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -238,6 +239,120 @@ struct SessionInfo {
     duration_estimate_s: f32,
 }
 
+/// blackbox-log 0.4.3 hard-codes BETAFLIGHT_SUPPORT = 4.2.0..4.6.0 and parses
+/// each version component as a `u8`. Betaflight 25.x switched to year-based
+/// versioning ("2025.12.0-beta"), so the major component overflows u8 and the
+/// header is rejected as `InvalidFirmware`, which leaves us with zero usable
+/// sessions. Replace the firmware revision line with a synthetic in-range
+/// version so the rest of the parser (frames, fields, time) — which doesn't
+/// depend on the version string — can run.
+fn rewrite_unsupported_firmware_header(data: &[u8]) -> Cow<'_, [u8]> {
+    const PREFIX: &[u8] = b"H Firmware revision:";
+    const REPLACEMENT_LINE: &[u8] = b"H Firmware revision:Betaflight 4.5.0";
+
+    if find_subsequence(data, PREFIX).is_none() {
+        return Cow::Borrowed(data);
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut cursor = 0usize;
+    let mut rewrote_any = false;
+
+    while cursor < data.len() {
+        let Some(rel) = find_subsequence(&data[cursor..], PREFIX) else {
+            out.extend_from_slice(&data[cursor..]);
+            break;
+        };
+        let line_start = cursor + rel;
+
+        // Only treat as a header line if it begins at file start or after '\n'.
+        if line_start > 0 && data[line_start - 1] != b'\n' {
+            out.extend_from_slice(&data[cursor..=line_start]);
+            cursor = line_start + 1;
+            continue;
+        }
+
+        out.extend_from_slice(&data[cursor..line_start]);
+
+        let line_end = data[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|off| line_start + off)
+            .unwrap_or(data.len());
+
+        let value = {
+            let raw = &data[line_start + PREFIX.len()..line_end];
+            raw.strip_prefix(b" ").unwrap_or(raw)
+        };
+
+        if firmware_value_needs_rewrite(value) {
+            let original = String::from_utf8_lossy(value);
+            warn!(
+                "Substituting unsupported firmware revision \"{}\" with \
+                 \"Betaflight 4.5.0\" so blackbox-log can parse the log.",
+                original
+            );
+            out.extend_from_slice(REPLACEMENT_LINE);
+            rewrote_any = true;
+        } else {
+            out.extend_from_slice(&data[line_start..line_end]);
+        }
+
+        if line_end < data.len() {
+            out.push(b'\n');
+            cursor = line_end + 1;
+        } else {
+            cursor = line_end;
+        }
+    }
+
+    if rewrote_any {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(data)
+    }
+}
+
+/// Returns `true` when the `Firmware revision` value would be rejected by
+/// blackbox-log's `Firmware::parse` (Betaflight outside `4.2.0..4.6.0`, or any
+/// component that doesn't fit in a `u8`).
+fn firmware_value_needs_rewrite(value: &[u8]) -> bool {
+    let s = match std::str::from_utf8(value) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let mut iter = s.split(' ');
+    let kind = iter.next().map(|k| k.to_ascii_lowercase());
+    let Some(version) = iter.next() else {
+        return false;
+    };
+
+    let mut components = version.splitn(3, '.');
+    let major = components.next().and_then(|c| c.parse::<u8>().ok());
+    let minor = components.next().and_then(|c| c.parse::<u8>().ok());
+    let patch = components.next().and_then(|c| c.parse::<u8>().ok());
+    let parsed = matches!((major, minor, patch), (Some(_), Some(_), Some(_)));
+
+    match kind.as_deref() {
+        Some("betaflight") => match (parsed, major, minor) {
+            (true, Some(maj), Some(min)) => !(maj == 4 && (2..6).contains(&min)),
+            _ => true,
+        },
+        Some("inav") => match (parsed, major) {
+            (true, Some(maj)) => !(5..9).contains(&maj),
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 /// Simple blackbox parser that works with the actual blackbox-log API
 #[derive(Debug)]
 pub struct SimpleBlackboxParser {
@@ -281,6 +396,14 @@ impl SimpleBlackboxParser {
         }
 
         self.stats.bytes_processed = data.len();
+
+        // Rewrite "Firmware revision" headers when the on-disk version isn't
+        // accepted by blackbox-log 0.4.3 (e.g. Betaflight 25.x year-based
+        // versions or other future schemes). Frame parsing is independent of
+        // the firmware string, so substituting an in-range version unblocks
+        // analysis without touching the data section.
+        let rewritten = rewrite_unsupported_firmware_header(data);
+        let data = rewritten.as_ref();
 
         // Extract sample rate from raw headers before processing
         let sample_rate = self.extract_sample_rate_from_raw_data(data);
@@ -2239,5 +2362,63 @@ mod tests {
             dyn_notch.max_freq
         );
         assert!(dyn_notch.enabled, "Expected dynamic notch to be enabled");
+    }
+
+    #[test]
+    fn rewrite_passes_through_supported_betaflight() {
+        let data = b"H Product:Blackbox flight data recorder\nH Firmware revision:Betaflight 4.5.0\n";
+        let out = rewrite_unsupported_firmware_header(data);
+        assert!(matches!(out, Cow::Borrowed(_)), "supported version should not be rewritten");
+        assert_eq!(out.as_ref(), data);
+    }
+
+    #[test]
+    fn rewrite_substitutes_year_based_betaflight() {
+        let data = b"H Product:Blackbox flight data recorder\nH Firmware revision:Betaflight 2025.12.0-beta (cd026f15f) STM32F405\nH looptime:125\n";
+        let out = rewrite_unsupported_firmware_header(data);
+        assert!(matches!(out, Cow::Owned(_)), "year-based version should be rewritten");
+        let s = std::str::from_utf8(out.as_ref()).unwrap();
+        assert!(s.contains("H Firmware revision:Betaflight 4.5.0\n"));
+        assert!(s.contains("H looptime:125\n"));
+        assert!(!s.contains("2025.12"));
+    }
+
+    #[test]
+    fn rewrite_substitutes_every_session() {
+        let mut data = Vec::new();
+        for _ in 0..3 {
+            data.extend_from_slice(b"H Product:Blackbox flight data recorder\nH Firmware revision:Betaflight 2025.12.0-beta (abc) STM32F405\nH looptime:125\n");
+        }
+        let out = rewrite_unsupported_firmware_header(&data);
+        let s = std::str::from_utf8(out.as_ref()).unwrap();
+        assert_eq!(s.matches("H Firmware revision:Betaflight 4.5.0").count(), 3);
+        assert!(!s.contains("2025.12"));
+    }
+
+    #[test]
+    fn rewrite_skips_in_value_substring() {
+        // The literal "H Firmware revision:" must only match at line start.
+        let data = b"H craftName:bogusH Firmware revision:nope\nH Firmware revision:Betaflight 2025.12.0-beta\n";
+        let out = rewrite_unsupported_firmware_header(data);
+        let s = std::str::from_utf8(out.as_ref()).unwrap();
+        assert!(s.contains("H craftName:bogusH Firmware revision:nope\n"));
+        assert!(s.contains("H Firmware revision:Betaflight 4.5.0\n"));
+    }
+
+    #[test]
+    fn rewrite_handles_4_6_outside_support_range() {
+        // blackbox-log 0.4.3 supports 4.2.0..4.6.0, so 4.6.0+ should be rewritten.
+        let data = b"H Firmware revision:Betaflight 4.6.0\n";
+        let out = rewrite_unsupported_firmware_header(data);
+        assert!(matches!(out, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn rewrite_leaves_unknown_kinds_alone() {
+        // Don't fabricate a Betaflight identity for INAV/EmuFlight/etc — let
+        // blackbox-log reject those itself.
+        let data = b"H Firmware revision:EmuFlight 0.4.0\n";
+        let out = rewrite_unsupported_firmware_header(data);
+        assert!(matches!(out, Cow::Borrowed(_)));
     }
 }
