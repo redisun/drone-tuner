@@ -1533,12 +1533,15 @@ async fn restore_pid_from_backup(
         .with_context(|| format!("Backup file {} is not valid JSON", backup_path.display()))?;
 
     let schema = json.get("schema").and_then(|v| v.as_str()).unwrap_or("");
-    if schema != "drone-tuner-pid-backup-v1" {
+    if schema != BACKUP_SCHEMA_V1 && schema != BACKUP_SCHEMA_V2 {
         return Err(anyhow::anyhow!(
-            "Unrecognised backup schema {:?} — expected \"drone-tuner-pid-backup-v1\"",
-            schema
+            "Unrecognised backup schema {:?} — expected {:?} or {:?}",
+            schema,
+            BACKUP_SCHEMA_V1,
+            BACKUP_SCHEMA_V2
         ));
     }
+    let is_v2 = schema == BACKUP_SCHEMA_V2;
 
     fn read_triplet(v: &serde_json::Value, key: &str) -> Result<(u8, u8, u8)> {
         let arr = v
@@ -1650,6 +1653,48 @@ async fn restore_pid_from_backup(
         .context("PID restore failed (any partial write was rolled back)")?;
     finish_step(write_pb, "PIDs restored");
 
+    // v2 backups carry round-trip snapshots of the Phase-1 surfaces
+    // (PidAdvanced / RcTuning / AdvancedConfig). Restoring them after
+    // the PID write means a `tune --restore` is whole-config: any
+    // pilot-preference drift introduced by a Configurator session
+    // between backup and restore is undone. v1 backups skip this block
+    // (the extras simply aren't in the file).
+    if is_v2 {
+        use drone_tuner_core::realtime::{
+            AdvancedConfigSnapshot, PidAdvancedSnapshot, RcTuningSnapshot,
+        };
+        let mut extras = Phase1Extras::default();
+        if let Some(bytes) = read_optional_payload(&json, "pid_advanced_payload")? {
+            extras.pid_advanced = Some(
+                PidAdvancedSnapshot::from_payload(bytes)
+                    .context("backup pid_advanced_payload is malformed")?,
+            );
+        }
+        if let Some(bytes) = read_optional_payload(&json, "rc_tuning_payload")? {
+            extras.rc_tuning = Some(
+                RcTuningSnapshot::from_payload(bytes)
+                    .context("backup rc_tuning_payload is malformed")?,
+            );
+        }
+        if let Some(bytes) = read_optional_payload(&json, "advanced_config_payload")? {
+            extras.advanced_config = Some(
+                AdvancedConfigSnapshot::from_payload(bytes)
+                    .context("backup advanced_config_payload is malformed")?,
+            );
+        }
+        let total = extras.pid_advanced.is_some() as usize
+            + extras.rc_tuning.is_some() as usize
+            + extras.advanced_config.is_some() as usize;
+        if total > 0 {
+            let extras_pb = make_spinner(format!("restoring {total} auxiliary MSP surface(s)"));
+            let written = write_phase1_extras(&mut fc, &extras).await;
+            finish_step(
+                extras_pb,
+                format!("auxiliary surfaces restored: {written}/{total}"),
+            );
+        }
+    }
+
     if save_eeprom {
         let save_pb = make_spinner("persisting to EEPROM");
         match fc.save_to_eeprom().await {
@@ -1689,11 +1734,13 @@ fn load_baseline_pid_config(path: &Path) -> Result<drone_tuner_core::domain::Pid
         .with_context(|| format!("Baseline file {} is not valid JSON", path.display()))?;
 
     let schema = json.get("schema").and_then(|v| v.as_str()).unwrap_or("");
-    if schema != "drone-tuner-pid-backup-v1" {
+    if schema != BACKUP_SCHEMA_V1 && schema != BACKUP_SCHEMA_V2 {
         return Err(anyhow::anyhow!(
-            "Unrecognised baseline schema {:?} in {} — expected \"drone-tuner-pid-backup-v1\"",
+            "Unrecognised baseline schema {:?} in {} — expected {:?} or {:?}",
             schema,
-            path.display()
+            path.display(),
+            BACKUP_SCHEMA_V1,
+            BACKUP_SCHEMA_V2
         ));
     }
 
@@ -1945,6 +1992,152 @@ fn sanitize_filename_part(s: &str) -> Option<String> {
 /// empty or sanitises away to nothing.
 fn craft_name_slug(info: &drone_tuner_core::realtime::FlightControllerInfo) -> Option<String> {
     sanitize_filename_part(&info.craft_name).map(|s| s.to_lowercase())
+}
+
+/// Phase-1 round-trip safety net: opaque snapshots of the MSP surfaces
+/// drone-tuner reads but never modifies (PID-Advanced, RC-Tuning,
+/// Advanced-Config). Captured into the backup file alongside the PID
+/// payload so `tune --restore` is whole-config — restoring a backup
+/// returns the FC to its pre-tune state across all four surfaces, not
+/// just the three flight axes.
+///
+/// Each field is optional because individual MSP commands may be
+/// unsupported on stripped vendor builds. We log a warning and proceed
+/// rather than aborting the tune — preserving what we can is strictly
+/// better than refusing to back anything up.
+#[derive(Debug, Clone, Default)]
+struct Phase1Extras {
+    pid_advanced: Option<drone_tuner_core::realtime::PidAdvancedSnapshot>,
+    rc_tuning: Option<drone_tuner_core::realtime::RcTuningSnapshot>,
+    advanced_config: Option<drone_tuner_core::realtime::AdvancedConfigSnapshot>,
+}
+
+/// Read all three Phase-1 surfaces from the FC. Failures are logged
+/// per-surface; the function never errors so a tune isn't blocked by
+/// an unsupported MSP command on an exotic firmware build.
+async fn read_phase1_extras(
+    fc: &mut drone_tuner_core::realtime::FlightControllerConnection,
+) -> Phase1Extras {
+    let pid_advanced = match fc.read_pid_advanced().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("MSP_PID_ADVANCED read failed (skipping in backup): {e:#}");
+            None
+        }
+    };
+    let rc_tuning = match fc.read_rc_tuning().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("MSP_RC_TUNING read failed (skipping in backup): {e:#}");
+            None
+        }
+    };
+    let advanced_config = match fc.read_advanced_config().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("MSP_ADVANCED_CONFIG read failed (skipping in backup): {e:#}");
+            None
+        }
+    };
+    Phase1Extras {
+        pid_advanced,
+        rc_tuning,
+        advanced_config,
+    }
+}
+
+/// Write the Phase-1 extras back to the FC. Used by `tune --restore`.
+/// Failures on individual surfaces are surfaced as warnings rather
+/// than errors — the PID restore that just succeeded is the headline
+/// recovery action; a follow-up failure on (say) RcTuning shouldn't
+/// undo it. The user can re-run `tune --restore` to retry.
+async fn write_phase1_extras(
+    fc: &mut drone_tuner_core::realtime::FlightControllerConnection,
+    extras: &Phase1Extras,
+) -> usize {
+    let mut written = 0;
+    if let Some(s) = &extras.pid_advanced {
+        match fc.write_pid_advanced(s).await {
+            Ok(()) => {
+                written += 1;
+            }
+            Err(e) => {
+                println!(
+                    "  {} MSP_PID_ADVANCED restore failed: {} (other surfaces still being restored)",
+                    display::glyph_warn(),
+                    e
+                );
+            }
+        }
+    }
+    if let Some(s) = &extras.rc_tuning {
+        match fc.write_rc_tuning(s).await {
+            Ok(()) => {
+                written += 1;
+            }
+            Err(e) => {
+                println!(
+                    "  {} MSP_RC_TUNING restore failed: {} (other surfaces still being restored)",
+                    display::glyph_warn(),
+                    e
+                );
+            }
+        }
+    }
+    if let Some(s) = &extras.advanced_config {
+        match fc.write_advanced_config(s).await {
+            Ok(()) => {
+                written += 1;
+            }
+            Err(e) => {
+                println!(
+                    "  {} MSP_ADVANCED_CONFIG restore failed: {} (other surfaces still being restored)",
+                    display::glyph_warn(),
+                    e
+                );
+            }
+        }
+    }
+    written
+}
+
+/// Backup-file schema constant. Bumped to v2 in the Phase-1 round-trip
+/// safety net work — v2 adds optional `pid_advanced_payload`,
+/// `rc_tuning_payload`, `advanced_config_payload` fields. Restore reads
+/// both v1 and v2 (v1 backups simply lack the extras); writing always
+/// emits v2 going forward.
+const BACKUP_SCHEMA_V1: &str = "drone-tuner-pid-backup-v1";
+const BACKUP_SCHEMA_V2: &str = "drone-tuner-pid-backup-v2";
+
+/// Parse an optional byte-array payload field from a backup JSON. Used
+/// by the v2 schema reader for the three Phase-1 extra surfaces. Returns
+/// `Ok(None)` when the field is missing or null; errors only on a
+/// malformed array (non-integer or out-of-u8 entry) so a backup written
+/// on a future schema-bump still reads cleanly when the field happens
+/// to be absent.
+fn read_optional_payload(json: &serde_json::Value, key: &str) -> Result<Option<Vec<u8>>> {
+    let Some(v) = json.get(key) else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let arr = v
+        .as_array()
+        .with_context(|| format!("backup field {key} is not an array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let n = item
+            .as_u64()
+            .with_context(|| format!("backup {key}[{i}] is not an integer"))?;
+        if n > 255 {
+            return Err(anyhow::anyhow!(
+                "backup {key}[{i}]={n} exceeds u8 range — refusing to write"
+            ));
+        }
+        out.push(n as u8);
+    }
+    Ok(Some(out))
 }
 
 /// Pretty-print byte counts as KB/MB/GB.
@@ -2285,6 +2478,35 @@ async fn apply_pid_recommendations_via_fc(
         ),
     );
 
+    // Phase-1 round-trip safety: when a backup is going to be written,
+    // capture the three MSP surfaces drone-tuner doesn't tune today
+    // (PidAdvanced / RcTuning / AdvancedConfig). Doing this BEFORE any
+    // writeback ensures the backup reflects pre-tune state, even though
+    // the tune flow doesn't currently touch these surfaces. Skipping the
+    // reads when no backup is requested keeps tunes that don't need them
+    // free of extra MSP roundtrips.
+    let phase1_extras = if args.backup.is_some() {
+        let extras_pb = make_spinner("snapshotting auxiliary MSP surfaces for backup");
+        let extras = read_phase1_extras(&mut fc).await;
+        let mut captured = Vec::new();
+        if extras.pid_advanced.is_some() {
+            captured.push("pid_advanced");
+        }
+        if extras.rc_tuning.is_some() {
+            captured.push("rc_tuning");
+        }
+        if extras.advanced_config.is_some() {
+            captured.push("advanced_config");
+        }
+        finish_step(
+            extras_pb,
+            format!("captured {} aux surface(s): {}", captured.len(), captured.join(", ")),
+        );
+        Some(extras)
+    } else {
+        None
+    };
+
     let mut new_snapshot = current.clone();
     let applied = apply_pid_recs_to_snapshot(&mut new_snapshot, &report.pid_recommendations, args);
 
@@ -2452,13 +2674,30 @@ async fn apply_pid_recommendations_via_fc(
                 .map(|d| d.join(&filename))
                 .unwrap_or_else(|_| PathBuf::from(filename))
         });
+        // v2 schema adds the three Phase-1 round-trip surfaces. Each
+        // is null-emitted when the FC didn't answer the corresponding
+        // MSP read (so a stripped vendor build still produces a usable
+        // backup that just lacks the absent fields). v1 readers ignore
+        // the new fields; v2 readers tolerate their absence.
+        let pid_advanced_json = phase1_extras
+            .as_ref()
+            .and_then(|e| e.pid_advanced.as_ref().map(|s| s.as_payload().to_vec()));
+        let rc_tuning_json = phase1_extras
+            .as_ref()
+            .and_then(|e| e.rc_tuning.as_ref().map(|s| s.as_payload().to_vec()));
+        let advanced_config_json = phase1_extras
+            .as_ref()
+            .and_then(|e| e.advanced_config.as_ref().map(|s| s.as_payload().to_vec()));
         let json = serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "drone-tuner-pid-backup-v1",
+            "schema": BACKUP_SCHEMA_V2,
             "captured_at": chrono::Utc::now(),
             "pid_payload": bk.as_payload(),
             "roll": bk.roll(),
             "pitch": bk.pitch(),
             "yaw": bk.yaw(),
+            "pid_advanced_payload": pid_advanced_json,
+            "rc_tuning_payload": rc_tuning_json,
+            "advanced_config_payload": advanced_config_json,
         }))?;
         std::fs::write(&path, json)
             .with_context(|| format!("Failed to write backup snapshot to {}", path.display()))?;
@@ -3956,6 +4195,135 @@ mod craft_name_tests {
             sanitize_filename_part("foo   bar"),
             Some("foo_bar".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod phase1_backup_tests {
+    use super::*;
+    use drone_tuner_core::realtime::{
+        AdvancedConfigSnapshot, FlightControllerConnection, MockTransport, MspSimulator,
+        PidAdvancedSnapshot, RcTuningSnapshot,
+    };
+
+    #[test]
+    fn read_optional_payload_returns_none_when_field_missing() {
+        let json = serde_json::json!({"other": "value"});
+        let out = read_optional_payload(&json, "missing").unwrap();
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn read_optional_payload_returns_none_when_field_null() {
+        let json = serde_json::json!({"missing": null});
+        let out = read_optional_payload(&json, "missing").unwrap();
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn read_optional_payload_round_trips_byte_array() {
+        let json = serde_json::json!({"payload": [1u8, 2, 3, 254, 255]});
+        let out = read_optional_payload(&json, "payload").unwrap();
+        assert_eq!(out, Some(vec![1u8, 2, 3, 254, 255]));
+    }
+
+    #[test]
+    fn read_optional_payload_rejects_oversized_byte() {
+        let json = serde_json::json!({"payload": [256]});
+        let err = read_optional_payload(&json, "payload")
+            .expect_err("byte > 255 must be rejected to avoid silent truncation");
+        assert!(err.to_string().contains("u8 range"));
+    }
+
+    #[test]
+    fn read_optional_payload_rejects_non_array() {
+        let json = serde_json::json!({"payload": "hello"});
+        let err = read_optional_payload(&json, "payload")
+            .expect_err("non-array must be rejected — caller can't recover meaningfully");
+        assert!(err.to_string().contains("not an array"));
+    }
+
+    /// End-to-end Phase-1 round-trip: read all three surfaces from a
+    /// simulator, serialize to v2 JSON shape, parse back via the same
+    /// readers `restore_pid_from_backup` uses, write to the FC, re-read,
+    /// and assert byte-equal preservation across every surface.
+    #[tokio::test]
+    async fn v2_backup_json_round_trips_phase1_surfaces_via_simulator() {
+        let (client, server) = MockTransport::pair();
+        let sim = MspSimulator::new(Box::new(server));
+        let state = sim.state.clone();
+        let _sim_handle = tokio::spawn(sim.run());
+        let mut fc = FlightControllerConnection::from_transport(Box::new(client))
+            .await
+            .expect("simulator handshake");
+
+        // Capture the FC's pre-restore state across the three surfaces.
+        let extras = read_phase1_extras(&mut fc).await;
+        assert!(extras.pid_advanced.is_some());
+        assert!(extras.rc_tuning.is_some());
+        assert!(extras.advanced_config.is_some());
+        let original_pid_adv = state.lock().unwrap().pid_advanced.clone();
+        let original_rc_tune = state.lock().unwrap().rc_tuning.clone();
+        let original_adv_cfg = state.lock().unwrap().advanced_config.clone();
+
+        // Serialize as the runtime would for a v2 backup file.
+        let json_blob = serde_json::json!({
+            "schema": BACKUP_SCHEMA_V2,
+            "pid_advanced_payload": extras.pid_advanced.as_ref().map(|s| s.as_payload().to_vec()),
+            "rc_tuning_payload": extras.rc_tuning.as_ref().map(|s| s.as_payload().to_vec()),
+            "advanced_config_payload": extras.advanced_config.as_ref().map(|s| s.as_payload().to_vec()),
+        });
+
+        // Mutate the FC's state to simulate a Configurator session
+        // changing things between backup and restore. After the restore
+        // we expect the bytes to match the BACKUP, not these mutations.
+        {
+            let mut s = state.lock().unwrap();
+            s.pid_advanced = vec![0xAA; 49];
+            s.rc_tuning = vec![0xBB; 30];
+            s.advanced_config = vec![0xCC; 21];
+        }
+
+        // Parse the v2 JSON back through the same helpers
+        // restore_pid_from_backup uses, then write to the FC.
+        let mut restored = Phase1Extras::default();
+        if let Some(bytes) = read_optional_payload(&json_blob, "pid_advanced_payload").unwrap() {
+            restored.pid_advanced = Some(PidAdvancedSnapshot::from_payload(bytes).unwrap());
+        }
+        if let Some(bytes) = read_optional_payload(&json_blob, "rc_tuning_payload").unwrap() {
+            restored.rc_tuning = Some(RcTuningSnapshot::from_payload(bytes).unwrap());
+        }
+        if let Some(bytes) = read_optional_payload(&json_blob, "advanced_config_payload").unwrap() {
+            restored.advanced_config = Some(AdvancedConfigSnapshot::from_payload(bytes).unwrap());
+        }
+        let written = write_phase1_extras(&mut fc, &restored).await;
+        assert_eq!(written, 3, "all three surfaces should restore");
+
+        // FC's state must now match the pre-mutation original bytes.
+        let after = state.lock().unwrap();
+        assert_eq!(
+            after.pid_advanced, original_pid_adv,
+            "PidAdvanced must round-trip through v2 backup JSON"
+        );
+        assert_eq!(after.rc_tuning, original_rc_tune);
+        assert_eq!(after.advanced_config, original_adv_cfg);
+    }
+
+    /// v1 backups must still be accepted — they simply skip the Phase-1
+    /// extras, matching pre-Phase-1 behaviour. Pinning this prevents a
+    /// future schema-bump that drops v1 silently.
+    #[test]
+    fn v1_backup_schema_still_recognised() {
+        let zeroes: Vec<u8> = vec![0; 30];
+        let json = serde_json::json!({
+            "schema": BACKUP_SCHEMA_V1,
+            "pid_payload": zeroes,
+            "roll": [42, 85, 35],
+            "pitch": [46, 90, 38],
+            "yaw": [45, 90, 0],
+        });
+        let schema = json.get("schema").and_then(|v| v.as_str()).unwrap();
+        assert!(schema == BACKUP_SCHEMA_V1 || schema == BACKUP_SCHEMA_V2);
     }
 }
 

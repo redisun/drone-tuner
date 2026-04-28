@@ -291,6 +291,23 @@ pub enum MspCommand {
     /// Set filter configuration. Payload mirrors what FilterConfig
     /// returned, so the typical flow is read → mutate → write.
     SetFilterConfig = 93,
+    /// Advanced firmware configuration: gyro/PID denominators, motor
+    /// PWM protocol, dynamic idle. Read-only access only — we never
+    /// recompute these, just snapshot for round-trip preservation.
+    AdvancedConfig = 90,
+    /// Set advanced firmware configuration. Payload mirrors AdvancedConfig.
+    SetAdvancedConfig = 91,
+    /// Advanced PID configuration: anti-gravity, feedforward, I-term
+    /// relax, throttle boost, integrated yaw, absolute control,
+    /// dynamic damping, TPA breakpoint, D-Max. Read for round-trip.
+    PidAdvanced = 94,
+    /// Set advanced PID configuration. Payload mirrors PidAdvanced.
+    SetPidAdvanced = 95,
+    /// RC tuning: rates, expo, throttle curve, TPA rate. Pilot-preference
+    /// settings — we never auto-tune these, only round-trip.
+    RcTuning = 111,
+    /// Set RC tuning. Payload mirrors RcTuning.
+    SetRcTuning = 204,
     /// Save parameters
     EepromWrite = 250,
 }
@@ -940,6 +957,90 @@ impl FlightControllerConnection {
             return Err(DronetunerError::communication_error(detail));
         }
         Ok(backup)
+    }
+
+    /// Read the FC's MSP_PID_ADVANCED payload (cmd 94). Carries
+    /// anti-grav, FF, I-relax, throttle boost, integrated yaw,
+    /// absolute control, dynamic damping, TPA breakpoint, D-Max.
+    /// Phase-1 round-trip preservation — drone-tuner never tunes
+    /// these today, but a backup captures them so `tune --restore`
+    /// can put them back if anything drifts.
+    pub async fn read_pid_advanced(&mut self) -> Result<PidAdvancedSnapshot> {
+        let request = self.msp.create_message(MspCommand::PidAdvanced, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let response = self.read_msp_response_for(MspCommand::PidAdvanced).await?;
+        PidAdvancedSnapshot::from_payload(response.payload)
+    }
+
+    /// Write a [`PidAdvancedSnapshot`] back to the FC (cmd 95).
+    /// RAM-only — call [`save_to_eeprom`] to persist.
+    ///
+    /// [`save_to_eeprom`]: Self::save_to_eeprom
+    pub async fn write_pid_advanced(&mut self, snapshot: &PidAdvancedSnapshot) -> Result<()> {
+        let request = self
+            .msp
+            .create_message(MspCommand::SetPidAdvanced, snapshot.as_payload())?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let _ack = self
+            .read_msp_response_for(MspCommand::SetPidAdvanced)
+            .await?;
+        Ok(())
+    }
+
+    /// Read the FC's MSP_RC_TUNING payload (cmd 111). Carries rates,
+    /// expo, throttle curve, TPA rate. Pilot-preference settings —
+    /// never auto-tuned, only round-tripped.
+    pub async fn read_rc_tuning(&mut self) -> Result<RcTuningSnapshot> {
+        let request = self.msp.create_message(MspCommand::RcTuning, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let response = self.read_msp_response_for(MspCommand::RcTuning).await?;
+        RcTuningSnapshot::from_payload(response.payload)
+    }
+
+    /// Write an [`RcTuningSnapshot`] back to the FC (cmd 204).
+    /// RAM-only — call [`save_to_eeprom`] to persist.
+    ///
+    /// [`save_to_eeprom`]: Self::save_to_eeprom
+    pub async fn write_rc_tuning(&mut self, snapshot: &RcTuningSnapshot) -> Result<()> {
+        let request = self
+            .msp
+            .create_message(MspCommand::SetRcTuning, snapshot.as_payload())?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let _ack = self.read_msp_response_for(MspCommand::SetRcTuning).await?;
+        Ok(())
+    }
+
+    /// Read the FC's MSP_ADVANCED_CONFIG payload (cmd 90). Carries
+    /// gyro/PID denom, motor PWM protocol/rate, dynamic-idle params.
+    /// Board/firmware-tier — never auto-tuned, only round-tripped.
+    pub async fn read_advanced_config(&mut self) -> Result<AdvancedConfigSnapshot> {
+        let request = self.msp.create_message(MspCommand::AdvancedConfig, &[])?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let response = self
+            .read_msp_response_for(MspCommand::AdvancedConfig)
+            .await?;
+        AdvancedConfigSnapshot::from_payload(response.payload)
+    }
+
+    /// Write an [`AdvancedConfigSnapshot`] back to the FC (cmd 91).
+    /// RAM-only — call [`save_to_eeprom`] to persist.
+    ///
+    /// [`save_to_eeprom`]: Self::save_to_eeprom
+    pub async fn write_advanced_config(&mut self, snapshot: &AdvancedConfigSnapshot) -> Result<()> {
+        let request = self
+            .msp
+            .create_message(MspCommand::SetAdvancedConfig, snapshot.as_payload())?;
+        self.transport.write(&request).await?;
+        self.transport.flush().await?;
+        let _ack = self
+            .read_msp_response_for(MspCommand::SetAdvancedConfig)
+            .await?;
+        Ok(())
     }
 
     /// Erase the entire onboard dataflash (`MSP_DATAFLASH_ERASE` / 72).
@@ -1792,6 +1893,117 @@ impl FilterSnapshot {
     }
 }
 
+/// Opaque snapshot of `MSP_PID_ADVANCED` (cmd 94). Carries anti-gravity,
+/// feedforward, I-term relax, throttle boost, integrated yaw, absolute
+/// control, dynamic damping, TPA breakpoint, and D-Max — none of which
+/// drone-tuner auto-tunes today. The Phase-1 round-trip safety net
+/// reads this on tune start, stores it in the on-disk backup, and
+/// writes it back on `tune --restore` so a stale backup or a future
+/// auto-tune that targets these surfaces never silently zeroes pilot
+/// intent.
+///
+/// Layout is firmware-version-dependent and shifts with every
+/// Betaflight minor release, so we treat the payload as opaque bytes.
+/// No typed accessors yet — Phase 3 will add them once the analyzers
+/// that consume them are designed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PidAdvancedSnapshot {
+    raw: Vec<u8>,
+}
+
+impl PidAdvancedSnapshot {
+    /// Parse a payload from an MSP_PID_ADVANCED response. Accepts any
+    /// non-empty payload — every supported FC returns at least the
+    /// legacy fields, and short payloads from minimal builds are
+    /// preserved as-is so SetPidAdvanced echoes them back faithfully.
+    pub fn from_payload(payload: Vec<u8>) -> Result<Self> {
+        if payload.is_empty() {
+            return Err(DronetunerError::parse_error(
+                "MSP_PID_ADVANCED payload is empty",
+                None,
+            ));
+        }
+        Ok(Self { raw: payload })
+    }
+
+    /// Borrow the underlying payload, suitable for SetPidAdvanced.
+    pub fn as_payload(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Total payload length the FC returned.
+    pub fn payload_len(&self) -> usize {
+        self.raw.len()
+    }
+}
+
+/// Opaque snapshot of `MSP_RC_TUNING` (cmd 111). Carries rates (R/P/Y),
+/// expo, throttle mid/expo/limit, TPA rate/breakpoint, rates_type. These
+/// are pilot-preference values — drone-tuner explicitly never auto-tunes
+/// them. The snapshot exists so backups capture them and `tune --restore`
+/// puts them back if a Configurator session or firmware migration drifts
+/// them. Layout is opaque for the same firmware-skew reason as the others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcTuningSnapshot {
+    raw: Vec<u8>,
+}
+
+impl RcTuningSnapshot {
+    /// Parse a payload from an MSP_RC_TUNING response.
+    pub fn from_payload(payload: Vec<u8>) -> Result<Self> {
+        if payload.is_empty() {
+            return Err(DronetunerError::parse_error(
+                "MSP_RC_TUNING payload is empty",
+                None,
+            ));
+        }
+        Ok(Self { raw: payload })
+    }
+
+    /// Borrow the underlying payload, suitable for SetRcTuning.
+    pub fn as_payload(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Total payload length the FC returned.
+    pub fn payload_len(&self) -> usize {
+        self.raw.len()
+    }
+}
+
+/// Opaque snapshot of `MSP_ADVANCED_CONFIG` (cmd 90). Carries gyro
+/// sync denom, PID process denom, motor PWM protocol, motor PWM rate,
+/// dynamic-idle parameters, gyro-use-32khz, and assorted scheduler
+/// flags. These are board/firmware-tier choices — never auto-tuned.
+/// Phase-1 round-trip preservation only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvancedConfigSnapshot {
+    raw: Vec<u8>,
+}
+
+impl AdvancedConfigSnapshot {
+    /// Parse a payload from an MSP_ADVANCED_CONFIG response.
+    pub fn from_payload(payload: Vec<u8>) -> Result<Self> {
+        if payload.is_empty() {
+            return Err(DronetunerError::parse_error(
+                "MSP_ADVANCED_CONFIG payload is empty",
+                None,
+            ));
+        }
+        Ok(Self { raw: payload })
+    }
+
+    /// Borrow the underlying payload, suitable for SetAdvancedConfig.
+    pub fn as_payload(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Total payload length the FC returned.
+    pub fn payload_len(&self) -> usize {
+        self.raw.len()
+    }
+}
+
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
@@ -2138,6 +2350,12 @@ impl MspCommand {
             117 => Ok(MspCommand::Pidnames),
             92 => Ok(MspCommand::FilterConfig),
             93 => Ok(MspCommand::SetFilterConfig),
+            90 => Ok(MspCommand::AdvancedConfig),
+            91 => Ok(MspCommand::SetAdvancedConfig),
+            94 => Ok(MspCommand::PidAdvanced),
+            95 => Ok(MspCommand::SetPidAdvanced),
+            111 => Ok(MspCommand::RcTuning),
+            204 => Ok(MspCommand::SetRcTuning),
             70 => Ok(MspCommand::DataflashSummary),
             71 => Ok(MspCommand::DataflashRead),
             72 => Ok(MspCommand::DataflashErase),
@@ -2293,6 +2511,13 @@ pub struct SimulatorState {
     pub dataflash_chunk_size: usize,
     /// How many times DataflashErase has been received.
     pub dataflash_erases: usize,
+    /// In-memory MSP_PID_ADVANCED payload. Tests inject a representative
+    /// blob; the simulator round-trips it via SetPidAdvanced.
+    pub pid_advanced: Vec<u8>,
+    /// In-memory MSP_RC_TUNING payload.
+    pub rc_tuning: Vec<u8>,
+    /// In-memory MSP_ADVANCED_CONFIG payload.
+    pub advanced_config: Vec<u8>,
 }
 
 impl SimulatorState {
@@ -2377,7 +2602,45 @@ impl Default for SimulatorState {
             // comfortable margin and still makes tests iterate.
             dataflash_chunk_size: 240,
             dataflash_erases: 0,
+            pid_advanced: Self::default_pid_advanced(),
+            rc_tuning: Self::default_rc_tuning(),
+            advanced_config: Self::default_advanced_config(),
         }
+    }
+}
+
+impl SimulatorState {
+    /// Plausible MSP_PID_ADVANCED payload mirroring Betaflight 4.5 defaults.
+    /// Layout is opaque to the client and version-skewed in real firmware,
+    /// so the test fixture is simply representative bytes — round-trip
+    /// fidelity matters; the specific values do not.
+    fn default_pid_advanced() -> Vec<u8> {
+        // 49 bytes is the Betaflight 4.5 vanilla length (varies by build
+        // flags). Filled with deterministic non-zero values so byte-equal
+        // round-trip assertions catch any silent zeroing.
+        let mut buf = vec![0u8; 49];
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(7).wrapping_add(11);
+        }
+        buf
+    }
+
+    /// Plausible MSP_RC_TUNING payload. ~30 bytes on modern Betaflight.
+    fn default_rc_tuning() -> Vec<u8> {
+        let mut buf = vec![0u8; 30];
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(13).wrapping_add(3);
+        }
+        buf
+    }
+
+    /// Plausible MSP_ADVANCED_CONFIG payload. ~21 bytes on modern Betaflight.
+    fn default_advanced_config() -> Vec<u8> {
+        let mut buf = vec![0u8; 21];
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(17).wrapping_add(5);
+        }
+        buf
     }
 }
 
@@ -2571,6 +2834,33 @@ impl MspSimulator {
                 } else {
                     state.filter_config = req.payload.clone();
                 }
+                Ok(Vec::new())
+            }
+            MspCommand::PidAdvanced => {
+                let state = self.state.lock().unwrap();
+                Ok(state.pid_advanced.clone())
+            }
+            MspCommand::SetPidAdvanced => {
+                let mut state = self.state.lock().unwrap();
+                state.pid_advanced = req.payload.clone();
+                Ok(Vec::new())
+            }
+            MspCommand::RcTuning => {
+                let state = self.state.lock().unwrap();
+                Ok(state.rc_tuning.clone())
+            }
+            MspCommand::SetRcTuning => {
+                let mut state = self.state.lock().unwrap();
+                state.rc_tuning = req.payload.clone();
+                Ok(Vec::new())
+            }
+            MspCommand::AdvancedConfig => {
+                let state = self.state.lock().unwrap();
+                Ok(state.advanced_config.clone())
+            }
+            MspCommand::SetAdvancedConfig => {
+                let mut state = self.state.lock().unwrap();
+                state.advanced_config = req.payload.clone();
                 Ok(Vec::new())
             }
             MspCommand::EepromWrite => {
@@ -2943,6 +3233,171 @@ mod tests {
         let err = FilterSnapshot::from_payload(vec![0u8; 4])
             .expect_err("payloads under 6 bytes should be rejected");
         assert!(matches!(err, DronetunerError::ParseError { .. }));
+    }
+
+    // -------- Phase 1: opaque round-trip safety net --------
+    //
+    // Each of the three Tier-2 / Tier-4 / Tier-5 surfaces (PidAdvanced,
+    // RcTuning, AdvancedConfig) is preserved as opaque bytes on backup
+    // and written back unchanged on restore. The tests below assert
+    // byte-equal round-trip end-to-end against the simulator and reject
+    // empty payloads at the parse boundary.
+
+    #[test]
+    fn test_pid_advanced_snapshot_round_trip_bytes() {
+        let raw: Vec<u8> = (0u8..49).map(|i| i.wrapping_mul(7).wrapping_add(11)).collect();
+        let snap = PidAdvancedSnapshot::from_payload(raw.clone()).unwrap();
+        assert_eq!(snap.as_payload(), raw.as_slice());
+        assert_eq!(snap.payload_len(), raw.len());
+    }
+
+    #[test]
+    fn test_pid_advanced_snapshot_rejects_empty_payload() {
+        let err = PidAdvancedSnapshot::from_payload(Vec::new())
+            .expect_err("empty payloads should be rejected");
+        assert!(matches!(err, DronetunerError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_rc_tuning_snapshot_round_trip_bytes() {
+        let raw: Vec<u8> = (0u8..30).map(|i| i.wrapping_mul(13).wrapping_add(3)).collect();
+        let snap = RcTuningSnapshot::from_payload(raw.clone()).unwrap();
+        assert_eq!(snap.as_payload(), raw.as_slice());
+        assert_eq!(snap.payload_len(), raw.len());
+    }
+
+    #[test]
+    fn test_rc_tuning_snapshot_rejects_empty_payload() {
+        let err = RcTuningSnapshot::from_payload(Vec::new())
+            .expect_err("empty payloads should be rejected");
+        assert!(matches!(err, DronetunerError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_advanced_config_snapshot_round_trip_bytes() {
+        let raw: Vec<u8> = (0u8..21).map(|i| i.wrapping_mul(17).wrapping_add(5)).collect();
+        let snap = AdvancedConfigSnapshot::from_payload(raw.clone()).unwrap();
+        assert_eq!(snap.as_payload(), raw.as_slice());
+        assert_eq!(snap.payload_len(), raw.len());
+    }
+
+    #[test]
+    fn test_advanced_config_snapshot_rejects_empty_payload() {
+        let err = AdvancedConfigSnapshot::from_payload(Vec::new())
+            .expect_err("empty payloads should be rejected");
+        assert!(matches!(err, DronetunerError::ParseError { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_pid_advanced_round_trip_via_simulator() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        // Read whatever the simulator seeded.
+        let original = conn.read_pid_advanced().await.expect("read_pid_advanced");
+        let original_bytes: Vec<u8> = state.lock().unwrap().pid_advanced.clone();
+        assert_eq!(original.as_payload(), original_bytes.as_slice());
+
+        // Round-trip: write the same snapshot back, re-read, must be byte-equal.
+        conn.write_pid_advanced(&original)
+            .await
+            .expect("write_pid_advanced");
+        let echoed = conn
+            .read_pid_advanced()
+            .await
+            .expect("read_pid_advanced after write");
+        assert_eq!(
+            echoed.as_payload(),
+            original.as_payload(),
+            "PidAdvanced must round-trip byte-equal so opaque preservation never loses pilot intent"
+        );
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_rc_tuning_round_trip_via_simulator() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let original = conn.read_rc_tuning().await.expect("read_rc_tuning");
+        let original_bytes: Vec<u8> = state.lock().unwrap().rc_tuning.clone();
+        assert_eq!(original.as_payload(), original_bytes.as_slice());
+
+        conn.write_rc_tuning(&original)
+            .await
+            .expect("write_rc_tuning");
+        let echoed = conn
+            .read_rc_tuning()
+            .await
+            .expect("read_rc_tuning after write");
+        assert_eq!(echoed.as_payload(), original.as_payload());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_advanced_config_round_trip_via_simulator() {
+        let (mut conn, state, handle) = pid_test_setup().await;
+
+        let original = conn
+            .read_advanced_config()
+            .await
+            .expect("read_advanced_config");
+        let original_bytes: Vec<u8> = state.lock().unwrap().advanced_config.clone();
+        assert_eq!(original.as_payload(), original_bytes.as_slice());
+
+        conn.write_advanced_config(&original)
+            .await
+            .expect("write_advanced_config");
+        let echoed = conn
+            .read_advanced_config()
+            .await
+            .expect("read_advanced_config after write");
+        assert_eq!(echoed.as_payload(), original.as_payload());
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+    }
+
+    /// Byte-level round-trip across all three new surfaces in a single
+    /// session — mimics the tune-backup → tune-restore flow that the
+    /// CLI will drive in Phase 1.4.
+    #[tokio::test]
+    async fn test_all_phase1_surfaces_round_trip_in_sequence() {
+        let (mut conn, _state, handle) = pid_test_setup().await;
+
+        // "Backup" pass: snapshot all three surfaces.
+        let pid_adv = conn.read_pid_advanced().await.unwrap();
+        let rc_tuning = conn.read_rc_tuning().await.unwrap();
+        let adv_cfg = conn.read_advanced_config().await.unwrap();
+
+        // Imagine a Configurator session running here that mutates the
+        // FC's RcTuning + AdvancedConfig in arbitrary ways. The sim
+        // doesn't model that — but writing back the backup snapshots
+        // proves the restore path lands the bytes faithfully.
+
+        // "Restore" pass: write each snapshot back.
+        conn.write_pid_advanced(&pid_adv).await.unwrap();
+        conn.write_rc_tuning(&rc_tuning).await.unwrap();
+        conn.write_advanced_config(&adv_cfg).await.unwrap();
+
+        // Re-read and assert byte-equal across every surface.
+        assert_eq!(
+            conn.read_pid_advanced().await.unwrap().as_payload(),
+            pid_adv.as_payload()
+        );
+        assert_eq!(
+            conn.read_rc_tuning().await.unwrap().as_payload(),
+            rc_tuning.as_payload()
+        );
+        assert_eq!(
+            conn.read_advanced_config().await.unwrap().as_payload(),
+            adv_cfg.as_payload()
+        );
+
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
 
     #[test]
