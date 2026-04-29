@@ -286,7 +286,15 @@ pub fn recommendations_table(
     pid: &[drone_tuner_core::domain::PidRecommendation],
     filter: &[drone_tuner_core::domain::FilterRecommendation],
 ) {
-    if pid.is_empty() && filter.is_empty() {
+    recommendations_table_full(pid, filter, &[]);
+}
+
+pub fn recommendations_table_full(
+    pid: &[drone_tuner_core::domain::PidRecommendation],
+    filter: &[drone_tuner_core::domain::FilterRecommendation],
+    advanced: &[drone_tuner_core::domain::AdvancedRecommendation],
+) {
+    if pid.is_empty() && filter.is_empty() && advanced.is_empty() {
         return;
     }
     let mut table = make_table();
@@ -320,7 +328,46 @@ pub fn recommendations_table(
             Cell::new(&r.expected_improvement),
         ]);
     }
+    for r in advanced {
+        let (target, change) = advanced_rec_cells(&r.parameter);
+        table.add_row(vec![
+            priority_cell(&r.priority),
+            Cell::new("Adv").fg(TblColor::Magenta),
+            Cell::new(target),
+            Cell::new(change),
+            Cell::new(&r.reason),
+        ]);
+    }
     println!("{table}");
+}
+
+fn advanced_rec_cells(
+    param: &drone_tuner_core::domain::AdvancedParameter,
+) -> (String, String) {
+    use drone_tuner_core::domain::AdvancedParameter::*;
+    match param {
+        VbatSagCompensation { current, recommended } => {
+            ("Vbat Sag Comp".into(), format!("{} → {}", current, recommended))
+        }
+        DynamicIdle { current_rpm, recommended_rpm } => {
+            ("Dynamic Idle".into(), format!("{} → {} (x100 RPM)", current_rpm, recommended_rpm))
+        }
+        DMax { axis, current_d_min, current_d_max, recommended_d_min, recommended_d_max } => {
+            (format!("{:?} D Range", axis), format!("{}-{} → {}-{}", current_d_min, current_d_max, recommended_d_min, recommended_d_max))
+        }
+        Tpa { current_rate, current_breakpoint, recommended_rate, recommended_breakpoint } => {
+            ("TPA".into(), format!("{}%@{} → {}%@{}", current_rate, current_breakpoint, recommended_rate, recommended_breakpoint))
+        }
+        Feedforward { param, current, recommended } => {
+            (format!("FF {:?}", param), format!("{} → {}", current, recommended))
+        }
+        ThrustLinearization { current, recommended } => {
+            ("Thrust Linear".into(), format!("{} → {}", current, recommended))
+        }
+        SliderHint { slider_name, current_value, suggested_value } => {
+            (format!("Slider: {}", slider_name), format!("{} → {} (x0.01)", current_value, suggested_value))
+        }
+    }
 }
 
 /// One row in the comparison table.

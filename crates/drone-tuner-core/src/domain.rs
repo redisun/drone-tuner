@@ -51,6 +51,9 @@ pub struct HardwareConfiguration {
     pub pid_config: PidConfiguration,
     /// Current filter settings
     pub filter_config: FilterConfiguration,
+    /// Advanced tuning config (D Max, feedforward, vbat sag comp, etc.)
+    #[serde(default)]
+    pub advanced_tuning: Option<AdvancedTuningConfig>,
 }
 
 /// Flight controller information
@@ -493,6 +496,9 @@ pub struct AnalysisReport {
     /// what the analyser saw.
     #[serde(default)]
     pub step_responses: Vec<crate::analysis::StepResponse>,
+    /// Recommended advanced tuning changes
+    #[serde(default)]
+    pub advanced_recommendations: Vec<AdvancedRecommendation>,
     /// Confidence scores for various analyses
     pub confidence_scores: ConfidenceScores,
     /// Overall tune quality score (0-100)
@@ -751,6 +757,121 @@ pub enum Priority {
     Critical,
 }
 
+/// Advanced tuning configuration (D Max, feedforward, vbat sag comp, etc.)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdvancedTuningConfig {
+    pub d_min: Option<PerAxisU8>,
+    pub d_max_gain: Option<u8>,
+    pub d_max_advance: Option<u8>,
+    pub feedforward: Option<FeedforwardConfig>,
+    pub tpa: Option<TpaAdvancedConfig>,
+    pub vbat_sag_compensation: Option<u8>,
+    pub thrust_linearization: Option<u8>,
+    pub dynamic_idle_min_rpm: Option<u8>,
+    pub anti_gravity_gain: Option<u16>,
+    pub motor_protocol: Option<u8>,
+    pub dshot_bidir: Option<bool>,
+    pub motor_kv: Option<u16>,
+    pub motor_poles: Option<u8>,
+    /// Simplified tuning slider state (None = not parsed / not present)
+    pub simplified_tuning: Option<SimplifiedTuning>,
+}
+
+/// Betaflight simplified tuning slider configuration.
+///
+/// When `mode` is 2 (RP mode, the most common setting), pilots adjust
+/// sliders in the Configurator instead of raw PID values. The sliders
+/// apply multipliers on top of the firmware defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SimplifiedTuning {
+    /// 0 = off, 1 = basic, 2 = RP mode (roll/pitch linked)
+    pub mode: u8,
+    /// Master multiplier (100 = 1.0x)
+    pub master_multiplier: Option<u16>,
+    /// P and I gain slider (100 = 1.0x)
+    pub pi_gain: Option<u16>,
+    /// D gain slider (100 = 1.0x)
+    pub d_gain: Option<u16>,
+    /// Feedforward gain slider (100 = 1.0x)
+    pub feedforward_gain: Option<u16>,
+    /// Pitch-specific P/I multiplier (100 = 1.0x)
+    pub pitch_pi_gain: Option<u16>,
+    /// Pitch-specific D multiplier (100 = 1.0x)
+    pub pitch_d_gain: Option<u16>,
+    /// D Max gain slider (100 = 1.0x)
+    pub dmax_gain: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerAxisU8 {
+    pub roll: u8,
+    pub pitch: u8,
+    pub yaw: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FeedforwardConfig {
+    pub transition: Option<u8>,
+    pub averaging: Option<u8>,
+    pub smooth_factor: Option<u8>,
+    pub jitter_factor: Option<u8>,
+    pub boost: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TpaAdvancedConfig {
+    pub mode: Option<u8>,
+    pub rate: u8,
+    pub breakpoint: u16,
+}
+
+/// A recommendation for an advanced tuning parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedRecommendation {
+    pub parameter: AdvancedParameter,
+    pub reason: String,
+    pub priority: Priority,
+}
+
+/// The specific advanced parameter change being recommended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdvancedParameter {
+    VbatSagCompensation { current: u8, recommended: u8 },
+    DynamicIdle { current_rpm: u8, recommended_rpm: u8 },
+    DMax {
+        axis: Axis,
+        current_d_min: u8,
+        current_d_max: u8,
+        recommended_d_min: u8,
+        recommended_d_max: u8,
+    },
+    Tpa {
+        current_rate: u8,
+        current_breakpoint: u16,
+        recommended_rate: u8,
+        recommended_breakpoint: u16,
+    },
+    Feedforward {
+        param: FeedforwardParam,
+        current: u8,
+        recommended: u8,
+    },
+    ThrustLinearization { current: u8, recommended: u8 },
+    SliderHint {
+        slider_name: String,
+        current_value: u16,
+        suggested_value: u16,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FeedforwardParam {
+    JitterFactor,
+    SmoothFactor,
+    Boost,
+    Transition,
+}
+
 /// Confidence scores for different analyses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfidenceScores {
@@ -830,6 +951,7 @@ impl HardwareConfiguration {
             },
             pid_config: PidConfiguration::default(),
             filter_config: FilterConfiguration::default(),
+            advanced_tuning: None,
         }
     }
 }

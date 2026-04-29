@@ -1218,6 +1218,16 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
         }
     }
 
+    if !analysis.report.advanced_recommendations.is_empty() {
+        println!("\n  Advanced Tuning:");
+        for rec in &analysis.report.advanced_recommendations {
+            let priority_icon = display::priority_badge(&rec.priority);
+            let description = format_advanced_rec(&rec.parameter);
+            println!("    {} {}", priority_icon, description);
+            println!("      {}", rec.reason);
+        }
+    }
+
     // Always surface the analyzer's measured state, regardless of whether
     // recs were generated. This means a clean-tune ("no changes") output
     // reads as *measured silence* rather than ambiguous emptiness — the
@@ -2655,6 +2665,129 @@ async fn apply_pid_recommendations_via_fc(
     }
     } // 'filters: { ... } block
 
+    // Advanced parameter writeback via MSP_PID_ADVANCED (cmd 94).
+    // Reads the current snapshot, mutates bytes for recommended fields,
+    // writes back. Follows the same priority-gating as PID/filter recs.
+    let mut advanced_changes_applied = 0usize;
+    if !report.advanced_recommendations.is_empty()
+        && (args.auto_apply_safe || args.apply_all)
+    {
+        let read_pb = make_spinner("reading PID_ADVANCED for advanced tuning");
+        match fc.read_pid_advanced().await {
+            Ok(mut snapshot) => {
+                finish_step(
+                    read_pb,
+                    format!("PID_ADVANCED: {} byte payload", snapshot.payload_len()),
+                );
+
+                let allow_priority = |p: &drone_tuner_core::domain::Priority| {
+                    if args.apply_all {
+                        true
+                    } else if args.auto_apply_safe {
+                        matches!(
+                            p,
+                            drone_tuner_core::domain::Priority::Low
+                                | drone_tuner_core::domain::Priority::Medium
+                        )
+                    } else {
+                        false
+                    }
+                };
+
+                let mut descs: Vec<String> = Vec::new();
+                for rec in &report.advanced_recommendations {
+                    if !allow_priority(&rec.priority) {
+                        continue;
+                    }
+                    use drone_tuner_core::domain::AdvancedParameter::*;
+                    match &rec.parameter {
+                        VbatSagCompensation { recommended, .. } => {
+                            if let Ok(()) = snapshot.set_vbat_sag_compensation(*recommended) {
+                                advanced_changes_applied += 1;
+                                descs.push(format!("vbat_sag_compensation → {recommended}"));
+                            }
+                        }
+                        DynamicIdle { recommended_rpm, .. } => {
+                            if let Ok(()) = snapshot.set_idle_min_rpm(*recommended_rpm) {
+                                advanced_changes_applied += 1;
+                                descs.push(format!("idle_min_rpm → {recommended_rpm}"));
+                            }
+                        }
+                        ThrustLinearization { recommended, .. } => {
+                            if let Ok(()) = snapshot.set_thrust_linearization(*recommended) {
+                                advanced_changes_applied += 1;
+                                descs.push(format!("thrust_linearization → {recommended}"));
+                            }
+                        }
+                        DMax { axis, recommended_d_min, .. } => {
+                            use drone_tuner_core::domain::Axis;
+                            let result = match axis {
+                                Axis::Roll => snapshot.set_d_min_roll(*recommended_d_min),
+                                Axis::Pitch => snapshot.set_d_min_pitch(*recommended_d_min),
+                                Axis::Yaw => continue,
+                            };
+                            if result.is_ok() {
+                                advanced_changes_applied += 1;
+                                descs.push(format!("d_min_{:?} → {}", axis, recommended_d_min));
+                            }
+                        }
+                        Feedforward { param, recommended, .. } => {
+                            use drone_tuner_core::domain::FeedforwardParam;
+                            let result = match param {
+                                FeedforwardParam::JitterFactor => snapshot.set_ff_jitter_factor(*recommended),
+                                FeedforwardParam::Boost => snapshot.set_ff_boost(*recommended),
+                                _ => continue,
+                            };
+                            if result.is_ok() {
+                                advanced_changes_applied += 1;
+                                descs.push(format!("feedforward_{:?} → {}", param, recommended));
+                            }
+                        }
+                        Tpa { .. } => {
+                            // TPA lives in RC_TUNING — skip for now
+                        }
+                        SliderHint { .. } => {
+                            // Informational only — slider hints are not MSP-writable
+                        }
+                    }
+                }
+
+                if advanced_changes_applied > 0 {
+                    println!("  {} advanced byte-mutation(s) staged:", advanced_changes_applied);
+                    for d in &descs {
+                        println!("    {d}");
+                    }
+                    let write_pb = make_spinner("writing PID_ADVANCED");
+                    match fc.write_pid_advanced(&snapshot).await {
+                        Ok(()) => {
+                            finish_step(
+                                write_pb,
+                                format!("{advanced_changes_applied} advanced change(s) written"),
+                            );
+                        }
+                        Err(e) => {
+                            write_pb.finish_and_clear();
+                            println!(
+                                "  {} PID_ADVANCED writeback failed: {}",
+                                display::glyph_warn(),
+                                e
+                            );
+                            advanced_changes_applied = 0;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                read_pb.finish_and_clear();
+                println!(
+                    "  {} could not read PID_ADVANCED: {} (skipping advanced writeback)",
+                    display::glyph_warn(),
+                    e
+                );
+            }
+        }
+    }
+
     // Persist backup to disk if requested. Only runs when a PID write
     // actually happened — there's nothing to back up otherwise. Default
     // filename embeds the craft name (sanitised) so `ls tune-backup-*.json`
@@ -2707,7 +2840,7 @@ async fn apply_pid_recommendations_via_fc(
     // EEPROM save runs whenever *something* was written — PIDs, filters,
     // or both. Skipping it on filter-only changes would silently drop them
     // on the next power cycle, which is the bug we just fixed.
-    let any_writes_applied = applied > 0 || filter_changes_applied > 0;
+    let any_writes_applied = applied > 0 || filter_changes_applied > 0 || advanced_changes_applied > 0;
     let mut persisted_to_eeprom = false;
     if args.save_eeprom && any_writes_applied {
         let save_pb = make_spinner("persisting to EEPROM");
@@ -2786,6 +2919,44 @@ fn record_history(
 /// One Betaflight setting we want to write, as a `(name, value-bytes)`
 /// pair plus a human-readable label for stdout.
 ///
+fn format_advanced_rec(param: &drone_tuner_core::domain::AdvancedParameter) -> String {
+    use drone_tuner_core::domain::AdvancedParameter::*;
+    match param {
+        VbatSagCompensation { current, recommended } => {
+            format!("Vbat Sag Compensation: {} → {}", current, recommended)
+        }
+        DynamicIdle { current_rpm, recommended_rpm } => {
+            format!("Dynamic Idle: {} → {} (x100 RPM)", current_rpm, recommended_rpm)
+        }
+        DMax { axis, current_d_min, current_d_max, recommended_d_min, recommended_d_max } => {
+            format!(
+                "{:?} D range: {}-{} → {}-{}",
+                axis, current_d_min, current_d_max, recommended_d_min, recommended_d_max
+            )
+        }
+        Tpa { current_rate, current_breakpoint, recommended_rate, recommended_breakpoint } => {
+            format!(
+                "TPA: {}%@{} → {}%@{}",
+                current_rate, current_breakpoint, recommended_rate, recommended_breakpoint
+            )
+        }
+        Feedforward { param, current, recommended } => {
+            format!("Feedforward {:?}: {} → {}", param, current, recommended)
+        }
+        ThrustLinearization { current, recommended } => {
+            format!("Thrust Linearization: {} → {}", current, recommended)
+        }
+        SliderHint { slider_name, current_value, suggested_value } => {
+            format!(
+                "Slider {}: {:.2} → {:.2}",
+                slider_name,
+                *current_value as f32 / 100.0,
+                *suggested_value as f32 / 100.0,
+            )
+        }
+    }
+}
+
 /// Map a Betaflight filter-type string ("PT1", "BIQUAD", "PT2", "PT3") to
 /// its `filterType_e` enum integer. Returns `None` for unknown types so
 /// the caller skips the filter-type setting and only writes the cutoff.
@@ -3454,9 +3625,10 @@ fn output_pretty(
                 // Recommendations: rendered as a single combined comfy-table
                 // (PID + filter rows together), priority-coloured per row.
                 println!();
-                display::recommendations_table(
+                display::recommendations_table_full(
                     &analysis.report.pid_recommendations,
                     &analysis.report.filter_recommendations,
+                    &analysis.report.advanced_recommendations,
                 );
 
                 // Step-response viz, only in --show-details mode. Surface
@@ -3629,7 +3801,8 @@ fn generate_comparison(results: &[AnalysisResult]) -> Result<FlightComparison> {
             tune_quality: result.report.tune_quality_score,
             issues_count: result.report.detected_issues.len(),
             recommendations_count: result.report.filter_recommendations.len()
-                + result.report.pid_recommendations.len(),
+                + result.report.pid_recommendations.len()
+                + result.report.advanced_recommendations.len(),
             duration_ms: result.session.metadata.duration_ms,
         };
 

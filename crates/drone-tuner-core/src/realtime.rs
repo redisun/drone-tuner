@@ -1931,10 +1931,108 @@ impl PidAdvancedSnapshot {
         &self.raw
     }
 
+    /// Mutable access to the underlying payload.
+    pub fn as_payload_mut(&mut self) -> &mut [u8] {
+        &mut self.raw
+    }
+
     /// Total payload length the FC returned.
     pub fn payload_len(&self) -> usize {
         self.raw.len()
     }
+
+    fn read_u8(&self, off: usize) -> Option<u8> {
+        self.raw.get(off).copied()
+    }
+
+    fn write_u8(&mut self, off: usize, v: u8, field: &'static str) -> Result<()> {
+        if off >= self.raw.len() {
+            return Err(DronetunerError::communication_error(format!(
+                "PID_ADVANCED field '{field}' requires payload ≥{} bytes, FC returned {}",
+                off + 1,
+                self.raw.len()
+            )));
+        }
+        self.raw[off] = v;
+        Ok(())
+    }
+
+    // Byte offsets for Betaflight 4.5.x MSP_PID_ADVANCED (cmd 94).
+    // Verified empirically against a BF 4.5.1 FC (61-byte payload) by
+    // cross-referencing raw MSP bytes with Betaflight Configurator values.
+    // BF 4.5 added ~8 bytes of anti-gravity/iterm fields vs 4.4, shifting
+    // everything after offset 16 compared to earlier layout docs.
+    const OFF_FF_TRANSITION: usize = 10;
+    const OFF_THROTTLE_BOOST: usize = 30;
+    const OFF_ACRO_TRAINER_ANGLE: usize = 31;
+    // offsets 32-37: pidRollF/PitchF/YawF (3 × u16)
+    const OFF_ANTI_GRAVITY_MODE: usize = 38;
+    const OFF_D_MIN_ROLL: usize = 39;
+    const OFF_D_MIN_PITCH: usize = 40;
+    const OFF_D_MIN_YAW: usize = 41;
+    const OFF_D_MIN_GAIN: usize = 42;
+    const OFF_D_MIN_ADVANCE: usize = 43;
+    // offset 44: use_integrated_yaw
+    // offset 45: integrated_yaw_relax
+    const OFF_ITERM_RELAX_CUTOFF: usize = 46;
+    const OFF_MOTOR_OUTPUT_LIMIT: usize = 47;
+    const OFF_AUTO_PROFILE_CELL_COUNT: usize = 48;
+    const OFF_IDLE_MIN_RPM: usize = 49;
+    const OFF_FF_AVERAGING: usize = 50;
+    const OFF_FF_SMOOTH_FACTOR: usize = 51;
+    const OFF_FF_BOOST: usize = 52;
+    const OFF_FF_MAX_RATE_LIMIT: usize = 53;
+    const OFF_FF_JITTER_FACTOR: usize = 54;
+    const OFF_VBAT_SAG_COMPENSATION: usize = 55;
+    const OFF_THRUST_LINEARIZATION: usize = 56;
+
+    // ---- read accessors ----
+
+    /// D_min for roll axis.
+    pub fn d_min_roll(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_ROLL) }
+    /// D_min for pitch axis.
+    pub fn d_min_pitch(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_PITCH) }
+    /// D_min for yaw axis.
+    pub fn d_min_yaw(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_YAW) }
+    /// D_min gain (controls how quickly D rises toward D_max).
+    pub fn d_min_gain(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_GAIN) }
+    /// D_min advance (phase lead for D_max calculation).
+    pub fn d_min_advance(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_ADVANCE) }
+    /// Feedforward transition.
+    pub fn ff_transition(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_TRANSITION) }
+    /// Feedforward averaging mode.
+    pub fn ff_averaging(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_AVERAGING) }
+    /// Feedforward smooth factor.
+    pub fn ff_smooth_factor(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_SMOOTH_FACTOR) }
+    /// Feedforward jitter factor.
+    pub fn ff_jitter_factor(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_JITTER_FACTOR) }
+    /// Feedforward boost.
+    pub fn ff_boost(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_BOOST) }
+    /// Vbat sag compensation (0=off, 100=full).
+    pub fn vbat_sag_compensation(&self) -> Option<u8> { self.read_u8(Self::OFF_VBAT_SAG_COMPENSATION) }
+    /// Thrust linearization (0=off).
+    pub fn thrust_linearization(&self) -> Option<u8> { self.read_u8(Self::OFF_THRUST_LINEARIZATION) }
+    /// Dynamic idle minimum RPM (0=off, units = RPM/100).
+    pub fn idle_min_rpm(&self) -> Option<u8> { self.read_u8(Self::OFF_IDLE_MIN_RPM) }
+
+    // ---- write accessors ----
+
+    /// Set D_min for roll.
+    pub fn set_d_min_roll(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_D_MIN_ROLL, v, "d_min_roll") }
+    /// Set D_min for pitch.
+    pub fn set_d_min_pitch(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_D_MIN_PITCH, v, "d_min_pitch") }
+    /// Set D_min gain.
+    pub fn set_d_min_gain(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_D_MIN_GAIN, v, "d_min_gain") }
+    /// Set feedforward jitter factor.
+    pub fn set_ff_jitter_factor(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_FF_JITTER_FACTOR, v, "feedforward_jitter_factor") }
+    /// Set feedforward boost.
+    pub fn set_ff_boost(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_FF_BOOST, v, "feedforward_boost") }
+    /// Set vbat sag compensation.
+    pub fn set_vbat_sag_compensation(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_VBAT_SAG_COMPENSATION, v, "vbat_sag_compensation") }
+    /// Set thrust linearization.
+    pub fn set_thrust_linearization(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_THRUST_LINEARIZATION, v, "thrust_linearization") }
+    /// Set dynamic idle minimum RPM.
+    pub fn set_idle_min_rpm(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_IDLE_MIN_RPM, v, "idle_min_rpm") }
 }
 
 /// Opaque snapshot of `MSP_RC_TUNING` (cmd 111). Carries rates (R/P/Y),

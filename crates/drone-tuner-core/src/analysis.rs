@@ -1,5 +1,6 @@
 //! Analysis engine for frequency domain analysis and oscillation detection.
 
+mod advanced;
 mod convergence;
 mod filter_optimizer;
 mod oscillation;
@@ -18,6 +19,7 @@ pub use pid::{clamp_recs_to_baseline, PidAnalyzerConfig, StepResponse, BASELINE_
 
 pub(crate) use oscillation::{DetectedOscillation, OscillationSeverity, OscillationType};
 
+use advanced::AdvancedAnalyzer;
 use crate::domain::*;
 use crate::error::{DronetunerError, Result};
 use filter_optimizer::FilterOptimizer;
@@ -37,6 +39,8 @@ pub struct AnalysisEngine {
     filter_optimizer: FilterOptimizer,
     /// PID analysis component
     pid_analyzer: PidAnalyzer,
+    /// Advanced parameter analysis component
+    advanced_analyzer: AdvancedAnalyzer,
     /// Configuration for analysis parameters
     config: AnalysisConfig,
     /// Memory pool for FFT buffers to reduce allocations
@@ -137,6 +141,7 @@ impl AnalysisEngine {
             oscillation_detector: OscillationDetector::new(),
             filter_optimizer: FilterOptimizer::new(),
             pid_analyzer: PidAnalyzer::new(),
+            advanced_analyzer: AdvancedAnalyzer::new(),
             config,
             fft_buffer_pool: Vec::new(),
         }
@@ -205,6 +210,15 @@ impl AnalysisEngine {
             pid_outcome.step_responses.len()
         );
 
+        // Stage 4.5: Advanced parameter analysis
+        let advanced_recommendations = self
+            .advanced_analyzer
+            .analyze(&session.metadata.hardware, &session.telemetry, &pid_outcome.recommendations);
+        tracing::debug!(
+            "Generated {} advanced recommendations",
+            advanced_recommendations.len()
+        );
+
         // Stage 5: Calculate confidence scores
         let confidence_scores = self.calculate_confidence_scores(&freq_analysis, &oscillations)?;
 
@@ -224,6 +238,7 @@ impl AnalysisEngine {
             filter_recommendations,
             pid_recommendations: pid_outcome.recommendations,
             step_responses: pid_outcome.step_responses,
+            advanced_recommendations,
             confidence_scores,
             tune_quality_score,
         })

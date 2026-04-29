@@ -1251,6 +1251,7 @@ impl SimpleBlackboxParser {
             },
             pid_config,
             filter_config,
+            advanced_tuning: self.extract_advanced_tuning_config(&header_map),
         }
     }
 
@@ -1456,6 +1457,115 @@ impl SimpleBlackboxParser {
         }
     }
 
+    fn extract_advanced_tuning_config(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Option<crate::domain::AdvancedTuningConfig> {
+        use crate::domain::{
+            AdvancedTuningConfig, FeedforwardConfig, PerAxisU8, SimplifiedTuning,
+            TpaAdvancedConfig,
+        };
+
+        let parse_u8 = |key: &str| -> Option<u8> {
+            headers.get(key).and_then(|v| v.parse().ok())
+        };
+        let parse_u16 = |key: &str| -> Option<u16> {
+            headers.get(key).and_then(|v| v.parse().ok())
+        };
+
+        let d_min = headers.get("d_min").and_then(|v| {
+            let parts: Vec<&str> = v.split(',').collect();
+            if parts.len() >= 3 {
+                Some(PerAxisU8 {
+                    roll: parts[0].trim().parse().unwrap_or(0),
+                    pitch: parts[1].trim().parse().unwrap_or(0),
+                    yaw: parts[2].trim().parse().unwrap_or(0),
+                })
+            } else {
+                None
+            }
+        });
+
+        let feedforward = {
+            let ff = FeedforwardConfig {
+                transition: parse_u8("feedforward_transition"),
+                averaging: parse_u8("feedforward_averaging"),
+                smooth_factor: parse_u8("feedforward_smooth_factor"),
+                jitter_factor: parse_u8("feedforward_jitter_factor"),
+                boost: parse_u8("feedforward_boost"),
+            };
+            if ff.transition.is_some() || ff.jitter_factor.is_some() {
+                Some(ff)
+            } else {
+                None
+            }
+        };
+
+        let tpa = match (parse_u8("tpa_rate"), headers.get("tpa_breakpoint")) {
+            (Some(rate), Some(bp_str)) => bp_str.parse::<u16>().ok().map(|bp| TpaAdvancedConfig {
+                mode: parse_u8("tpa_mode"),
+                rate,
+                breakpoint: bp,
+            }),
+            _ => None,
+        };
+
+        let dshot_bidir = parse_u8("dshot_bidir").map(|v| v != 0);
+        let motor_protocol = parse_u8("motor_pwm_protocol");
+        let motor_kv = parse_u16("motor_kv");
+        let motor_poles = parse_u8("motor_poles");
+
+        // Simplified tuning sliders (Betaflight 4.3+)
+        let simplified_tuning = {
+            let mode = parse_u8("simplified_pids_mode").unwrap_or(0);
+            if mode > 0 {
+                Some(SimplifiedTuning {
+                    mode,
+                    master_multiplier: parse_u16("simplified_master_multiplier"),
+                    pi_gain: parse_u16("simplified_pi_gain"),
+                    d_gain: parse_u16("simplified_d_gain"),
+                    feedforward_gain: parse_u16("simplified_feedforward_gain"),
+                    pitch_pi_gain: parse_u16("simplified_pitch_pi_gain"),
+                    pitch_d_gain: parse_u16("simplified_pitch_d_gain"),
+                    dmax_gain: parse_u16("simplified_dmax_gain")
+                        .or_else(|| parse_u16("simplified_d_max_gain")),
+                })
+            } else {
+                None
+            }
+        };
+
+        let cfg = AdvancedTuningConfig {
+            d_min,
+            d_max_gain: parse_u8("d_max_gain").or_else(|| parse_u8("d_min_gain")),
+            d_max_advance: parse_u8("d_max_advance").or_else(|| parse_u8("d_min_advance")),
+            feedforward,
+            tpa,
+            vbat_sag_compensation: parse_u8("vbat_sag_compensation"),
+            thrust_linearization: parse_u8("thrust_linear")
+                .or_else(|| parse_u8("thrustLinearization")),
+            dynamic_idle_min_rpm: parse_u8("dyn_idle_min_rpm"),
+            anti_gravity_gain: parse_u16("anti_gravity_gain"),
+            motor_protocol,
+            dshot_bidir,
+            motor_kv,
+            motor_poles,
+            simplified_tuning,
+        };
+
+        if cfg.d_min.is_none()
+            && cfg.vbat_sag_compensation.is_none()
+            && cfg.dynamic_idle_min_rpm.is_none()
+            && cfg.feedforward.is_none()
+            && cfg.tpa.is_none()
+            && cfg.simplified_tuning.is_none()
+        {
+            return None;
+        }
+
+        Some(cfg)
+    }
+
     /// Parse PID triple values from header string
     /// Expected format: "61,110,41" -> (P, I, D)
     fn parse_pid_triple(&self, header_value: Option<&String>) -> (f32, f32, f32) {
@@ -1640,6 +1750,7 @@ impl SimpleBlackboxParser {
             },
             pid_config: PidConfiguration::default(),
             filter_config: FilterConfiguration::default(),
+            advanced_tuning: None,
         }
     }
 

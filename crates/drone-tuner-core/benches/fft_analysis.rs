@@ -395,6 +395,7 @@ impl Default for BenchmarkHardwareConfiguration {
                     enabled: true,
                 }),
             },
+            advanced_tuning: None,
         })
     }
 }
