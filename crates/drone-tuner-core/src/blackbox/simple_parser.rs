@@ -1462,16 +1462,12 @@ impl SimpleBlackboxParser {
         headers: &std::collections::HashMap<String, String>,
     ) -> Option<crate::domain::AdvancedTuningConfig> {
         use crate::domain::{
-            AdvancedTuningConfig, FeedforwardConfig, PerAxisU8, SimplifiedTuning,
-            TpaAdvancedConfig,
+            AdvancedTuningConfig, FeedforwardConfig, PerAxisU8, SimplifiedTuning, TpaAdvancedConfig,
         };
 
-        let parse_u8 = |key: &str| -> Option<u8> {
-            headers.get(key).and_then(|v| v.parse().ok())
-        };
-        let parse_u16 = |key: &str| -> Option<u16> {
-            headers.get(key).and_then(|v| v.parse().ok())
-        };
+        let parse_u8 = |key: &str| -> Option<u8> { headers.get(key).and_then(|v| v.parse().ok()) };
+        let parse_u16 =
+            |key: &str| -> Option<u16> { headers.get(key).and_then(|v| v.parse().ok()) };
 
         let d_min = headers.get("d_min").and_then(|v| {
             let parts: Vec<&str> = v.split(',').collect();
@@ -2477,9 +2473,13 @@ mod tests {
 
     #[test]
     fn rewrite_passes_through_supported_betaflight() {
-        let data = b"H Product:Blackbox flight data recorder\nH Firmware revision:Betaflight 4.5.0\n";
+        let data =
+            b"H Product:Blackbox flight data recorder\nH Firmware revision:Betaflight 4.5.0\n";
         let out = rewrite_unsupported_firmware_header(data);
-        assert!(matches!(out, Cow::Borrowed(_)), "supported version should not be rewritten");
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "supported version should not be rewritten"
+        );
         assert_eq!(out.as_ref(), data);
     }
 
@@ -2487,7 +2487,10 @@ mod tests {
     fn rewrite_substitutes_year_based_betaflight() {
         let data = b"H Product:Blackbox flight data recorder\nH Firmware revision:Betaflight 2025.12.0-beta (cd026f15f) STM32F405\nH looptime:125\n";
         let out = rewrite_unsupported_firmware_header(data);
-        assert!(matches!(out, Cow::Owned(_)), "year-based version should be rewritten");
+        assert!(
+            matches!(out, Cow::Owned(_)),
+            "year-based version should be rewritten"
+        );
         let s = std::str::from_utf8(out.as_ref()).unwrap();
         assert!(s.contains("H Firmware revision:Betaflight 4.5.0\n"));
         assert!(s.contains("H looptime:125\n"));

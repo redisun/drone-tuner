@@ -8,7 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # NOTE: We deliberately do *not* set `RUSTFLAGS: -D warnings` at workflow
+  # scope. Cargo appends RUSTFLAGS after the `--` args on the rustc command
+  # line, so it overrode the per-job `-A clippy::pedantic` allowlist below
+  # and made every pedantic warning fail the build. Clippy strictness is
+  # configured per-job via explicit `-D`/`-A` flags instead.
 
 jobs:
   fmt:

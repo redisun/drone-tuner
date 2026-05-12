@@ -422,8 +422,7 @@ fn init_logging(verbose: bool) -> Result<()> {
 
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr), // Keep logs separate from output
+            tracing_subscriber::fmt::layer().with_writer(std::io::stderr), // Keep logs separate from output
         )
         .with(filter)
         .init();
@@ -470,18 +469,14 @@ async fn analyze_command(
             let connection = resolved
                 .as_deref()
                 .expect("resolve_connection_raw guarantees Some when pull_bbl is true");
-            let was_auto_discovered =
-                !matches!(args.connection.as_deref(), Some(c) if c != "auto");
+            let was_auto_discovered = !matches!(args.connection.as_deref(), Some(c) if c != "auto");
             if was_auto_discovered {
                 println!("auto-discovered FC at {}", style(connection).bold());
             }
-            let pulled = pull_bbl_from_fc(
-                connection,
-                args.keep_bbl.as_deref(),
-                args.pull_chunk_size,
-            )
-            .await
-            .context("Failed to pull BBL from flight controller")?;
+            let pulled =
+                pull_bbl_from_fc(connection, args.keep_bbl.as_deref(), args.pull_chunk_size)
+                    .await
+                    .context("Failed to pull BBL from flight controller")?;
             vec![pulled]
         }
         (None, false) => {
@@ -903,7 +898,11 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
                 "cpu" => telemetry_fields.push(TelemetryField::CpuLoad),
                 "loop_time" => telemetry_fields.push(TelemetryField::LoopTime),
                 _ => {
-                    println!("{} Unknown telemetry field: {}", display::glyph_warn(), field);
+                    println!(
+                        "{} Unknown telemetry field: {}",
+                        display::glyph_warn(),
+                        field
+                    );
                 }
             }
         }
@@ -971,10 +970,7 @@ async fn monitor_command(_args: MonitorArgs, _output_format: OutputFormat) -> Re
             }
         }
 
-        println!(
-            "\nMonitoring stopped. Captured {} samples",
-            sample_count
-        );
+        println!("\nMonitoring stopped. Captured {} samples", sample_count);
         Ok(())
     }
 }
@@ -1019,7 +1015,7 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
     // reused for every FC roundtrip in this run (pull, dry-connect, apply).
     let resolved_connection = resolve_connection(&args)?;
     let was_auto_discovered = match (&resolved_connection, args.connection.as_deref()) {
-        (Some(_), None) => true,        // omitted, discovered
+        (Some(_), None) => true,         // omitted, discovered
         (Some(_), Some("auto")) => true, // explicit `auto`, discovered
         _ => false,
     };
@@ -1034,13 +1030,9 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
             let connection = resolved_connection
                 .as_deref()
                 .expect("resolve_connection guarantees Some when --pull-bbl is set");
-            pull_bbl_from_fc(
-                connection,
-                args.keep_bbl.as_deref(),
-                args.pull_chunk_size,
-            )
-            .await
-            .context("Failed to pull BBL from flight controller")?
+            pull_bbl_from_fc(connection, args.keep_bbl.as_deref(), args.pull_chunk_size)
+                .await
+                .context("Failed to pull BBL from flight controller")?
         }
         (None, false) => {
             return Err(anyhow::anyhow!(
@@ -1089,7 +1081,10 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
     // of current), so cumulative drift across iterations can't escape
     // the envelope. Apply before display so what the user sees is what
     // will actually be written.
-    apply_baseline_clamp(&mut analysis.report.pid_recommendations, args.baseline.as_deref());
+    apply_baseline_clamp(
+        &mut analysis.report.pid_recommendations,
+        args.baseline.as_deref(),
+    );
 
     // Item 5: cross-tune convergence detector. Look at recent tune-history
     // rows for the same FC; if the analyzer is about to push a gain in the
@@ -1238,7 +1233,10 @@ async fn tune_command(args: TuneArgs, _output_format: OutputFormat) -> Result<()
     // Decide whether/how to apply.
     match (resolved_connection.as_deref(), args.dry_run) {
         (None, true) => {
-            println!("\n{} Dry run mode - no changes applied", display::glyph_info());
+            println!(
+                "\n{} Dry run mode - no changes applied",
+                display::glyph_info()
+            );
         }
         (None, false) => {
             println!(
@@ -1327,7 +1325,11 @@ fn print_tune_findings(analysis: &AnalysisResult) {
     );
 
     let mut total_shown = 0usize;
-    for (label, axis) in [("Roll ", Axis::Roll), ("Pitch", Axis::Pitch), ("Yaw  ", Axis::Yaw)] {
+    for (label, axis) in [
+        ("Roll ", Axis::Roll),
+        ("Pitch", Axis::Pitch),
+        ("Yaw  ", Axis::Yaw),
+    ] {
         let mut axis_peaks: Vec<_> = peaks.iter().filter(|p| p.axes.contains(&axis)).collect();
         axis_peaks.sort_by(|a, b| {
             b.amplitude
@@ -1363,7 +1365,7 @@ fn print_tune_findings(analysis: &AnalysisResult) {
     // log time (not necessarily what's on the FC right now if it was
     // re-flashed since).
     let filters = &analysis.session.metadata.hardware.filter_config;
-    println!("  {} Active filters at log time:", "");
+    println!("   Active filters at log time:");
     if filters.gyro_filters.is_empty() {
         println!("    Gyro LPF:    not configured");
     } else {
@@ -1509,12 +1511,15 @@ async fn pull_bbl_from_fc(
         )
         .await
         .context("Dataflash pull failed")?;
-    finish_step(pull_pb, format!("downloaded {}", format_bytes(blob.len() as u64)));
+    finish_step(
+        pull_pb,
+        format!("downloaded {}", format_bytes(blob.len() as u64)),
+    );
 
     // Persist.
     std::fs::write(&path, &blob)
         .with_context(|| format!("Failed to write pulled BBL to {}", path.display()))?;
-    println!("  {} saved → {}", "", path.display());
+    println!("   saved → {}", path.display());
 
     Ok(path)
 }
@@ -1776,10 +1781,27 @@ fn load_baseline_pid_config(path: &Path) -> Result<drone_tuner_core::domain::Pid
     let pitch = read_triplet(&json, "pitch")?;
     let yaw = read_triplet(&json, "yaw")?;
 
-    let mut cfg = PidConfiguration::default();
-    cfg.roll = PidValues { p: roll[0], i: roll[1], d: roll[2], f: None };
-    cfg.pitch = PidValues { p: pitch[0], i: pitch[1], d: pitch[2], f: None };
-    cfg.yaw = PidValues { p: yaw[0], i: yaw[1], d: yaw[2], f: None };
+    let cfg = PidConfiguration {
+        roll: PidValues {
+            p: roll[0],
+            i: roll[1],
+            d: roll[2],
+            f: None,
+        },
+        pitch: PidValues {
+            p: pitch[0],
+            i: pitch[1],
+            d: pitch[2],
+            f: None,
+        },
+        yaw: PidValues {
+            p: yaw[0],
+            i: yaw[1],
+            d: yaw[2],
+            f: None,
+        },
+        ..Default::default()
+    };
     Ok(cfg)
 }
 
@@ -1809,10 +1831,8 @@ fn apply_baseline_clamp(
                 Ok(baseline_cfg) => {
                     let pre_count = recs.len();
                     let taken = std::mem::take(recs);
-                    let clamped = drone_tuner_core::analysis::clamp_recs_to_baseline(
-                        taken,
-                        &baseline_cfg,
-                    );
+                    let clamped =
+                        drone_tuner_core::analysis::clamp_recs_to_baseline(taken, &baseline_cfg);
                     let dropped = pre_count.saturating_sub(clamped.len());
                     *recs = clamped;
                     println!(
@@ -1980,11 +2000,9 @@ fn sanitize_filename_part(s: &str) -> Option<String> {
         if c.is_ascii_alphanumeric() || c == '-' {
             out.push(c);
             last_was_underscore = false;
-        } else if c == '_' || c.is_whitespace() {
-            if !last_was_underscore && !out.is_empty() {
-                out.push('_');
-                last_was_underscore = true;
-            }
+        } else if (c == '_' || c.is_whitespace()) && !last_was_underscore && !out.is_empty() {
+            out.push('_');
+            last_was_underscore = true;
         }
         // Anything else (punctuation, non-ASCII): drop silently.
     }
@@ -2179,9 +2197,7 @@ fn format_bytes(bytes: u64) -> String {
 ///    smaller set of boards using AT32 / CH340 / CP210x.
 /// 4. Refuse to guess if more than one candidate remains; print the
 ///    list and ask the user to pass `--connection <PATH>`.
-fn pick_fc_port_from(
-    ports: Vec<serialport::SerialPortInfo>,
-) -> Result<serialport::SerialPortInfo> {
+fn pick_fc_port_from(ports: Vec<serialport::SerialPortInfo>) -> Result<serialport::SerialPortInfo> {
     use serialport::SerialPortType;
 
     let usb_ports: Vec<_> = ports
@@ -2201,11 +2217,7 @@ fn pick_fc_port_from(
         .filter(|p| matches!(&p.port_type, SerialPortType::UsbPort(usb) if usb.vid == 0x0483))
         .cloned()
         .collect();
-    let candidates = if !stm32.is_empty() {
-        stm32
-    } else {
-        usb_ports
-    };
+    let candidates = if !stm32.is_empty() { stm32 } else { usb_ports };
 
     match candidates.len() {
         1 => Ok(candidates.into_iter().next().unwrap()),
@@ -2269,10 +2281,7 @@ fn resolve_connection(args: &TuneArgs) -> Result<Option<String>> {
 
 /// Same logic as [`resolve_connection`], parameterised for callers that
 /// don't have a `TuneArgs`. Used by the `analyze --pull-bbl` path.
-fn resolve_connection_raw(
-    connection: Option<&str>,
-    pull_bbl: bool,
-) -> Result<Option<String>> {
+fn resolve_connection_raw(connection: Option<&str>, pull_bbl: bool) -> Result<Option<String>> {
     match connection {
         Some("auto") => Ok(Some(discover_fc_port()?)),
         Some(c) => Ok(Some(c.to_string())),
@@ -2355,10 +2364,7 @@ async fn dry_connect_and_diff(
             display::glyph_info()
         );
     } else {
-        println!(
-            "\n{} PID change(s) WOULD be applied:",
-            count
-        );
+        println!("\n{} PID change(s) WOULD be applied:", count);
         if current.roll() != proposed.roll() {
             println!(
                 "    Roll  P/I/D: {:?} → {:?}",
@@ -2510,7 +2516,11 @@ async fn apply_pid_recommendations_via_fc(
         }
         finish_step(
             extras_pb,
-            format!("captured {} aux surface(s): {}", captured.len(), captured.join(", ")),
+            format!(
+                "captured {} aux surface(s): {}",
+                captured.len(),
+                captured.join(", ")
+            ),
         );
         Some(extras)
     } else {
@@ -2578,100 +2588,98 @@ async fn apply_pid_recommendations_via_fc(
     // FC, not an MSP path.
     let mut filter_changes_applied = 0usize;
     'filters: {
-    if !args.skip_filters && !report.filter_recommendations.is_empty() {
-        let read_pb = make_spinner("reading current filter config");
-        let mut snapshot = match fc.read_filter_config().await {
-            Ok(s) => s,
-            Err(e) => {
-                read_pb.finish_and_clear();
-                println!(
-                    "  {} could not read filter config: {} (skipping filter writeback)",
-                    display::glyph_warn(),
-                    e
-                );
-                // Bail out of the filter section but continue to backup /
-                // EEPROM / history below — the PID write that already
-                // succeeded shouldn't be torpedoed by an unrelated MSP
-                // read failure.
-                break 'filters;
-            }
-        };
-        finish_step(
-            read_pb,
-            format!(
-                "current filter config: {} byte payload",
-                snapshot.payload_len()
-            ),
-        );
-
-        let (descriptions, applied_count, unsupported) =
-            apply_filter_recs_to_snapshot(&mut snapshot, &report.filter_recommendations, args);
-        filter_changes_applied = applied_count;
-
-        if applied_count == 0 {
-            if !unsupported.is_empty() {
-                println!(
-                    "  {} filter recs surfaced but none auto-applicable on this build:",
-                    display::glyph_info(),
-                );
-                for u in &unsupported {
-                    println!("    - {u}");
-                }
-            } else {
-                println!(
-                    "  {} no filter recs match priority gating (--apply-all / --auto-apply-safe).",
-                    display::glyph_info()
-                );
-            }
-        } else {
-            println!("  {applied_count} filter byte-mutation(s) staged:");
-            for d in &descriptions {
-                println!("    {d}");
-            }
-            let filter_pb = make_spinner("writing filter config (with rollback safety net)");
-            match fc.apply_filter_with_rollback(&snapshot).await {
-                Ok(_backup) => {
-                    finish_step(
-                        filter_pb,
-                        format!("{applied_count} filter byte-mutation(s) written"),
-                    );
-                }
+        if !args.skip_filters && !report.filter_recommendations.is_empty() {
+            let read_pb = make_spinner("reading current filter config");
+            let mut snapshot = match fc.read_filter_config().await {
+                Ok(s) => s,
                 Err(e) => {
-                    filter_pb.finish_and_clear();
+                    read_pb.finish_and_clear();
                     println!(
-                        "  {} filter writeback failed: {} (rollback restored pre-change state)",
+                        "  {} could not read filter config: {} (skipping filter writeback)",
                         display::glyph_warn(),
                         e
                     );
-                    filter_changes_applied = 0;
+                    // Bail out of the filter section but continue to backup /
+                    // EEPROM / history below — the PID write that already
+                    // succeeded shouldn't be torpedoed by an unrelated MSP
+                    // read failure.
+                    break 'filters;
                 }
-            }
-            if !unsupported.is_empty() {
-                println!(
-                    "  {} {} filter rec(s) skipped (FC's filter config payload too short):",
-                    display::glyph_info(),
-                    unsupported.len()
+            };
+            finish_step(
+                read_pb,
+                format!(
+                    "current filter config: {} byte payload",
+                    snapshot.payload_len()
+                ),
+            );
+
+            let (descriptions, applied_count, unsupported) =
+                apply_filter_recs_to_snapshot(&mut snapshot, &report.filter_recommendations, args);
+            filter_changes_applied = applied_count;
+
+            if applied_count == 0 {
+                if !unsupported.is_empty() {
+                    println!(
+                        "  {} filter recs surfaced but none auto-applicable on this build:",
+                        display::glyph_info(),
+                    );
+                    for u in &unsupported {
+                        println!("    - {u}");
+                    }
+                } else {
+                    println!(
+                    "  {} no filter recs match priority gating (--apply-all / --auto-apply-safe).",
+                    display::glyph_info()
                 );
-                for u in &unsupported {
-                    println!("    - {u}");
+                }
+            } else {
+                println!("  {applied_count} filter byte-mutation(s) staged:");
+                for d in &descriptions {
+                    println!("    {d}");
+                }
+                let filter_pb = make_spinner("writing filter config (with rollback safety net)");
+                match fc.apply_filter_with_rollback(&snapshot).await {
+                    Ok(_backup) => {
+                        finish_step(
+                            filter_pb,
+                            format!("{applied_count} filter byte-mutation(s) written"),
+                        );
+                    }
+                    Err(e) => {
+                        filter_pb.finish_and_clear();
+                        println!(
+                            "  {} filter writeback failed: {} (rollback restored pre-change state)",
+                            display::glyph_warn(),
+                            e
+                        );
+                        filter_changes_applied = 0;
+                    }
+                }
+                if !unsupported.is_empty() {
+                    println!(
+                        "  {} {} filter rec(s) skipped (FC's filter config payload too short):",
+                        display::glyph_info(),
+                        unsupported.len()
+                    );
+                    for u in &unsupported {
+                        println!("    - {u}");
+                    }
                 }
             }
+        } else if args.skip_filters {
+            println!(
+                "  {} --skip-filters set — filter recs printed but not written.",
+                display::glyph_info()
+            );
         }
-    } else if args.skip_filters {
-        println!(
-            "  {} --skip-filters set — filter recs printed but not written.",
-            display::glyph_info()
-        );
-    }
     } // 'filters: { ... } block
 
     // Advanced parameter writeback via MSP_PID_ADVANCED (cmd 94).
     // Reads the current snapshot, mutates bytes for recommended fields,
     // writes back. Follows the same priority-gating as PID/filter recs.
     let mut advanced_changes_applied = 0usize;
-    if !report.advanced_recommendations.is_empty()
-        && (args.auto_apply_safe || args.apply_all)
-    {
+    if !report.advanced_recommendations.is_empty() && (args.auto_apply_safe || args.apply_all) {
         let read_pb = make_spinner("reading PID_ADVANCED for advanced tuning");
         match fc.read_pid_advanced().await {
             Ok(mut snapshot) => {
@@ -2707,7 +2715,9 @@ async fn apply_pid_recommendations_via_fc(
                                 descs.push(format!("vbat_sag_compensation → {recommended}"));
                             }
                         }
-                        DynamicIdle { recommended_rpm, .. } => {
+                        DynamicIdle {
+                            recommended_rpm, ..
+                        } => {
                             if let Ok(()) = snapshot.set_idle_min_rpm(*recommended_rpm) {
                                 advanced_changes_applied += 1;
                                 descs.push(format!("idle_min_rpm → {recommended_rpm}"));
@@ -2719,7 +2729,11 @@ async fn apply_pid_recommendations_via_fc(
                                 descs.push(format!("thrust_linearization → {recommended}"));
                             }
                         }
-                        DMax { axis, recommended_d_min, .. } => {
+                        DMax {
+                            axis,
+                            recommended_d_min,
+                            ..
+                        } => {
                             use drone_tuner_core::domain::Axis;
                             let result = match axis {
                                 Axis::Roll => snapshot.set_d_min_roll(*recommended_d_min),
@@ -2731,10 +2745,14 @@ async fn apply_pid_recommendations_via_fc(
                                 descs.push(format!("d_min_{:?} → {}", axis, recommended_d_min));
                             }
                         }
-                        Feedforward { param, recommended, .. } => {
+                        Feedforward {
+                            param, recommended, ..
+                        } => {
                             use drone_tuner_core::domain::FeedforwardParam;
                             let result = match param {
-                                FeedforwardParam::JitterFactor => snapshot.set_ff_jitter_factor(*recommended),
+                                FeedforwardParam::JitterFactor => {
+                                    snapshot.set_ff_jitter_factor(*recommended)
+                                }
                                 FeedforwardParam::Boost => snapshot.set_ff_boost(*recommended),
                                 _ => continue,
                             };
@@ -2753,7 +2771,10 @@ async fn apply_pid_recommendations_via_fc(
                 }
 
                 if advanced_changes_applied > 0 {
-                    println!("  {} advanced byte-mutation(s) staged:", advanced_changes_applied);
+                    println!(
+                        "  {} advanced byte-mutation(s) staged:",
+                        advanced_changes_applied
+                    );
                     for d in &descs {
                         println!("    {d}");
                     }
@@ -2834,13 +2855,14 @@ async fn apply_pid_recommendations_via_fc(
         }))?;
         std::fs::write(&path, json)
             .with_context(|| format!("Failed to write backup snapshot to {}", path.display()))?;
-        println!("  {} backup → {}", "", path.display());
+        println!("   backup → {}", path.display());
     }
 
     // EEPROM save runs whenever *something* was written — PIDs, filters,
     // or both. Skipping it on filter-only changes would silently drop them
     // on the next power cycle, which is the bug we just fixed.
-    let any_writes_applied = applied > 0 || filter_changes_applied > 0 || advanced_changes_applied > 0;
+    let any_writes_applied =
+        applied > 0 || filter_changes_applied > 0 || advanced_changes_applied > 0;
     let mut persisted_to_eeprom = false;
     if args.save_eeprom && any_writes_applied {
         let save_pb = make_spinner("persisting to EEPROM");
@@ -2922,31 +2944,62 @@ fn record_history(
 fn format_advanced_rec(param: &drone_tuner_core::domain::AdvancedParameter) -> String {
     use drone_tuner_core::domain::AdvancedParameter::*;
     match param {
-        VbatSagCompensation { current, recommended } => {
+        VbatSagCompensation {
+            current,
+            recommended,
+        } => {
             format!("Vbat Sag Compensation: {} → {}", current, recommended)
         }
-        DynamicIdle { current_rpm, recommended_rpm } => {
-            format!("Dynamic Idle: {} → {} (x100 RPM)", current_rpm, recommended_rpm)
+        DynamicIdle {
+            current_rpm,
+            recommended_rpm,
+        } => {
+            format!(
+                "Dynamic Idle: {} → {} (x100 RPM)",
+                current_rpm, recommended_rpm
+            )
         }
-        DMax { axis, current_d_min, current_d_max, recommended_d_min, recommended_d_max } => {
+        DMax {
+            axis,
+            current_d_min,
+            current_d_max,
+            recommended_d_min,
+            recommended_d_max,
+        } => {
             format!(
                 "{:?} D range: {}-{} → {}-{}",
                 axis, current_d_min, current_d_max, recommended_d_min, recommended_d_max
             )
         }
-        Tpa { current_rate, current_breakpoint, recommended_rate, recommended_breakpoint } => {
+        Tpa {
+            current_rate,
+            current_breakpoint,
+            recommended_rate,
+            recommended_breakpoint,
+        } => {
             format!(
                 "TPA: {}%@{} → {}%@{}",
                 current_rate, current_breakpoint, recommended_rate, recommended_breakpoint
             )
         }
-        Feedforward { param, current, recommended } => {
+        Feedforward {
+            param,
+            current,
+            recommended,
+        } => {
             format!("Feedforward {:?}: {} → {}", param, current, recommended)
         }
-        ThrustLinearization { current, recommended } => {
+        ThrustLinearization {
+            current,
+            recommended,
+        } => {
             format!("Thrust Linearization: {} → {}", current, recommended)
         }
-        SliderHint { slider_name, current_value, suggested_value } => {
+        SliderHint {
+            slider_name,
+            current_value,
+            suggested_value,
+        } => {
             format!(
                 "Slider {}: {:.2} → {:.2}",
                 slider_name,
@@ -3028,14 +3081,26 @@ fn apply_filter_recs_to_snapshot(
             } => {
                 let v = recommended_cutoff.round().clamp(0.0, 65535.0) as u16;
                 match stage {
-                    1 => try_set!(snap.set_gyro_lpf1_hz(v), format!("gyro_lpf1_static_hz → {v} Hz")),
-                    2 => try_set!(snap.set_gyro_lpf2_hz(v), format!("gyro_lpf2_static_hz → {v} Hz")),
+                    1 => try_set!(
+                        snap.set_gyro_lpf1_hz(v),
+                        format!("gyro_lpf1_static_hz → {v} Hz")
+                    ),
+                    2 => try_set!(
+                        snap.set_gyro_lpf2_hz(v),
+                        format!("gyro_lpf2_static_hz → {v} Hz")
+                    ),
                     other => unsupported.push(format!("gyro_lpf{other} (unsupported stage)")),
                 }
                 if let Some(ft) = filter_type_to_enum(filter_type) {
                     match stage {
-                        1 => try_set!(snap.set_gyro_lpf1_type(ft), format!("gyro_lpf1_type → {filter_type}")),
-                        2 => try_set!(snap.set_gyro_lpf2_type(ft), format!("gyro_lpf2_type → {filter_type}")),
+                        1 => try_set!(
+                            snap.set_gyro_lpf1_type(ft),
+                            format!("gyro_lpf1_type → {filter_type}")
+                        ),
+                        2 => try_set!(
+                            snap.set_gyro_lpf2_type(ft),
+                            format!("gyro_lpf2_type → {filter_type}")
+                        ),
                         _ => {}
                     }
                 }
@@ -3066,8 +3131,9 @@ fn apply_filter_recs_to_snapshot(
                                 snap.set_dterm_lpf2_hz(v),
                                 format!("dterm_lpf2_static_hz → {v} Hz")
                             ),
-                            other => unsupported
-                                .push(format!("dterm_lpf{other} (unsupported stage)")),
+                            other => {
+                                unsupported.push(format!("dterm_lpf{other} (unsupported stage)"))
+                            }
                         }
                     }
                 }
@@ -3103,10 +3169,7 @@ fn apply_filter_recs_to_snapshot(
                 recommended_cutoff, ..
             } => {
                 let v = recommended_cutoff.round().clamp(0.0, 65535.0) as u16;
-                try_set!(
-                    snap.set_yaw_lpf_hz(v),
-                    format!("yaw_lowpass_hz → {v} Hz")
-                );
+                try_set!(snap.set_yaw_lpf_hz(v), format!("yaw_lowpass_hz → {v} Hz"));
             }
             AdjustDynamicNotch {
                 notch_count,
@@ -3491,7 +3554,7 @@ fn output_pretty(
 
                     // PID Values Section
                     let pid = &analysis.session.metadata.hardware.pid_config;
-                    println!("  {} PID Values:", "");
+                    println!("   PID Values:");
                     println!(
                         "    Roll:  P={:.1}, I={:.1}, D={:.1}",
                         pid.roll.p, pid.roll.i, pid.roll.d
@@ -3508,7 +3571,7 @@ fn output_pretty(
 
                     // Filter Settings Section
                     let filters = &analysis.session.metadata.hardware.filter_config;
-                    println!("  {} Filter Settings:", "");
+                    println!("   Filter Settings:");
 
                     // Gyro filters
                     if !filters.gyro_filters.is_empty() {
@@ -3565,7 +3628,7 @@ fn output_pretty(
 
                     // RC Rates Section
                     let rates = &pid.settings.rates;
-                    println!("  {} RC Rates:", "");
+                    println!("   RC Rates:");
                     println!(
                         "    Rates: R={:.1}, P={:.1}, Y={:.1}",
                         rates.roll_rate, rates.pitch_rate, rates.yaw_rate
@@ -3613,10 +3676,7 @@ fn output_pretty(
 
                 // Issues
                 if !analysis.report.detected_issues.is_empty() {
-                    println!(
-                        "  {} Issues found:",
-                        display::glyph_warn()
-                    );
+                    println!("  {} Issues found:", display::glyph_warn());
                     for issue in &analysis.report.detected_issues {
                         println!("    • {}", issue.description);
                     }
@@ -3655,7 +3715,7 @@ fn render_step_responses(responses: &[drone_tuner_core::analysis::StepResponse])
     use drone_tuner_core::domain::Axis;
 
     println!();
-    println!("  {} Step responses (top per axis):", "");
+    println!("   Step responses (top per axis):");
     for axis in [Axis::Roll, Axis::Pitch, Axis::Yaw] {
         let mut by_axis: Vec<&drone_tuner_core::analysis::StepResponse> =
             responses.iter().filter(|r| r.axis == axis).collect();

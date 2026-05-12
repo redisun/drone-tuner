@@ -6,9 +6,7 @@
 //! output and piped runs stay byte-clean.
 
 use comfy_table::presets::UTF8_FULL_CONDENSED;
-use comfy_table::{
-    Cell, CellAlignment, Color as TblColor, ContentArrangement, Table,
-};
+use comfy_table::{Cell, CellAlignment, Color as TblColor, ContentArrangement, Table};
 use console::{style, StyledObject};
 use drone_tuner_core::domain::{FilterRecommendationType, Priority};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -69,10 +67,7 @@ pub fn banner(format: &OutputFormat) {
         style(env!("CARGO_PKG_VERSION")).magenta().bold(),
         style(REPO_URL).dim(),
     );
-    eprintln!(
-        "{}",
-        style("━".repeat(85)).cyan()
-    );
+    eprintln!("{}", style("━".repeat(85)).cyan());
     eprintln!();
 }
 
@@ -148,16 +143,16 @@ pub fn quality_gauge(score: f32) -> String {
     let bar_filled: String = "█".repeat(filled);
     let bar_empty: String = "░".repeat(empty);
 
-    let (label, paint): (&str, fn(StyledObject<String>) -> StyledObject<String>) =
-        if score >= 90.0 {
-            ("EXCELLENT", |s| s.green().bold())
-        } else if score >= 80.0 {
-            ("GOOD", |s| s.green())
-        } else if score >= 60.0 {
-            ("OK", |s| s.yellow())
-        } else {
-            ("POOR", |s| s.red())
-        };
+    type Paint = fn(StyledObject<String>) -> StyledObject<String>;
+    let (label, paint): (&str, Paint) = if score >= 90.0 {
+        ("EXCELLENT", |s| s.green().bold())
+    } else if score >= 80.0 {
+        ("GOOD", |s| s.green())
+    } else if score >= 60.0 {
+        ("OK", |s| s.yellow())
+    } else {
+        ("POOR", |s| s.red())
+    };
 
     let bar = format!("{}{}", bar_filled, bar_empty);
     format!(
@@ -189,9 +184,7 @@ fn priority_cell(p: &Priority) -> Cell {
 /// Format a filter recommendation into a "Target" + "Current → New"
 /// pair of strings for table rendering. Mirrors the prose form used in
 /// the tune-flow output but split for tabular display.
-fn filter_rec_cells(
-    r: &drone_tuner_core::domain::FilterRecommendation,
-) -> (String, String) {
+fn filter_rec_cells(r: &drone_tuner_core::domain::FilterRecommendation) -> (String, String) {
     match &r.recommendation_type {
         FilterRecommendationType::AdjustGyroLowpass {
             stage,
@@ -200,10 +193,7 @@ fn filter_rec_cells(
             filter_type,
         } => (
             format!("Gyro LPF{} ({})", stage, filter_type),
-            format!(
-                "{:.0} Hz → {:.0} Hz",
-                current_cutoff, recommended_cutoff
-            ),
+            format!("{:.0} Hz → {:.0} Hz", current_cutoff, recommended_cutoff),
         ),
         FilterRecommendationType::ConfigureGyroNotch {
             notch_number,
@@ -341,32 +331,71 @@ pub fn recommendations_table_full(
     println!("{table}");
 }
 
-fn advanced_rec_cells(
-    param: &drone_tuner_core::domain::AdvancedParameter,
-) -> (String, String) {
+fn advanced_rec_cells(param: &drone_tuner_core::domain::AdvancedParameter) -> (String, String) {
     use drone_tuner_core::domain::AdvancedParameter::*;
     match param {
-        VbatSagCompensation { current, recommended } => {
-            ("Vbat Sag Comp".into(), format!("{} → {}", current, recommended))
-        }
-        DynamicIdle { current_rpm, recommended_rpm } => {
-            ("Dynamic Idle".into(), format!("{} → {} (x100 RPM)", current_rpm, recommended_rpm))
-        }
-        DMax { axis, current_d_min, current_d_max, recommended_d_min, recommended_d_max } => {
-            (format!("{:?} D Range", axis), format!("{}-{} → {}-{}", current_d_min, current_d_max, recommended_d_min, recommended_d_max))
-        }
-        Tpa { current_rate, current_breakpoint, recommended_rate, recommended_breakpoint } => {
-            ("TPA".into(), format!("{}%@{} → {}%@{}", current_rate, current_breakpoint, recommended_rate, recommended_breakpoint))
-        }
-        Feedforward { param, current, recommended } => {
-            (format!("FF {:?}", param), format!("{} → {}", current, recommended))
-        }
-        ThrustLinearization { current, recommended } => {
-            ("Thrust Linear".into(), format!("{} → {}", current, recommended))
-        }
-        SliderHint { slider_name, current_value, suggested_value } => {
-            (format!("Slider: {}", slider_name), format!("{} → {} (x0.01)", current_value, suggested_value))
-        }
+        VbatSagCompensation {
+            current,
+            recommended,
+        } => (
+            "Vbat Sag Comp".into(),
+            format!("{} → {}", current, recommended),
+        ),
+        DynamicIdle {
+            current_rpm,
+            recommended_rpm,
+        } => (
+            "Dynamic Idle".into(),
+            format!("{} → {} (x100 RPM)", current_rpm, recommended_rpm),
+        ),
+        DMax {
+            axis,
+            current_d_min,
+            current_d_max,
+            recommended_d_min,
+            recommended_d_max,
+        } => (
+            format!("{:?} D Range", axis),
+            format!(
+                "{}-{} → {}-{}",
+                current_d_min, current_d_max, recommended_d_min, recommended_d_max
+            ),
+        ),
+        Tpa {
+            current_rate,
+            current_breakpoint,
+            recommended_rate,
+            recommended_breakpoint,
+        } => (
+            "TPA".into(),
+            format!(
+                "{}%@{} → {}%@{}",
+                current_rate, current_breakpoint, recommended_rate, recommended_breakpoint
+            ),
+        ),
+        Feedforward {
+            param,
+            current,
+            recommended,
+        } => (
+            format!("FF {:?}", param),
+            format!("{} → {}", current, recommended),
+        ),
+        ThrustLinearization {
+            current,
+            recommended,
+        } => (
+            "Thrust Linear".into(),
+            format!("{} → {}", current, recommended),
+        ),
+        SliderHint {
+            slider_name,
+            current_value,
+            suggested_value,
+        } => (
+            format!("Slider: {}", slider_name),
+            format!("{} → {} (x0.01)", current_value, suggested_value),
+        ),
     }
 }
 
@@ -402,8 +431,7 @@ pub fn comparison_table(rows: &[ComparisonRow<'_>]) {
                 .fg(q_color)
                 .set_alignment(CellAlignment::Right),
             Cell::new(r.issues.to_string()).set_alignment(CellAlignment::Right),
-            Cell::new(r.recommendations.to_string())
-                .set_alignment(CellAlignment::Right),
+            Cell::new(r.recommendations.to_string()).set_alignment(CellAlignment::Right),
             Cell::new(format!("{:.1}s", r.duration_ms as f32 / 1000.0))
                 .set_alignment(CellAlignment::Right),
         ]);
@@ -476,10 +504,7 @@ pub fn info_panel(
         } else {
             ("MISSING", TblColor::Red)
         };
-        table.add_row(vec![
-            Cell::new(*name),
-            Cell::new(badge).fg(color),
-        ]);
+        table.add_row(vec![Cell::new(*name), Cell::new(badge).fg(color)]);
     }
     println!("{table}");
 }

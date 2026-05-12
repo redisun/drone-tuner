@@ -1131,8 +1131,7 @@ mod simulator_tests {
             .assert()
             .success()
             .stdout(
-                predicate::str::contains("Connected")
-                    .or(predicate::str::contains("connected:")),
+                predicate::str::contains("Connected").or(predicate::str::contains("connected:")),
             )
             .stdout(predicate::str::contains("Dry run complete"));
     }

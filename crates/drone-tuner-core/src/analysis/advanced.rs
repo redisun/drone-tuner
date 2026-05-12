@@ -371,9 +371,9 @@ impl AdvancedAnalyzer {
         // can achieve that (and scale the whole tune proportionally) by
         // bumping Master Multiplier from 100 to 110.
         if st.master_multiplier == Some(100) {
-            let has_p_increase = pid_recs.iter().any(|r| {
-                r.term == PidTerm::P && r.recommended_value > r.current_value
-            });
+            let has_p_increase = pid_recs
+                .iter()
+                .any(|r| r.term == PidTerm::P && r.recommended_value > r.current_value);
             if has_p_increase {
                 recs.push(AdvancedRecommendation {
                     parameter: AdvancedParameter::SliderHint {
@@ -395,9 +395,9 @@ impl AdvancedAnalyzer {
         // --- D gain slider at default (100) and PID analysis detected
         //     slow settling (D increase recommended) ---
         if st.d_gain == Some(100) {
-            let has_d_increase = pid_recs.iter().any(|r| {
-                r.term == PidTerm::D && r.recommended_value > r.current_value
-            });
+            let has_d_increase = pid_recs
+                .iter()
+                .any(|r| r.term == PidTerm::D && r.recommended_value > r.current_value);
             if has_d_increase {
                 recs.push(AdvancedRecommendation {
                     parameter: AdvancedParameter::SliderHint {
@@ -562,12 +562,11 @@ mod tests {
         let tel = empty_telemetry();
         let recs = AdvancedAnalyzer::new().analyze(&hw, &tel, &[]);
 
-        let vbat = recs.iter().find(|r| {
-            matches!(r.parameter, AdvancedParameter::VbatSagCompensation { .. })
-        });
+        let vbat = recs
+            .iter()
+            .find(|r| matches!(r.parameter, AdvancedParameter::VbatSagCompensation { .. }));
         assert!(vbat.is_some(), "should recommend vbat sag comp");
-        if let AdvancedParameter::VbatSagCompensation { recommended, .. } =
-            vbat.unwrap().parameter
+        if let AdvancedParameter::VbatSagCompensation { recommended, .. } = vbat.unwrap().parameter
         {
             assert_eq!(recommended, 100);
         }
@@ -638,7 +637,10 @@ mod tests {
             .iter()
             .find(|r| matches!(r.parameter, AdvancedParameter::DynamicIdle { .. }));
         assert!(idle.is_some(), "should recommend dynamic idle");
-        if let AdvancedParameter::DynamicIdle { recommended_rpm, .. } = idle.unwrap().parameter {
+        if let AdvancedParameter::DynamicIdle {
+            recommended_rpm, ..
+        } = idle.unwrap().parameter
+        {
             assert_eq!(recommended_rpm, 30);
         }
     }
@@ -736,7 +738,11 @@ mod tests {
             .iter()
             .filter(|r| matches!(r.parameter, AdvancedParameter::DMax { .. }))
             .collect();
-        assert_eq!(d_max_recs.len(), 2, "should recommend for both roll and pitch");
+        assert_eq!(
+            d_max_recs.len(),
+            2,
+            "should recommend for both roll and pitch"
+        );
 
         // Verify recommended d_min is ~65% of D.
         for rec in &d_max_recs {
@@ -1192,7 +1198,12 @@ mod tests {
 
     // ---------- simplified tuning sliders ----------
 
-    fn make_pid_rec(axis: Axis, term: PidTerm, current: f32, recommended: f32) -> PidRecommendation {
+    fn make_pid_rec(
+        axis: Axis,
+        term: PidTerm,
+        current: f32,
+        recommended: f32,
+    ) -> PidRecommendation {
         PidRecommendation {
             axis,
             term,
@@ -1221,8 +1232,16 @@ mod tests {
             &r.parameter,
             AdvancedParameter::SliderHint { slider_name, .. } if slider_name == "Master Multiplier"
         ));
-        assert!(slider.is_some(), "should hint Master Multiplier when P increase recommended");
-        if let AdvancedParameter::SliderHint { current_value, suggested_value, .. } = &slider.unwrap().parameter {
+        assert!(
+            slider.is_some(),
+            "should hint Master Multiplier when P increase recommended"
+        );
+        if let AdvancedParameter::SliderHint {
+            current_value,
+            suggested_value,
+            ..
+        } = &slider.unwrap().parameter
+        {
             assert_eq!(*current_value, 100);
             assert_eq!(*suggested_value, 110);
         }
@@ -1242,12 +1261,22 @@ mod tests {
         let pid_recs = vec![make_pid_rec(Axis::Roll, PidTerm::D, 38.0, 44.0)];
         let recs = AdvancedAnalyzer::new().analyze(&hw, &tel, &pid_recs);
 
-        let slider = recs.iter().find(|r| matches!(
-            &r.parameter,
-            AdvancedParameter::SliderHint { slider_name, .. } if slider_name == "D Gain"
-        ));
-        assert!(slider.is_some(), "should hint D Gain when D increase recommended");
-        if let AdvancedParameter::SliderHint { current_value, suggested_value, .. } = &slider.unwrap().parameter {
+        let slider = recs.iter().find(|r| {
+            matches!(
+                &r.parameter,
+                AdvancedParameter::SliderHint { slider_name, .. } if slider_name == "D Gain"
+            )
+        });
+        assert!(
+            slider.is_some(),
+            "should hint D Gain when D increase recommended"
+        );
+        if let AdvancedParameter::SliderHint {
+            current_value,
+            suggested_value,
+            ..
+        } = &slider.unwrap().parameter
+        {
             assert_eq!(*current_value, 100);
             assert_eq!(*suggested_value, 110);
         }
@@ -1271,7 +1300,9 @@ mod tests {
         let recs = AdvancedAnalyzer::new().analyze(&hw, &tel, &pid_recs);
 
         assert!(
-            !recs.iter().any(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. })),
+            !recs
+                .iter()
+                .any(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. })),
             "mode 0 => no slider hints"
         );
     }
@@ -1318,7 +1349,9 @@ mod tests {
         let recs = AdvancedAnalyzer::new().analyze(&hw, &tel, &pid_recs);
 
         assert!(
-            !recs.iter().any(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. })),
+            !recs
+                .iter()
+                .any(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. })),
             "sliders already bumped => no hints"
         );
     }
@@ -1334,7 +1367,9 @@ mod tests {
         let recs = AdvancedAnalyzer::new().analyze(&hw, &tel, &pid_recs);
 
         assert!(
-            !recs.iter().any(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. })),
+            !recs
+                .iter()
+                .any(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. })),
             "no simplified_tuning => no slider hints"
         );
     }
@@ -1356,7 +1391,13 @@ mod tests {
         ];
         let recs = AdvancedAnalyzer::new().analyze(&hw, &tel, &pid_recs);
 
-        let slider_count = recs.iter().filter(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. })).count();
-        assert_eq!(slider_count, 2, "both Master Multiplier and D Gain hints should fire");
+        let slider_count = recs
+            .iter()
+            .filter(|r| matches!(r.parameter, AdvancedParameter::SliderHint { .. }))
+            .count();
+        assert_eq!(
+            slider_count, 2,
+            "both Master Multiplier and D Gain hints should fire"
+        );
     }
 }

@@ -19,9 +19,9 @@ pub use pid::{clamp_recs_to_baseline, PidAnalyzerConfig, StepResponse, BASELINE_
 
 pub(crate) use oscillation::{DetectedOscillation, OscillationSeverity, OscillationType};
 
-use advanced::AdvancedAnalyzer;
 use crate::domain::*;
 use crate::error::{DronetunerError, Result};
+use advanced::AdvancedAnalyzer;
 use filter_optimizer::FilterOptimizer;
 use num_complex::Complex;
 use oscillation::OscillationDetector;
@@ -211,9 +211,11 @@ impl AnalysisEngine {
         );
 
         // Stage 4.5: Advanced parameter analysis
-        let advanced_recommendations = self
-            .advanced_analyzer
-            .analyze(&session.metadata.hardware, &session.telemetry, &pid_outcome.recommendations);
+        let advanced_recommendations = self.advanced_analyzer.analyze(
+            &session.metadata.hardware,
+            &session.telemetry,
+            &pid_outcome.recommendations,
+        );
         tracing::debug!(
             "Generated {} advanced recommendations",
             advanced_recommendations.len()

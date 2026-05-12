@@ -27,12 +27,8 @@ use std::path::PathBuf;
 pub fn data_root() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-        })
-        .context(
-            "Cannot resolve a data directory: neither $XDG_DATA_HOME nor $HOME is set",
-        )?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+        .context("Cannot resolve a data directory: neither $XDG_DATA_HOME nor $HOME is set")?;
     Ok(base.join("drone-tuner"))
 }
 

@@ -259,7 +259,11 @@ mod tests {
             change(Axis::Roll, PidTerm::D, 3),
         ];
         let out = apply_convergence_suppression(recs, &history, DEFAULT_MIN_REPEATED);
-        assert_eq!(out.kept.len(), 1, "opposite-direction recovery rec must survive");
+        assert_eq!(
+            out.kept.len(),
+            1,
+            "opposite-direction recovery rec must survive"
+        );
         assert!(out.suppressed.is_empty());
     }
 
@@ -318,7 +322,10 @@ mod tests {
             change(Axis::Roll, PidTerm::D, 3),
         ];
         let out = apply_convergence_suppression(recs, &history, DEFAULT_MIN_REPEATED);
-        assert!(out.kept.is_empty(), "zero deltas must not break the detector");
+        assert!(
+            out.kept.is_empty(),
+            "zero deltas must not break the detector"
+        );
         assert_eq!(out.suppressed.len(), 1);
     }
 
@@ -333,7 +340,11 @@ mod tests {
             change(Axis::Roll, PidTerm::D, 3),
         ];
         let out = apply_convergence_suppression(recs, &history, DEFAULT_MIN_REPEATED);
-        assert_eq!(out.kept.len(), 1, "round-to-zero recs aren't convergence concerns");
+        assert_eq!(
+            out.kept.len(),
+            1,
+            "round-to-zero recs aren't convergence concerns"
+        );
         assert!(out.suppressed.is_empty());
     }
 

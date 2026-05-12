@@ -836,8 +836,14 @@ pub struct AdvancedRecommendation {
 /// The specific advanced parameter change being recommended.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdvancedParameter {
-    VbatSagCompensation { current: u8, recommended: u8 },
-    DynamicIdle { current_rpm: u8, recommended_rpm: u8 },
+    VbatSagCompensation {
+        current: u8,
+        recommended: u8,
+    },
+    DynamicIdle {
+        current_rpm: u8,
+        recommended_rpm: u8,
+    },
     DMax {
         axis: Axis,
         current_d_min: u8,
@@ -856,7 +862,10 @@ pub enum AdvancedParameter {
         current: u8,
         recommended: u8,
     },
-    ThrustLinearization { current: u8, recommended: u8 },
+    ThrustLinearization {
+        current: u8,
+        recommended: u8,
+    },
     SliderHint {
         slider_name: String,
         current_value: u16,

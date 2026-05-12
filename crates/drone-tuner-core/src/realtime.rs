@@ -1057,9 +1057,7 @@ impl FlightControllerConnection {
     /// the next call to [`Self::read_dataflash_summary`] to report
     /// `used_size = 0` if you need to confirm completion.
     pub async fn erase_dataflash(&mut self) -> Result<()> {
-        let request = self
-            .msp
-            .create_message(MspCommand::DataflashErase, &[])?;
+        let request = self.msp.create_message(MspCommand::DataflashErase, &[])?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
         let _ack = self.read_msp_response().await?;
@@ -1072,9 +1070,7 @@ impl FlightControllerConnection {
     /// are currently used by recorded blackbox sessions, and how big the
     /// chip is. SD-card-only boards return `supported = false`.
     pub async fn read_dataflash_summary(&mut self) -> Result<DataflashSummary> {
-        let request = self
-            .msp
-            .create_message(MspCommand::DataflashSummary, &[])?;
+        let request = self.msp.create_message(MspCommand::DataflashSummary, &[])?;
         self.transport.write(&request).await?;
         self.transport.flush().await?;
         for _ in 0..8 {
@@ -1150,8 +1146,7 @@ impl FlightControllerConnection {
                 None,
             ));
         }
-        let echoed =
-            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let echoed = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         Ok((echoed, payload[4..].to_vec()))
     }
 
@@ -1180,8 +1175,7 @@ impl FlightControllerConnection {
                 None,
             ));
         }
-        let echoed =
-            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let echoed = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let read_len = u16::from_le_bytes([payload[4], payload[5]]) as usize;
         // payload[6] is the compression flag; the firmware only uses
         // it when USE_HUFFMAN is defined AND we requested compression
@@ -1256,20 +1250,18 @@ impl FlightControllerConnection {
         let mut acc: Vec<u8> = Vec::with_capacity(256);
         let mut tmp = [0u8; 256];
         for _ in 0..32 {
-            let n = match tokio::time::timeout(
-                Duration::from_secs(2),
-                self.transport.read(&mut tmp),
-            )
-            .await
-            {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(DronetunerError::communication_error(
-                        "Timed out waiting for MSPv2 response bytes",
-                    ));
-                }
-            };
+            let n =
+                match tokio::time::timeout(Duration::from_secs(2), self.transport.read(&mut tmp))
+                    .await
+                {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        return Err(DronetunerError::communication_error(
+                            "Timed out waiting for MSPv2 response bytes",
+                        ));
+                    }
+                };
             if n == 0 && acc.is_empty() {
                 return Err(DronetunerError::communication_error(
                     "No MSPv2 response received",
@@ -1309,8 +1301,7 @@ impl FlightControllerConnection {
                         if acc.len() < 8 {
                             break; // need full V2 header (8 bytes)
                         }
-                        let payload_size =
-                            u16::from_le_bytes([acc[6], acc[7]]) as usize;
+                        let payload_size = u16::from_le_bytes([acc[6], acc[7]]) as usize;
                         // Header(8) + payload + CRC(1) = 9 + payload_size.
                         let frame_len = 9 + payload_size;
                         if acc.len() < frame_len {
@@ -1331,7 +1322,8 @@ impl FlightControllerConnection {
                             let detail = if response.payload.is_empty() {
                                 "no payload (likely: unknown setting name, \
                                  value out of range, or setting not writable \
-                                 in current FC state)".to_string()
+                                 in current FC state)"
+                                    .to_string()
                             } else {
                                 format!(
                                     "payload {} bytes: {:02x?}",
@@ -1364,10 +1356,7 @@ impl FlightControllerConnection {
     /// FC returns an empty chunk.
     ///
     /// Errors if the FC reports `supported = false` or `used_size == 0`.
-    pub async fn pull_dataflash<F: FnMut(u64, u64)>(
-        &mut self,
-        mut progress: F,
-    ) -> Result<Vec<u8>> {
+    pub async fn pull_dataflash<F: FnMut(u64, u64)>(&mut self, mut progress: F) -> Result<Vec<u8>> {
         self.pull_dataflash_with(progress_to_callback(&mut progress), 1024)
             .await
     }
@@ -1527,8 +1516,7 @@ impl DataflashSummary {
         }
         let flags = payload[0];
         let sectors = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-        let total_size =
-            u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+        let total_size = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
         let used_size = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
         Ok(Self {
             ready: flags & 0x01 != 0,
@@ -1783,22 +1771,38 @@ impl FilterSnapshot {
             .unwrap_or_else(|| self.read_u8(OFF_GYRO_LPF1_LEGACY_U8).unwrap_or(0) as u16)
     }
     /// Gyro stage-2 lowpass cutoff in Hz (0 = disabled).
-    pub fn gyro_lpf2_hz(&self) -> Option<u16> { self.read_u16(OFF_GYRO_LPF2_HZ) }
+    pub fn gyro_lpf2_hz(&self) -> Option<u16> {
+        self.read_u16(OFF_GYRO_LPF2_HZ)
+    }
     /// D-term stage-1 lowpass cutoff in Hz (0 = disabled).
-    pub fn dterm_lpf1_hz(&self) -> u16 { self.read_u16(OFF_DTERM_LPF1_HZ).unwrap_or(0) }
+    pub fn dterm_lpf1_hz(&self) -> u16 {
+        self.read_u16(OFF_DTERM_LPF1_HZ).unwrap_or(0)
+    }
     /// D-term stage-2 lowpass cutoff in Hz.
-    pub fn dterm_lpf2_hz(&self) -> Option<u16> { self.read_u16(OFF_DTERM_LPF2_HZ) }
+    pub fn dterm_lpf2_hz(&self) -> Option<u16> {
+        self.read_u16(OFF_DTERM_LPF2_HZ)
+    }
     /// Yaw lowpass cutoff in Hz (0 = disabled).
-    pub fn yaw_lpf_hz(&self) -> u16 { self.read_u16(OFF_YAW_LPF_HZ).unwrap_or(0) }
+    pub fn yaw_lpf_hz(&self) -> u16 {
+        self.read_u16(OFF_YAW_LPF_HZ).unwrap_or(0)
+    }
     /// Dynamic notch count (number of running notches). `None` when
     /// the FC's payload is too short to include this field.
-    pub fn dyn_notch_count(&self) -> Option<u8> { self.read_u8(OFF_DYN_NOTCH_COUNT) }
+    pub fn dyn_notch_count(&self) -> Option<u8> {
+        self.read_u8(OFF_DYN_NOTCH_COUNT)
+    }
     /// Dynamic notch Q-factor. `None` when payload too short.
-    pub fn dyn_notch_q(&self) -> Option<u16> { self.read_u16(OFF_DYN_NOTCH_Q) }
+    pub fn dyn_notch_q(&self) -> Option<u16> {
+        self.read_u16(OFF_DYN_NOTCH_Q)
+    }
     /// Lower bound of the dynamic-notch tracking range, Hz.
-    pub fn dyn_notch_min_hz(&self) -> Option<u16> { self.read_u16(OFF_DYN_NOTCH_MIN_HZ) }
+    pub fn dyn_notch_min_hz(&self) -> Option<u16> {
+        self.read_u16(OFF_DYN_NOTCH_MIN_HZ)
+    }
     /// Upper bound of the dynamic-notch tracking range, Hz.
-    pub fn dyn_notch_max_hz(&self) -> Option<u16> { self.read_u16(OFF_DYN_NOTCH_MAX_HZ) }
+    pub fn dyn_notch_max_hz(&self) -> Option<u16> {
+        self.read_u16(OFF_DYN_NOTCH_MAX_HZ)
+    }
 
     // -------- typed setters --------
     //
@@ -1989,50 +1993,92 @@ impl PidAdvancedSnapshot {
     // ---- read accessors ----
 
     /// D_min for roll axis.
-    pub fn d_min_roll(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_ROLL) }
+    pub fn d_min_roll(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_D_MIN_ROLL)
+    }
     /// D_min for pitch axis.
-    pub fn d_min_pitch(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_PITCH) }
+    pub fn d_min_pitch(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_D_MIN_PITCH)
+    }
     /// D_min for yaw axis.
-    pub fn d_min_yaw(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_YAW) }
+    pub fn d_min_yaw(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_D_MIN_YAW)
+    }
     /// D_min gain (controls how quickly D rises toward D_max).
-    pub fn d_min_gain(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_GAIN) }
+    pub fn d_min_gain(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_D_MIN_GAIN)
+    }
     /// D_min advance (phase lead for D_max calculation).
-    pub fn d_min_advance(&self) -> Option<u8> { self.read_u8(Self::OFF_D_MIN_ADVANCE) }
+    pub fn d_min_advance(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_D_MIN_ADVANCE)
+    }
     /// Feedforward transition.
-    pub fn ff_transition(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_TRANSITION) }
+    pub fn ff_transition(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_FF_TRANSITION)
+    }
     /// Feedforward averaging mode.
-    pub fn ff_averaging(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_AVERAGING) }
+    pub fn ff_averaging(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_FF_AVERAGING)
+    }
     /// Feedforward smooth factor.
-    pub fn ff_smooth_factor(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_SMOOTH_FACTOR) }
+    pub fn ff_smooth_factor(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_FF_SMOOTH_FACTOR)
+    }
     /// Feedforward jitter factor.
-    pub fn ff_jitter_factor(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_JITTER_FACTOR) }
+    pub fn ff_jitter_factor(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_FF_JITTER_FACTOR)
+    }
     /// Feedforward boost.
-    pub fn ff_boost(&self) -> Option<u8> { self.read_u8(Self::OFF_FF_BOOST) }
+    pub fn ff_boost(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_FF_BOOST)
+    }
     /// Vbat sag compensation (0=off, 100=full).
-    pub fn vbat_sag_compensation(&self) -> Option<u8> { self.read_u8(Self::OFF_VBAT_SAG_COMPENSATION) }
+    pub fn vbat_sag_compensation(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_VBAT_SAG_COMPENSATION)
+    }
     /// Thrust linearization (0=off).
-    pub fn thrust_linearization(&self) -> Option<u8> { self.read_u8(Self::OFF_THRUST_LINEARIZATION) }
+    pub fn thrust_linearization(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_THRUST_LINEARIZATION)
+    }
     /// Dynamic idle minimum RPM (0=off, units = RPM/100).
-    pub fn idle_min_rpm(&self) -> Option<u8> { self.read_u8(Self::OFF_IDLE_MIN_RPM) }
+    pub fn idle_min_rpm(&self) -> Option<u8> {
+        self.read_u8(Self::OFF_IDLE_MIN_RPM)
+    }
 
     // ---- write accessors ----
 
     /// Set D_min for roll.
-    pub fn set_d_min_roll(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_D_MIN_ROLL, v, "d_min_roll") }
+    pub fn set_d_min_roll(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_D_MIN_ROLL, v, "d_min_roll")
+    }
     /// Set D_min for pitch.
-    pub fn set_d_min_pitch(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_D_MIN_PITCH, v, "d_min_pitch") }
+    pub fn set_d_min_pitch(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_D_MIN_PITCH, v, "d_min_pitch")
+    }
     /// Set D_min gain.
-    pub fn set_d_min_gain(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_D_MIN_GAIN, v, "d_min_gain") }
+    pub fn set_d_min_gain(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_D_MIN_GAIN, v, "d_min_gain")
+    }
     /// Set feedforward jitter factor.
-    pub fn set_ff_jitter_factor(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_FF_JITTER_FACTOR, v, "feedforward_jitter_factor") }
+    pub fn set_ff_jitter_factor(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_FF_JITTER_FACTOR, v, "feedforward_jitter_factor")
+    }
     /// Set feedforward boost.
-    pub fn set_ff_boost(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_FF_BOOST, v, "feedforward_boost") }
+    pub fn set_ff_boost(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_FF_BOOST, v, "feedforward_boost")
+    }
     /// Set vbat sag compensation.
-    pub fn set_vbat_sag_compensation(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_VBAT_SAG_COMPENSATION, v, "vbat_sag_compensation") }
+    pub fn set_vbat_sag_compensation(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_VBAT_SAG_COMPENSATION, v, "vbat_sag_compensation")
+    }
     /// Set thrust linearization.
-    pub fn set_thrust_linearization(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_THRUST_LINEARIZATION, v, "thrust_linearization") }
+    pub fn set_thrust_linearization(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_THRUST_LINEARIZATION, v, "thrust_linearization")
+    }
     /// Set dynamic idle minimum RPM.
-    pub fn set_idle_min_rpm(&mut self, v: u8) -> Result<()> { self.write_u8(Self::OFF_IDLE_MIN_RPM, v, "idle_min_rpm") }
+    pub fn set_idle_min_rpm(&mut self, v: u8) -> Result<()> {
+        self.write_u8(Self::OFF_IDLE_MIN_RPM, v, "idle_min_rpm")
+    }
 }
 
 /// Opaque snapshot of `MSP_RC_TUNING` (cmd 111). Carries rates (R/P/Y),
@@ -3297,9 +3343,15 @@ mod tests {
         let stored = state.lock().unwrap().filter_config.clone();
         // 4.5 layout: gyro_lpf1 at offset 20-21 (legacy mirror at byte 0),
         // dterm_lpf1 at offset 1-2.
-        assert_eq!(&stored[OFF_GYRO_LPF1_HZ..OFF_GYRO_LPF1_HZ + 2], &150u16.to_le_bytes());
+        assert_eq!(
+            &stored[OFF_GYRO_LPF1_HZ..OFF_GYRO_LPF1_HZ + 2],
+            &150u16.to_le_bytes()
+        );
         assert_eq!(stored[OFF_GYRO_LPF1_LEGACY_U8], 150u8);
-        assert_eq!(&stored[OFF_DTERM_LPF1_HZ..OFF_DTERM_LPF1_HZ + 2], &125u16.to_le_bytes());
+        assert_eq!(
+            &stored[OFF_DTERM_LPF1_HZ..OFF_DTERM_LPF1_HZ + 2],
+            &125u16.to_le_bytes()
+        );
 
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
@@ -3343,7 +3395,9 @@ mod tests {
 
     #[test]
     fn test_pid_advanced_snapshot_round_trip_bytes() {
-        let raw: Vec<u8> = (0u8..49).map(|i| i.wrapping_mul(7).wrapping_add(11)).collect();
+        let raw: Vec<u8> = (0u8..49)
+            .map(|i| i.wrapping_mul(7).wrapping_add(11))
+            .collect();
         let snap = PidAdvancedSnapshot::from_payload(raw.clone()).unwrap();
         assert_eq!(snap.as_payload(), raw.as_slice());
         assert_eq!(snap.payload_len(), raw.len());
@@ -3358,7 +3412,9 @@ mod tests {
 
     #[test]
     fn test_rc_tuning_snapshot_round_trip_bytes() {
-        let raw: Vec<u8> = (0u8..30).map(|i| i.wrapping_mul(13).wrapping_add(3)).collect();
+        let raw: Vec<u8> = (0u8..30)
+            .map(|i| i.wrapping_mul(13).wrapping_add(3))
+            .collect();
         let snap = RcTuningSnapshot::from_payload(raw.clone()).unwrap();
         assert_eq!(snap.as_payload(), raw.as_slice());
         assert_eq!(snap.payload_len(), raw.len());
@@ -3373,7 +3429,9 @@ mod tests {
 
     #[test]
     fn test_advanced_config_snapshot_round_trip_bytes() {
-        let raw: Vec<u8> = (0u8..21).map(|i| i.wrapping_mul(17).wrapping_add(5)).collect();
+        let raw: Vec<u8> = (0u8..21)
+            .map(|i| i.wrapping_mul(17).wrapping_add(5))
+            .collect();
         let snap = AdvancedConfigSnapshot::from_payload(raw.clone()).unwrap();
         assert_eq!(snap.as_payload(), raw.as_slice());
         assert_eq!(snap.payload_len(), raw.len());
@@ -3704,9 +3762,18 @@ mod tests {
         let stored = state.lock().unwrap().filter_config.clone();
         // Mutated bytes
         assert_eq!(stored[OFF_DYN_NOTCH_COUNT], 1);
-        assert_eq!(&stored[OFF_DYN_NOTCH_MIN_HZ..OFF_DYN_NOTCH_MIN_HZ + 2], &80u16.to_le_bytes());
-        assert_eq!(&stored[OFF_DYN_NOTCH_MAX_HZ..OFF_DYN_NOTCH_MAX_HZ + 2], &550u16.to_le_bytes());
-        assert_eq!(&stored[OFF_GYRO_LPF1_HZ..OFF_GYRO_LPF1_HZ + 2], &180u16.to_le_bytes());
+        assert_eq!(
+            &stored[OFF_DYN_NOTCH_MIN_HZ..OFF_DYN_NOTCH_MIN_HZ + 2],
+            &80u16.to_le_bytes()
+        );
+        assert_eq!(
+            &stored[OFF_DYN_NOTCH_MAX_HZ..OFF_DYN_NOTCH_MAX_HZ + 2],
+            &550u16.to_le_bytes()
+        );
+        assert_eq!(
+            &stored[OFF_GYRO_LPF1_HZ..OFF_GYRO_LPF1_HZ + 2],
+            &180u16.to_le_bytes()
+        );
         // Legacy mirror at byte 0 follows
         assert_eq!(stored[OFF_GYRO_LPF1_LEGACY_U8], 180u8);
         // Deprecated padding round-trips verbatim from the seeded default
@@ -3714,8 +3781,14 @@ mod tests {
         assert_eq!(stored[37], 0);
         assert_eq!(stored[38], 0);
         // Unchanged seed values preserved
-        assert_eq!(&stored[OFF_DTERM_LPF1_HZ..OFF_DTERM_LPF1_HZ + 2], &150u16.to_le_bytes());
-        assert_eq!(&stored[OFF_YAW_LPF_HZ..OFF_YAW_LPF_HZ + 2], &100u16.to_le_bytes());
+        assert_eq!(
+            &stored[OFF_DTERM_LPF1_HZ..OFF_DTERM_LPF1_HZ + 2],
+            &150u16.to_le_bytes()
+        );
+        assert_eq!(
+            &stored[OFF_YAW_LPF_HZ..OFF_YAW_LPF_HZ + 2],
+            &100u16.to_le_bytes()
+        );
 
         drop(conn);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
@@ -3756,7 +3829,11 @@ mod tests {
         for off in [18, 19, 37, 38] {
             assert_eq!(raw[off], 0xAB, "byte {off} must round-trip verbatim");
         }
-        assert_eq!(&raw[5..7], &123u16.to_le_bytes(), "static notch hz preserved");
+        assert_eq!(
+            &raw[5..7],
+            &123u16.to_le_bytes(),
+            "static notch hz preserved"
+        );
         assert_eq!(raw[OFF_DYN_NOTCH_COUNT], 2, "intended mutation lands");
     }
 
@@ -3899,7 +3976,10 @@ mod tests {
         state.lock().unwrap().corrupt_next_setpid_storage = Some(corrupt);
 
         let result = conn.apply_pid_with_rollback(&new_pid).await;
-        assert!(result.is_err(), "readback verify must catch silent corruption");
+        assert!(
+            result.is_err(),
+            "readback verify must catch silent corruption"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("verification failed"),

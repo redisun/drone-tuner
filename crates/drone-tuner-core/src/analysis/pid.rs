@@ -1350,7 +1350,10 @@ mod band_routing_tests {
     fn classifier_partitions_known_frequencies() {
         // Sanity-check the band edges so the regression below has a stable foundation.
         assert_eq!(classify_oscillation_band(2.0), OscillationBand::Subharmonic);
-        assert_eq!(classify_oscillation_band(4.99), OscillationBand::Subharmonic);
+        assert_eq!(
+            classify_oscillation_band(4.99),
+            OscillationBand::Subharmonic
+        );
         assert_eq!(classify_oscillation_band(5.0), OscillationBand::PTooHigh);
         assert_eq!(classify_oscillation_band(11.9), OscillationBand::PTooHigh);
         assert_eq!(classify_oscillation_band(15.0), OscillationBand::Ambiguous);
@@ -1360,7 +1363,10 @@ mod band_routing_tests {
         assert_eq!(classify_oscillation_band(80.0), OscillationBand::Noise);
         assert_eq!(classify_oscillation_band(150.0), OscillationBand::Noise);
         // NaN is treated as subharmonic — we never want a NaN-driven recommendation.
-        assert_eq!(classify_oscillation_band(f32::NAN), OscillationBand::Subharmonic);
+        assert_eq!(
+            classify_oscillation_band(f32::NAN),
+            OscillationBand::Subharmonic
+        );
     }
 
     fn make_response(axis: Axis, freq_hz: f32, damping: f32) -> StepResponse {
@@ -1371,7 +1377,7 @@ mod band_routing_tests {
             rise_time: 0.05,
             settling_time: 0.20,
             overshoot_percent: 8.0, // below overshoot_tolerance so the P-cut from
-                                    // overshoot path doesn't fire and steal credit
+            // overshoot path doesn't fire and steal credit
             oscillation_frequency: freq_hz,
             damping_ratio: damping,
             steady_state_error_dps: None,
@@ -1658,8 +1664,11 @@ mod band_routing_tests {
         let out = collapse_recs_per_axis(recs);
         assert_eq!(out.len(), 3, "Each axis collapses independently");
         let axes: Vec<_> = out.iter().map(|r| r.axis.clone()).collect();
-        assert_eq!(axes, vec![Axis::Roll, Axis::Pitch, Axis::Yaw],
-                   "Output stably ordered Roll → Pitch → Yaw");
+        assert_eq!(
+            axes,
+            vec![Axis::Roll, Axis::Pitch, Axis::Yaw],
+            "Output stably ordered Roll → Pitch → Yaw"
+        );
     }
 
     #[test]
@@ -1672,7 +1681,11 @@ mod band_routing_tests {
         ];
         let out = collapse_recs_per_axis(recs);
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].term, PidTerm::I), "High-priority I-bump must win, got {:?}", out[0]);
+        assert!(
+            matches!(out[0].term, PidTerm::I),
+            "High-priority I-bump must win, got {:?}",
+            out[0]
+        );
     }
 
     #[test]
@@ -1684,8 +1697,10 @@ mod band_routing_tests {
         ];
         let out = collapse_recs_per_axis(recs);
         assert_eq!(out.len(), 1);
-        assert!(out[0].recommended_value < out[0].current_value,
-                "Cut must beat bump at same priority");
+        assert!(
+            out[0].recommended_value < out[0].current_value,
+            "Cut must beat bump at same priority"
+        );
     }
 
     #[test]
@@ -1698,7 +1713,11 @@ mod band_routing_tests {
         ];
         let out = collapse_recs_per_axis(recs);
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].term, PidTerm::P), "P must beat D and I on full tie, got {:?}", out[0]);
+        assert!(
+            matches!(out[0].term, PidTerm::P),
+            "P must beat D and I on full tie, got {:?}",
+            out[0]
+        );
 
         // Without the P entry, D should win over I.
         let recs = vec![
@@ -1706,7 +1725,11 @@ mod band_routing_tests {
             make_rec(Axis::Roll, PidTerm::D, 30.0, 27.0, Priority::Medium),
         ];
         let out = collapse_recs_per_axis(recs);
-        assert!(matches!(out[0].term, PidTerm::D), "D must beat I on tie, got {:?}", out[0]);
+        assert!(
+            matches!(out[0].term, PidTerm::D),
+            "D must beat I on tie, got {:?}",
+            out[0]
+        );
     }
 
     #[test]
@@ -1717,7 +1740,10 @@ mod band_routing_tests {
         ];
         let out = collapse_recs_per_axis(recs);
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].priority, Priority::Critical), "Critical must beat High");
+        assert!(
+            matches!(out[0].priority, Priority::Critical),
+            "Critical must beat High"
+        );
     }
 
     #[test]
@@ -1742,8 +1768,10 @@ mod band_routing_tests {
         ];
         let out = collapse_recs_per_axis(recs);
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].term, PidTerm::P),
-                "P-cut should win over I-bump at same priority (cut > bump)");
+        assert!(
+            matches!(out[0].term, PidTerm::P),
+            "P-cut should win over I-bump at same priority (cut > bump)"
+        );
     }
 
     // ---------- baseline-anchored bound tests (Item 4) ----------
@@ -1751,7 +1779,13 @@ mod band_routing_tests {
     #[test]
     fn clamp_passes_through_when_within_bounds() {
         // Baseline P=50, current=50, recommended=46 (8% cut). Inside ±15%.
-        let recs = vec![make_rec(Axis::Roll, PidTerm::P, 50.0, 46.0, Priority::Medium)];
+        let recs = vec![make_rec(
+            Axis::Roll,
+            PidTerm::P,
+            50.0,
+            46.0,
+            Priority::Medium,
+        )];
         let baseline = pid_cfg(50.0, 80.0, 30.0);
         let out = clamp_recs_to_baseline(recs, &baseline);
         assert_eq!(out.len(), 1);
@@ -1767,9 +1801,15 @@ mod band_routing_tests {
         let out = clamp_recs_to_baseline(recs, &baseline);
         assert_eq!(out.len(), 1);
         let expected = 47.0 * (1.0 - BASELINE_BOUND_PCT);
-        assert!((out[0].recommended_value - expected).abs() < 1e-3,
-                "expected {expected:.2}, got {}", out[0].recommended_value);
-        assert!(out[0].reason.contains("clamped"), "clamp note must annotate the rec");
+        assert!(
+            (out[0].recommended_value - expected).abs() < 1e-3,
+            "expected {expected:.2}, got {}",
+            out[0].recommended_value
+        );
+        assert!(
+            out[0].reason.contains("clamped"),
+            "clamp note must annotate the rec"
+        );
     }
 
     #[test]
@@ -1777,12 +1817,20 @@ mod band_routing_tests {
         // Real-world MEDIUM FUCKER recovery: baseline P=47, current=33
         // (already drifted), recommended=37 (moving toward baseline).
         // The envelope expands to enclose current, so 37 must be allowed.
-        let recs = vec![make_rec(Axis::Roll, PidTerm::P, 33.0, 37.0, Priority::Medium)];
+        let recs = vec![make_rec(
+            Axis::Roll,
+            PidTerm::P,
+            33.0,
+            37.0,
+            Priority::Medium,
+        )];
         let baseline = pid_cfg(47.0, 75.0, 28.0);
         let out = clamp_recs_to_baseline(recs, &baseline);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].recommended_value, 37.0,
-                   "recovery moves toward baseline must be allowed unchanged");
+        assert_eq!(
+            out[0].recommended_value, 37.0,
+            "recovery moves toward baseline must be allowed unchanged"
+        );
     }
 
     #[test]
@@ -1790,11 +1838,20 @@ mod band_routing_tests {
         // Baseline P=47, current=33 (already low), recommended=28
         // (further reduction). Clamping toward baseline would reverse
         // the rec's intent, so the rec must be dropped entirely.
-        let recs = vec![make_rec(Axis::Roll, PidTerm::P, 33.0, 28.0, Priority::Medium)];
+        let recs = vec![make_rec(
+            Axis::Roll,
+            PidTerm::P,
+            33.0,
+            28.0,
+            Priority::Medium,
+        )];
         let baseline = pid_cfg(47.0, 75.0, 28.0);
         let out = clamp_recs_to_baseline(recs, &baseline);
-        assert!(out.is_empty(),
-                "rec that drifts further from baseline must be dropped, got {:?}", out);
+        assert!(
+            out.is_empty(),
+            "rec that drifts further from baseline must be dropped, got {:?}",
+            out
+        );
     }
 
     #[test]
@@ -1814,7 +1871,13 @@ mod band_routing_tests {
     /// or dropped because the clamp would reverse the rec's "go up" intent.
     #[test]
     fn clamp_prevents_d_runaway_at_drifted_state() {
-        let recs = vec![make_rec(Axis::Roll, PidTerm::D, 58.0, 63.0, Priority::Medium)];
+        let recs = vec![make_rec(
+            Axis::Roll,
+            PidTerm::D,
+            58.0,
+            63.0,
+            Priority::Medium,
+        )];
         let baseline = pid_cfg(47.0, 75.0, 28.0);
         let out = clamp_recs_to_baseline(recs, &baseline);
         assert!(
