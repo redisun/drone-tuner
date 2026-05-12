@@ -612,10 +612,14 @@ mod validate_scenarios {
         // Should complete validation of 20 files within reasonable time.
         // The pretty output renders one comfy-table row per file plus a final
         // "Valid: N Invalid: M" line — the latter is the most stable check.
+        //
+        // Timeout: ~20s on a fast dev box, but the GHA `ubuntu-latest` runner
+        // is ~2× slower and was tripping the previous 30s cap. 120s gives the
+        // CI runner ample headroom while still catching genuine hangs.
         {
             let mut cmd = create_test_command();
             cmd.arg("validate").arg(&batch_dir);
-            run_with_timeout(cmd, 30)
+            run_with_timeout(cmd, 120)
         }
         .success()
         .stdout(predicate::str::contains("Valid:"));
