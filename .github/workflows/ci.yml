@@ -34,6 +34,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # libudev-dev is required by `libudev-sys` (transitive via `serialport`)
+      # for USB serial enumeration. Without it the build fails before clippy
+      # ever runs.
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       # We deliberately allow clippy::pedantic / clippy::nursery (they're
       # opinionated style lints that produce hundreds of warnings on this
       # codebase). Real bugs and clippy::all violations fail the build.
@@ -51,6 +56,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Test
